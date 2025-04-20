@@ -23,9 +23,8 @@ self.blend = nn.Parameter(torch.tensor(0.5)) # Learnable blend factor between 0 
                                     Trainable parameters: 55338025
                                     Total parameters: 55338025
 
-*all metrics outside of wer/cer are for analysis, debugging, and for understanding model behavior at the token level.
 
-<div></div>
+<div> Total parameters: 55,338,025 </div>
     <table border="1" class="dataframe">
   <thead>
  <tr style="text-align: left;">
@@ -480,7 +479,7 @@ self.blend = nn.Parameter(torch.tensor(0.5)) # Learnable blend factor between 0 
       <td>0.942017</td>
       <td>0.932626</td>
     </tr>
-    <tr>
+ <tr>
       <td>90000</td>
       <td>0.000400</td>
       <td>0.833820</td>
@@ -490,6 +489,57 @@ self.blend = nn.Parameter(torch.tensor(0.5)) # Learnable blend factor between 0 
       <td>0.941620</td>
       <td>0.932617</td>
     </tr>
+    <tr>
+      <td>92000</td>
+      <td>0.007600</td>
+      <td>0.818226</td>
+      <td>12.352664</td>
+      <td>0.942415</td>
+      <td>0.929752</td>
+      <td>0.942415</td>
+      <td>0.933300</td>
+    </tr>
+    <tr>
+      <td>94000</td>
+      <td>0.000000</td>
+      <td>0.815365</td>
+      <td>11.834041</td>
+      <td>0.945989</td>
+      <td>0.935079</td>
+      <td>0.945989</td>
+      <td>0.937764</td>
+    </tr>
+    <tr>
+      <td>96000</td>
+      <td>0.000000</td>
+      <td>0.821372</td>
+      <td>12.211221</td>
+      <td>0.942812</td>
+      <td>0.930952</td>
+      <td>0.942812</td>
+      <td>0.934042</td>
+    </tr>
+    <tr>
+      <td>98000</td>
+      <td>0.005200</td>
+      <td>0.816930</td>
+      <td>12.164074</td>
+      <td>0.942415</td>
+      <td>0.929443</td>
+      <td>0.942415</td>
+      <td>0.933270</td>
+    </tr>
+    <tr>
+      <td>100000</td>
+      <td>0.031800</td>
+      <td>0.824229</td>
+      <td>12.305516</td>
+      <td>0.942415</td>
+      <td>0.928827</td>
+      <td>0.942415</td>
+      <td>0.932923</td>
+    </tr>
   </tbody>
 </table><p>
-            
+
+*all metrics outside of wer/cer are for analysis, debugging, and for understanding model behavior at the token level.
