@@ -1,160 +1,492 @@
 Standard asr model with RoPE, optional blending of scaled dot product and cosine similarity, and optional blending of spectrogram and waveform input. 
 Both can be variable controlled or turned off. Full script with tranining loop compatable with hugging face. For testing.
 
-set input_features=True, waveform=True:
+input_features=True, waveform=True
+self.blend = nn.Parameter(torch.tensor(0.5)) # Learnable blend factor between 0 and 1 
 
-            def prepare_dataset(batch, input_features=True, waveform=False):
-                audio = batch["audio"]
-                if input_features:
-                    batch["input_features"] = extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
-                if waveform:
-                    batch["waveform"] = torch.tensor(audio["array"]).unsqueeze(0).float()
-                batch["labels"] = tokenizer(batch["transcription"]).input_ids
-                return batch
+            Short test run:
+                                    Initializing all weights
+                                    Initialization summary:
+                                    Linear: 48
+                                    Conv1d: 5
+                                    LayerNorm: 0
+                                    RMSNorm: 18
+                                    Conv2d: 0
+                                    SEBlock: 1
+                                    TextDecoder: 1
+                                    AudioEncoder: 1
+                                    Residual: 8
+                                    Multihead: 8
+                                    MultiheadA: 0
+                                    MultiheadB: 0
+                                    MultiheadC: 0
+                                    Trainable parameters: 55338025
+                                    Total parameters: 55338025
 
-      ### control blending amount: 
-      
-      class AudioEncoder(nn.Module):
-          def __init__(self, mels: int, ctx: int, dims: int, head: int, layer, act: str = "relu"):
-              super().__init__()
-      
-              self.dropout = 0.1
-              act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), 
-                         "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
-              self.act = act_map.get(act, nn.GELU())
-              self.blend = nn.Parameter(torch.tensor(0.5)) # Learnable blend factor between 0 and 1 
-      
-              self.se = nn.Sequential(Conv1d(mels, dims, kernel_size=3, padding=1), self.act, 
-                  Conv1d(dims, dims, kernel_size=3, stride=1, padding=2, dilation=2), 
-                  Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims),     
-                  Conv1d(dims, dims, kernel_size=1), SEBlock(dims, reduction=16), self.act,
-                  nn.Dropout(p=self.dropout), Conv1d(dims, dims, kernel_size=3, stride=1, padding=1))
-              
-              self.we = nn.Sequential(
-                  nn.Conv1d(1, dims, kernel_size=11, stride=5, padding=5),
-                  nn.GELU(),
-                  nn.Conv1d(dims, dims, kernel_size=5, stride=2, padding=2),
-                  nn.GELU(),
-                  nn.AdaptiveAvgPool1d(ctx),
-              )
-      
-              self.register_buffer("positional_embedding", sinusoids(ctx, dims))       
-      
-              self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, cross_attention=False, act = "relu")
-                          for _ in range(layer)]) if layer > 0 else None)
-              
-              self.ln_enc = RMSNorm(normalized_shape=dims)
-      
-          def forward(self, x, w) -> Tensor:
-              """ x : torch.Tensor, shape = (batch, mels, ctx) the mel spectrogram of the audio """
-              """ w : torch.Tensor, shape = (batch, 1, ctx) the waveform of the audio """
-      
-              if x is not None:
-                  if w is not None:
-                      x = self.se(x) 
-                      x = x.permute(0, 2, 1) 
-                      assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
-                      x = (x + self.positional_embedding).to(x.dtype)
-                      w = self.we(w).permute(0, 2, 1)
-                      blend = torch.sigmoid(self.blend)
-                      x = blend * x + (1 - blend) * w
-                  else:
-                      x = self.se(x) 
-                      x = x.permute(0, 2, 1) 
-                      assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
-                      x = (x + self.positional_embedding).to(x.dtype)
-                  
-              else:
-                  assert w is not None, "You have to provide either x or w"
-                  x = self.we(w).permute(0, 2, 1)
-                  assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
-                  x = (x + self.positional_embedding).to(x.dtype)
-      
-              for block in chain(self.blockA or []):
-                  x = block(x)
-              return self.ln_enc(x)
-
-    
-    class Multihead(nn.Module):
-        blend = True
-        mag = False
-        def __init__(self, dims: int, head: int):
-            super().__init__()
-            self.dims = dims
-            self.head = head
-            head_dim = dims // head
-            self.head_dim = head_dim
-            self.dropout = 0.1
-    
-            self.q = Linear(dims, dims)
-            self.k = Linear(dims, dims, bias=False)
-            self.v = Linear(dims, dims)
-            self.o = Linear(dims, dims)
-    
-            self.rotary = Rotary(dim=head_dim, learned_freq=True)
-    
-            if Multihead.blend:
-                self.factor = nn.Parameter(torch.tensor(0.5, **tox))
-    
-        def compute_cosine_attention(self, q: Tensor, k: Tensor, v: Tensor, mask):
-            ctx = q.shape[1]
-            qn = torch.nn.functional.normalize(q, dim=-1, eps=1e-12)
-            kn = torch.nn.functional.normalize(k, dim=-1, eps=1e-12)
-            qk = torch.matmul(qn, kn.transpose(-1, -2))
-    
-            if Multihead.mag:
-                qm = torch.norm(q, dim=-1, keepdim=True)
-                km = torch.norm(k, dim=-1, keepdim=True)
-                ms = (qm * km.transpose(-1, -2)) ** 0.5
-                ms = torch.clamp(ms, min=1e-8)
-                qk = qk * ms
-    
-            if mask is not None:
-                qk = qk + mask[:ctx, :ctx]
-    
-            w = F.softmax(qk.float(), dim=-1).to(q.dtype)
-            w = F.dropout(w, p=self.dropout, training=self.training)
-            out = torch.matmul(w, v)
-            return out, qk
-    
-        def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask = None, kv_cache = None):
-            q = self.q(x)
-            if kv_cache is None or xa is None or self.k not in kv_cache:
-                k = self.k(x if xa is None else xa)
-                v = self.v(x if xa is None else xa)
-            else:
-                k = kv_cache[self.k]
-                v = kv_cache[self.v]
-            out, qk = self._forward(q, k, v, mask)
-            return self.o(out), qk
-    
-        def _forward(self, q: Tensor, k: Tensor, v: Tensor, mask = None):
-            ctx = q.shape[1]
-            dims = self.dims
-            scale = (dims // self.head) ** -0.25
-    
-            q = q.view(*q.shape[:2], self.head, -1).permute(0, 2, 1, 3)
-            k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
-            v = v.view(*v.shape[:2], self.head, -1).permute(0, 2, 1, 3)
-    
-            freqs_cis = self.rotary(ctx)
-            q = self.rotary.apply_rotary(q, freqs_cis)
-            k = self.rotary.apply_rotary(k, freqs_cis)
-    
-            qk = (q * scale) @ (k * scale).transpose(-1, -2)
-            if mask is not None:
-                qk = qk + mask[:ctx, :ctx]
-            qk = qk.float()
-            w = F.softmax(qk.float(), dim=-1).to(q.dtype)
-            w = F.dropout(w, p=self.dropout, training=self.training)
-            out = torch.matmul(w, v)
-    
-            if Multihead.blend:
-                cos_w, cos_qk = self.compute_cosine_attention(q, k, v, mask)
-                blend = torch.sigmoid(self.factor)
-                out = blend * cos_w + (1 - blend) * out
-                qk = blend * cos_qk + (1 - blend) * qk
-            
-            out = out.permute(0, 2, 1, 3).flatten(start_dim=2)
-            qk = qk.detach() if self.training else qk
-            return out, qk
+<div></div>
+    <table border="1" class="dataframe">
+  <thead>
+ <tr style="text-align: left;">
+      <th>Step</th>
+      <th>Training Loss</th>
+      <th>Validation Loss</th>
+      <th>Wer</th>
+      <th>Accuracy</th>
+      <th>Precision</th>
+      <th>Recall</th>
+      <th>F1</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2000</td>
+      <td>18.092300</td>
+      <td>18.094042</td>
+      <td>84.677039</td>
+      <td>0.105242</td>
+      <td>0.063004</td>
+      <td>0.105242</td>
+      <td>0.065817</td>
+    </tr>
+    <tr>
+      <td>4000</td>
+      <td>11.774700</td>
+      <td>13.269469</td>
+      <td>84.441301</td>
+      <td>0.140588</td>
+      <td>0.085592</td>
+      <td>0.140588</td>
+      <td>0.093962</td>
+    </tr>
+    <tr>
+      <td>6000</td>
+      <td>8.873400</td>
+      <td>11.945918</td>
+      <td>83.026874</td>
+      <td>0.164813</td>
+      <td>0.106469</td>
+      <td>0.164813</td>
+      <td>0.119764</td>
+    </tr>
+    <tr>
+      <td>8000</td>
+      <td>9.087700</td>
+      <td>11.071589</td>
+      <td>80.433758</td>
+      <td>0.181890</td>
+      <td>0.124660</td>
+      <td>0.181890</td>
+      <td>0.141570</td>
+    </tr>
+    <tr>
+      <td>10000</td>
+      <td>8.414800</td>
+      <td>10.316739</td>
+      <td>81.518152</td>
+      <td>0.220016</td>
+      <td>0.139223</td>
+      <td>0.220016</td>
+      <td>0.161180</td>
+    </tr>
+    <tr>
+      <td>12000</td>
+      <td>7.120600</td>
+      <td>9.721140</td>
+      <td>76.991985</td>
+      <td>0.261319</td>
+      <td>0.168419</td>
+      <td>0.261319</td>
+      <td>0.195558</td>
+    </tr>
+    <tr>
+      <td>14000</td>
+      <td>5.390300</td>
+      <td>9.145411</td>
+      <td>72.465818</td>
+      <td>0.314138</td>
+      <td>0.237863</td>
+      <td>0.314138</td>
+      <td>0.260354</td>
+    </tr>
+    <tr>
+      <td>16000</td>
+      <td>5.591600</td>
+      <td>8.452500</td>
+      <td>67.468175</td>
+      <td>0.372121</td>
+      <td>0.290982</td>
+      <td>0.372121</td>
+      <td>0.317709</td>
+    </tr>
+    <tr>
+      <td>18000</td>
+      <td>3.927100</td>
+      <td>7.619088</td>
+      <td>61.716172</td>
+      <td>0.437252</td>
+      <td>0.384644</td>
+      <td>0.437252</td>
+      <td>0.398461</td>
+    </tr>
+    <tr>
+      <td>20000</td>
+      <td>2.988900</td>
+      <td>6.722630</td>
+      <td>56.105611</td>
+      <td>0.514694</td>
+      <td>0.466956</td>
+      <td>0.514694</td>
+      <td>0.479414</td>
+    </tr>
+    <tr>
+      <td>22000</td>
+      <td>1.693500</td>
+      <td>5.919944</td>
+      <td>49.457803</td>
+      <td>0.597299</td>
+      <td>0.561372</td>
+      <td>0.597299</td>
+      <td>0.568058</td>
+    </tr>
+    <tr>
+      <td>24000</td>
+      <td>1.457600</td>
+      <td>5.068944</td>
+      <td>43.187176</td>
+      <td>0.664813</td>
+      <td>0.630534</td>
+      <td>0.664813</td>
+      <td>0.636420</td>
+    </tr>
+    <tr>
+      <td>26000</td>
+      <td>0.731200</td>
+      <td>4.468833</td>
+      <td>37.246582</td>
+      <td>0.714456</td>
+      <td>0.685669</td>
+      <td>0.714456</td>
+      <td>0.690794</td>
+    </tr>
+    <tr>
+      <td>28000</td>
+      <td>0.387100</td>
+      <td>3.920610</td>
+      <td>34.842056</td>
+      <td>0.752581</td>
+      <td>0.718280</td>
+      <td>0.752581</td>
+      <td>0.726407</td>
+    </tr>
+    <tr>
+      <td>30000</td>
+      <td>0.522700</td>
+      <td>3.337055</td>
+      <td>32.013201</td>
+      <td>0.778793</td>
+      <td>0.748308</td>
+      <td>0.778793</td>
+      <td>0.754799</td>
+    </tr>
+    <tr>
+      <td>32000</td>
+      <td>0.348100</td>
+      <td>3.137705</td>
+      <td>27.392739</td>
+      <td>0.816521</td>
+      <td>0.789249</td>
+      <td>0.816521</td>
+      <td>0.794745</td>
+    </tr>
+    <tr>
+      <td>34000</td>
+      <td>0.235400</td>
+      <td>2.837850</td>
+      <td>25.836869</td>
+      <td>0.826450</td>
+      <td>0.804915</td>
+      <td>0.826450</td>
+      <td>0.808204</td>
+    </tr>
+    <tr>
+      <td>36000</td>
+      <td>0.147900</td>
+      <td>2.472836</td>
+      <td>24.092409</td>
+      <td>0.848292</td>
+      <td>0.822547</td>
+      <td>0.848292</td>
+      <td>0.828575</td>
+    </tr>
+    <tr>
+      <td>38000</td>
+      <td>0.031100</td>
+      <td>2.230168</td>
+      <td>22.489392</td>
+      <td>0.858221</td>
+      <td>0.832547</td>
+      <td>0.858221</td>
+      <td>0.839435</td>
+    </tr>
+    <tr>
+      <td>40000</td>
+      <td>0.030800</td>
+      <td>2.048872</td>
+      <td>21.122112</td>
+      <td>0.868149</td>
+      <td>0.845544</td>
+      <td>0.868149</td>
+      <td>0.851453</td>
+    </tr>
+    <tr>
+      <td>42000</td>
+      <td>0.081000</td>
+      <td>1.886192</td>
+      <td>20.179161</td>
+      <td>0.877681</td>
+      <td>0.858592</td>
+      <td>0.877681</td>
+      <td>0.862592</td>
+    </tr>
+    <tr>
+      <td>44000</td>
+      <td>0.111100</td>
+      <td>1.709980</td>
+      <td>19.707685</td>
+      <td>0.884829</td>
+      <td>0.861480</td>
+      <td>0.884829</td>
+      <td>0.867254</td>
+    </tr>
+    <tr>
+      <td>46000</td>
+      <td>0.040200</td>
+      <td>1.642010</td>
+      <td>19.471947</td>
+      <td>0.886815</td>
+      <td>0.872261</td>
+      <td>0.886815</td>
+      <td>0.874384</td>
+    </tr>
+    <tr>
+      <td>48000</td>
+      <td>0.331200</td>
+      <td>1.563076</td>
+      <td>18.953324</td>
+      <td>0.891978</td>
+      <td>0.873376</td>
+      <td>0.891978</td>
+      <td>0.877740</td>
+    </tr>
+    <tr>
+      <td>50000</td>
+      <td>0.000000</td>
+      <td>1.449146</td>
+      <td>18.198963</td>
+      <td>0.897538</td>
+      <td>0.879116</td>
+      <td>0.897538</td>
+      <td>0.883927</td>
+    </tr>
+    <tr>
+      <td>52000</td>
+      <td>0.000000</td>
+      <td>1.346408</td>
+      <td>16.548798</td>
+      <td>0.911438</td>
+      <td>0.896957</td>
+      <td>0.911438</td>
+      <td>0.900420</td>
+    </tr>
+    <tr>
+      <td>54000</td>
+      <td>0.089600</td>
+      <td>1.259197</td>
+      <td>16.360207</td>
+      <td>0.911438</td>
+      <td>0.892535</td>
+      <td>0.911438</td>
+      <td>0.897926</td>
+    </tr>
+    <tr>
+      <td>56000</td>
+      <td>0.003600</td>
+      <td>1.204781</td>
+      <td>16.313060</td>
+      <td>0.914218</td>
+      <td>0.900028</td>
+      <td>0.914218</td>
+      <td>0.903210</td>
+    </tr>
+    <tr>
+      <td>58000</td>
+      <td>0.021500</td>
+      <td>1.137096</td>
+      <td>14.615747</td>
+      <td>0.924543</td>
+      <td>0.908271</td>
+      <td>0.924543</td>
+      <td>0.913154</td>
+    </tr>
+    <tr>
+      <td>60000</td>
+      <td>0.067200</td>
+      <td>1.117908</td>
+      <td>15.370108</td>
+      <td>0.919778</td>
+      <td>0.907544</td>
+      <td>0.919778</td>
+      <td>0.910139</td>
+    </tr>
+    <tr>
+      <td>62000</td>
+      <td>0.011900</td>
+      <td>1.088004</td>
+      <td>14.710042</td>
+      <td>0.924940</td>
+      <td>0.907473</td>
+      <td>0.924940</td>
+      <td>0.912866</td>
+    </tr>
+    <tr>
+      <td>64000</td>
+      <td>0.001600</td>
+      <td>1.027228</td>
+      <td>14.191419</td>
+      <td>0.925338</td>
+      <td>0.909092</td>
+      <td>0.925338</td>
+      <td>0.913723</td>
+    </tr>
+    <tr>
+      <td>66000</td>
+      <td>0.020200</td>
+      <td>1.005682</td>
+      <td>14.474305</td>
+      <td>0.925735</td>
+      <td>0.909920</td>
+      <td>0.925735</td>
+      <td>0.914692</td>
+    </tr>
+    <tr>
+      <td>68000</td>
+      <td>0.015600</td>
+      <td>1.030672</td>
+      <td>14.285714</td>
+      <td>0.929706</td>
+      <td>0.915055</td>
+      <td>0.929706</td>
+      <td>0.919430</td>
+    </tr>
+    <tr>
+      <td>70000</td>
+      <td>0.035700</td>
+      <td>1.009697</td>
+      <td>14.285714</td>
+      <td>0.929309</td>
+      <td>0.912733</td>
+      <td>0.929309</td>
+      <td>0.917668</td>
+    </tr>
+    <tr>
+      <td>72000</td>
+      <td>0.000000</td>
+      <td>0.968514</td>
+      <td>13.861386</td>
+      <td>0.933678</td>
+      <td>0.918284</td>
+      <td>0.933678</td>
+      <td>0.923120</td>
+    </tr>
+    <tr>
+      <td>74000</td>
+      <td>0.000000</td>
+      <td>0.955723</td>
+      <td>13.342763</td>
+      <td>0.936458</td>
+      <td>0.922170</td>
+      <td>0.936458</td>
+      <td>0.926470</td>
+    </tr>
+    <tr>
+      <td>76000</td>
+      <td>0.039600</td>
+      <td>0.950628</td>
+      <td>13.437058</td>
+      <td>0.933280</td>
+      <td>0.917714</td>
+      <td>0.933280</td>
+      <td>0.922634</td>
+    </tr>
+    <tr>
+      <td>78000</td>
+      <td>0.000000</td>
+      <td>0.944726</td>
+      <td>13.625648</td>
+      <td>0.933280</td>
+      <td>0.918627</td>
+      <td>0.933280</td>
+      <td>0.922984</td>
+    </tr>
+    <tr>
+      <td>80000</td>
+      <td>0.038700</td>
+      <td>0.887802</td>
+      <td>13.201320</td>
+      <td>0.936458</td>
+      <td>0.924333</td>
+      <td>0.936458</td>
+      <td>0.927376</td>
+    </tr>
+    <tr>
+      <td>82000</td>
+      <td>0.000000</td>
+      <td>0.872674</td>
+      <td>13.012730</td>
+      <td>0.938840</td>
+      <td>0.928047</td>
+      <td>0.938840</td>
+      <td>0.930471</td>
+    </tr>
+    <tr>
+      <td>84000</td>
+      <td>0.046200</td>
+      <td>0.862091</td>
+      <td>12.352664</td>
+      <td>0.942017</td>
+      <td>0.929719</td>
+      <td>0.942017</td>
+      <td>0.933114</td>
+    </tr>
+    <tr>
+      <td>86000</td>
+      <td>0.000000</td>
+      <td>0.857046</td>
+      <td>12.729844</td>
+      <td>0.940032</td>
+      <td>0.927587</td>
+      <td>0.940032</td>
+      <td>0.930960</td>
+    </tr>
+    <tr>
+      <td>88000</td>
+      <td>0.000000</td>
+      <td>0.836060</td>
+      <td>12.446959</td>
+      <td>0.942017</td>
+      <td>0.928478</td>
+      <td>0.942017</td>
+      <td>0.932626</td>
+    </tr>
+    <tr>
+      <td>90000</td>
+      <td>0.000400</td>
+      <td>0.833820</td>
+      <td>12.776992</td>
+      <td>0.941620</td>
+      <td>0.928891</td>
+      <td>0.941620</td>
+      <td>0.932617</td>
+    </tr>
+  </tbody>
+</table><p>
