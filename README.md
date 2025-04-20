@@ -1,6 +1,7 @@
 Standard asr model with RoPE, optional blending of scaled dot product and cosine similarity, and optional blending of spectrogram and waveform input. 
-Both can be variable controlled or turned off. Full script with tranining loop compatable with hugging face.
+Both can be variable controlled or turned off. Full script with tranining loop compatable with hugging face. For testing.
 
+Examples:
       
       class AudioEncoder(nn.Module):
           def __init__(self, mels: int, ctx: int, dims: int, head: int, layer, act: str = "relu"):
