@@ -1,7 +1,7 @@
 Standard asr model with RoPE, optional blending of scaled dot product and cosine similarity, and optional blending of spectrogram and waveform input. 
 Both can be variable controlled or turned off. Full script with tranining loop compatable with hugging face. For testing.
 
-input_features=True, waveform=True
+input_features=True, waveform=False, use_betweenness=False, blend=True (cosine+scaleddot)
 self.blend = nn.Parameter(torch.tensor(0.5)) # Learnable blend factor between 0 and 1 
 
             Short test run:
