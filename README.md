@@ -23,6 +23,8 @@ self.blend = nn.Parameter(torch.tensor(0.5)) # Learnable blend factor between 0 
                                     Trainable parameters: 55338025
                                     Total parameters: 55338025
 
+*all metrics outside of wer/cer are for analysis, debugging, and for understanding model behavior at the token level.
+
 <div></div>
     <table border="1" class="dataframe">
   <thead>
@@ -490,3 +492,4 @@ self.blend = nn.Parameter(torch.tensor(0.5)) # Learnable blend factor between 0 
     </tr>
   </tbody>
 </table><p>
+            
