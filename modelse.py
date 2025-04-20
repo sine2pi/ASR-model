@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch import Tensor
+from BetweennessRoPE import BetweennessRoPE
 import numpy as np
 from typing import Optional, Dict
 import gzip
@@ -158,7 +159,7 @@ class Rotary(nn.Module):
         return torch.cat([x1.type_as(x), x2], dim=-1)
 
 class Multihead(nn.Module):
-    blend = True
+    blend = False
     mag = False
     def __init__(self, dims: int, head: int):
         super().__init__()
@@ -173,7 +174,11 @@ class Multihead(nn.Module):
         self.v = Linear(dims, dims)
         self.o = Linear(dims, dims)
 
-        self.rotary = Rotary(dim=head_dim, learned_freq=True)
+        self.use_betweenness = False  
+        if self.use_betweenness:
+            self.betweenness_rope = BetweennessRoPE(dim=head_dim)
+        else:
+            self.rotary = Rotary(dim=head_dim, learned_freq=True)
 
         if Multihead.blend:
             self.factor = nn.Parameter(torch.tensor(0.5, **tox))
@@ -219,9 +224,15 @@ class Multihead(nn.Module):
         k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
         v = v.view(*v.shape[:2], self.head, -1).permute(0, 2, 1, 3)
 
-        freqs_cis = self.rotary(ctx)
-        q = self.rotary.apply_rotary(q, freqs_cis)
-        k = self.rotary.apply_rotary(k, freqs_cis)
+        if self.use_betweenness:
+            betweenness = self.betweenness_rope.compute_betweenness(q)
+            freqs_cos, freqs_sin = self.betweenness_rope.precompute_freqs_cis(ctx, q.device)
+            q = self.betweenness_rope.apply_rope(q, freqs_cos, freqs_sin, betweenness)
+            k = self.betweenness_rope.apply_rope(k, freqs_cos, freqs_sin, betweenness)
+        else:
+            freqs_cis = self.rotary(ctx)
+            q = self.rotary.apply_rotary(q, freqs_cis)
+            k = self.rotary.apply_rotary(k, freqs_cis)
 
         qk = (q * scale) @ (k * scale).transpose(-1, -2)
         if mask is not None:
@@ -292,11 +303,13 @@ class AudioEncoder(nn.Module):
     def __init__(self, mels: int, ctx: int, dims: int, head: int, layer, act: str = "relu"):
         super().__init__()
 
+        head_dim = dims // head
         self.dropout = 0.1
         act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), 
                    "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
         self.act = act_map.get(act, nn.GELU())
         self.blend = nn.Parameter(torch.tensor(0.5)) # Learnable blend factor between 0 and 1
+        self.rotary = Rotary(dim=head_dim, learned_freq=True)
 
         self.se = nn.Sequential(Conv1d(mels, dims, kernel_size=3, padding=1), self.act, 
             Conv1d(dims, dims, kernel_size=3, stride=1, padding=2, dilation=2), 
@@ -322,6 +335,9 @@ class AudioEncoder(nn.Module):
     def forward(self, x, w) -> Tensor:
         """ x : torch.Tensor, shape = (batch, mels, ctx) the mel spectrogram of the audio """
         """ w : torch.Tensor, shape = (batch, 1, ctx) the waveform of the audio """
+        # ctx = x.shape[1]
+        # freqs_cis = self.rotary(ctx)
+        # x = self.rotary.apply_rotary(x, freqs_cis)
 
         if x is not None:
             if w is not None:
@@ -573,7 +589,6 @@ class Echo(nn.Module):
         for module_type, count in self.init_counts.items():
             print(f"{module_type}: {count}")
 
-
 metric = evaluate.load(path="wer")
 
 @dataclass
@@ -584,6 +599,7 @@ class DataCollator:
 
     def __call__(self, features: List[Dict[str, Union[List[int], Tensor]]]) -> Dict[str, Tensor]:
         batch = {}
+        # Handle input features and/or waveform
         if "input_features" in features[0]:
             input_features = [{"input_features": f["input_features"]} for f in features]
             batch["input_features"] = self.extractor.pad(input_features, return_tensors="pt")["input_features"]
@@ -592,6 +608,7 @@ class DataCollator:
             max_len = max(w.shape[-1] for w in waveforms)
             padded_waveforms = [F.pad(w, (0, max_len - w.shape[-1])) for w in waveforms]
             batch["waveform"] = torch.stack(padded_waveforms)
+        # Prepare labels
         label_features = [{"input_ids": f["labels"]} for f in features]
         labels_batch = self.tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
@@ -600,7 +617,7 @@ class DataCollator:
         batch["labels"] = labels
         return batch
 
-def prepare_dataset(batch, input_features=True, waveform=False):
+def prepare_dataset(batch, input_features=False, waveform=True):
     audio = batch["audio"]
     if input_features:
         batch["input_features"] = extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
@@ -628,12 +645,12 @@ def compute_metrics(eval_pred):
     labels_flat = label_ids.flatten()
     mask = labels_flat != tokenizer.pad_token_id
   
-    samp = [0] # sample = random.randint(0, len(pred_str)-1) sample = random.sample(range(10), 1)
-    for idx in samp:
-        print("-" * 10)
-        print(f"Step: {trainer.state.global_step}")
-        print(f"Prediction: {pred_str[idx]}")
-        print(f"Label: {label_str[idx]}")
+    # samp = [0] # sample = random.randint(0, len(pred_str)-1) sample = random.sample(range(10), 1)
+    # for idx in samp:
+    #     print("-" * 10)
+    #     print(f"Step: {trainer.state.global_step}")
+    #     print(f"Prediction: {pred_str[idx]}")
+    #     print(f"Label: {label_str[idx]}")
 
     acc = accuracy_score(y_true=labels_flat[mask], y_pred=pred_flat[mask])
     pre = precision_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], 
@@ -650,6 +667,7 @@ def compute_metrics(eval_pred):
         "recall": rec,
         "f1": f1
         }
+
 
 
 if __name__ == "__main__":
@@ -734,7 +752,7 @@ if __name__ == "__main__":
 
 
 
-    
+
     from tensorboard import program
     log_dir = "./output/logs" 
     tb = program.TensorBoard()
