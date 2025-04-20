@@ -542,4 +542,4 @@ self.blend = nn.Parameter(torch.tensor(0.5)) # Learnable blend factor between 0 
   </tbody>
 </table><p>
 
-*all metrics outside of wer/cer are for analysis, debugging, and for understanding model behavior at the token level.
+*all metrics other than WER are for analysis, debugging, and for understanding model behavior at the token level.
