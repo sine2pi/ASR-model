@@ -583,18 +583,16 @@ class DataCollator:
     decoder_start_token_id: Any
 
     def __call__(self, features: List[Dict[str, Union[List[int], Tensor]]]) -> Dict[str, Tensor]:
-        input_features = [{"input_features": feature["input_features"]} for feature in features]
         batch = {}
-        batch["input_features"] = self.extractor.pad(input_features, return_tensors="pt")["input_features"]
-
+        if "input_features" in features[0]:
+            input_features = [{"input_features": f["input_features"]} for f in features]
+            batch["input_features"] = self.extractor.pad(input_features, return_tensors="pt")["input_features"]
         if "waveform" in features[0]:
-
-            waveforms = [feature["waveform"] for feature in features]
+            waveforms = [f["waveform"] for f in features]
             max_len = max(w.shape[-1] for w in waveforms)
             padded_waveforms = [F.pad(w, (0, max_len - w.shape[-1])) for w in waveforms]
             batch["waveform"] = torch.stack(padded_waveforms)
-
-        label_features = [{"input_ids": feature["labels"]} for feature in features]
+        label_features = [{"input_ids": f["labels"]} for f in features]
         labels_batch = self.tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
         if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
