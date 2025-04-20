@@ -1,7 +1,18 @@
 Standard asr model with RoPE, optional blending of scaled dot product and cosine similarity, and optional blending of spectrogram and waveform input. 
 Both can be variable controlled or turned off. Full script with tranining loop compatable with hugging face. For testing.
 
-Examples:
+set input_features=True, waveform=True:
+
+            def prepare_dataset(batch, input_features=True, waveform=False):
+                audio = batch["audio"]
+                if input_features:
+                    batch["input_features"] = extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
+                if waveform:
+                    batch["waveform"] = torch.tensor(audio["array"]).unsqueeze(0).float()
+                batch["labels"] = tokenizer(batch["transcription"]).input_ids
+                return batch
+
+      ### control blending amount: 
       
       class AudioEncoder(nn.Module):
           def __init__(self, mels: int, ctx: int, dims: int, head: int, layer, act: str = "relu"):
