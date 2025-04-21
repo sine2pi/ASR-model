@@ -541,7 +541,7 @@ ASR model with bRoPE (optional Betweenness), optional blending of scaled dot pro
     </tr>
   </tbody>
 </table><p>
-*Accuracy, Precision, Recall and F1 are for analysis, debugging, and for understanding model behavior at the token level.
+
 <div>
 input_features=False, waveform=True, use_betweenness=False, blend=False
 </div>
@@ -1061,5 +1061,7 @@ input_features=False, waveform=True, use_betweenness=False, blend=False
     </tr>
   </tbody>
 </table><p>
+*Accuracy, Precision, Recall and F1 are for analysis, debugging, and for understanding model behavior at the token level.
+            
 <img width="400" alt="ftff" src="https://github.com/user-attachments/assets/e69d0224-f297-4ff7-8fcb-6fa587534672" />
 
