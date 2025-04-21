@@ -122,7 +122,6 @@ def default(val, d):
     return val if exists(val) else d
 
 def sinusoids(length, channels, max_timescale=10000):
-    """Returns sinusoids for positional embedding"""
     assert channels % 2 == 0
     log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
     inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2))
@@ -333,12 +332,9 @@ class AudioEncoder(nn.Module):
         self.ln_enc = RMSNorm(normalized_shape=dims)
 
     def forward(self, x, w) -> Tensor:
-        """ x : torch.Tensor, shape = (batch, mels, ctx) the mel spectrogram of the audio """
-        """ w : torch.Tensor, shape = (batch, 1, ctx) the waveform of the audio """
-        # ctx = x.shape[1]
-        # freqs_cis = self.rotary(ctx)
-        # x = self.rotary.apply_rotary(x, freqs_cis)
-
+        """ x : torch.Tensor, shape = (batch, mels, ctx) the mel spectrogram of the audio input"""
+        """ w : torch.Tensor, shape = (batch, 1, ctx) the waveform of the audio input """
+        """ x : torch.Tensor, shape = (batch, ctx, dims) the encoder output """
         if x is not None:
             if w is not None:
                 x = self.se(x) 
@@ -352,8 +348,7 @@ class AudioEncoder(nn.Module):
                 x = self.se(x) 
                 x = x.permute(0, 2, 1) 
                 assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
-                x = (x + self.positional_embedding).to(x.dtype)
-            
+                x = (x + self.positional_embedding).to(x.dtype)            
         else:
             assert w is not None, "You have to provide either x or w"
             x = self.we(w).permute(0, 2, 1)
@@ -367,7 +362,6 @@ class AudioEncoder(nn.Module):
 class TextDecoder(nn.Module):
     def __init__(self, vocab: int, ctx: int, dims: int, head: int, layer):
         super().__init__()
-
         self.dropout = 0.1
         self.token_embedding = nn.Embedding(num_embeddings=vocab, embedding_dim=dims)
         self.positional_embedding = nn.Parameter(data=torch.empty(ctx, dims))
@@ -599,7 +593,6 @@ class DataCollator:
 
     def __call__(self, features: List[Dict[str, Union[List[int], Tensor]]]) -> Dict[str, Tensor]:
         batch = {}
-        # Handle input features and/or waveform
         if "input_features" in features[0]:
             input_features = [{"input_features": f["input_features"]} for f in features]
             batch["input_features"] = self.extractor.pad(input_features, return_tensors="pt")["input_features"]
@@ -608,7 +601,6 @@ class DataCollator:
             max_len = max(w.shape[-1] for w in waveforms)
             padded_waveforms = [F.pad(w, (0, max_len - w.shape[-1])) for w in waveforms]
             batch["waveform"] = torch.stack(padded_waveforms)
-        # Prepare labels
         label_features = [{"input_ids": f["labels"]} for f in features]
         labels_batch = self.tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
@@ -667,8 +659,6 @@ def compute_metrics(eval_pred):
         "recall": rec,
         "f1": f1
         }
-
-
 
 if __name__ == "__main__":
 
@@ -739,7 +729,7 @@ if __name__ == "__main__":
         args=training_args,
         model=model,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["test"].take(100),
+        eval_dataset=dataset["test"],
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         processing_class=extractor,
@@ -747,11 +737,7 @@ if __name__ == "__main__":
     model.init_weights()
     print("Trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
     print("Total parameters:", sum(p.numel() for p in model.parameters()))
-    # print(model)
     trainer.train(resume_from_checkpoint=False)
-
-
-
 
     from tensorboard import program
     log_dir = "./output/logs" 
