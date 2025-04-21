@@ -1,6 +1,8 @@
 ASR encoder-decoder model with bRoPE (optional Betweenness), optional blending of scaled dot product and cosine similarity, and optional blending of spectrogram and waveform input. Full script with tranining loop compatable with hugging face. For testing.
             
-            Test-1 waveform vs spectrogram vs waveform+spectrogram - pilot run
+
+     Test-1 waveform vs spectrogram vs waveform+spectrogram - pilot run
+
             input_features=True, waveform=False, use_betweenness=False, blend=False (cosine+scaleddot)
             self.blend = nn.Parameter(torch.tensor(0.5)) # Learnable blend factor between 0 and 1 
 
