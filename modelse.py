@@ -593,14 +593,23 @@ class DataCollator:
 
     def __call__(self, features: List[Dict[str, Union[List[int], Tensor]]]) -> Dict[str, Tensor]:
         batch = {}
+
         if "input_features" in features[0]:
             input_features = [{"input_features": f["input_features"]} for f in features]
             batch["input_features"] = self.extractor.pad(input_features, return_tensors="pt")["input_features"]
+            # print("input_features shape:", batch["input_features"].shape)
         if "waveform" in features[0]:
             waveforms = [f["waveform"] for f in features]
-            max_len = max(w.shape[-1] for w in waveforms)
-            padded_waveforms = [F.pad(w, (0, max_len - w.shape[-1])) for w in waveforms]
+            fixed_len = 3000 * 160  # Set a fixed length for all waveforms (e.g., 480000 samples for 30 seconds at 16kHz)
+            padded_waveforms = []
+            for w in waveforms:
+                if w.shape[-1] < fixed_len:
+                    w = F.pad(w, (0, fixed_len - w.shape[-1]))
+                else:
+                    w = w[..., :fixed_len]
+                padded_waveforms.append(w)
             batch["waveform"] = torch.stack(padded_waveforms)
+            # print("waveform shape:", batch["waveform"].shape)
         label_features = [{"input_ids": f["labels"]} for f in features]
         labels_batch = self.tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
