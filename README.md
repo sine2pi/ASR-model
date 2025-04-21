@@ -5,16 +5,7 @@ This model's learnable blend (with a sigmoid-mixed parameter) between waveform a
 Blending waveform and spectrogram features has been explored in some research, but is not standard in ASR pipelines.
 This learnable blend is a modern, under-explored approach addressing the waveform spectrogram debate. Initial findings of the pilot run suggest that the blending of the two significantly decreases WER compared to standalone waveform and spectrogram without significantly increasing overhead. 
 
-4 tests: spectrogram, waveform, spectrogram+waveform variable length, spectrogram+waveform both padded and truncated across batches to equal 30s of audio.
-
-<img width="686" alt="1111" src="https://github.com/user-attachments/assets/4bcc1f88-4340-4777-a728-b471b94db48e" />
-<img width="173" alt="22222" src="https://github.com/user-attachments/assets/6d04b641-d9a8-4092-ab01-89c02d896d1a" />
-<img width="270" alt="7777" src="https://github.com/user-attachments/assets/fd21685d-b8d2-40eb-b3cb-ff5a8ee8265b" />
-<img width="283" alt="5555" src="https://github.com/user-attachments/assets/3ece8194-6bec-4082-a24e-14b7ae336a11" />
-<img width="570" alt="4444" src="https://github.com/user-attachments/assets/62590df3-a24b-4e9f-94e0-ce244262d94d" />
-
-
-
+3 tests: spectrogram, waveform, spectrogram+waveform.
 
      Test-1 waveform vs spectrogram vs waveform+spectrogram - pilot run
 
