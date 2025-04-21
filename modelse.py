@@ -618,12 +618,18 @@ class DataCollator:
         batch["labels"] = labels
         return batch
 
-def prepare_dataset(batch, input_features=False, waveform=True):
+def prepare_dataset(batch, input_features=True, waveform=True):
     audio = batch["audio"]
-    if input_features:
-        batch["input_features"] = extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
+    fixed_len = 3000 * 160
+    wav = torch.tensor(audio["array"]).float()
+    if wav.shape[-1] < fixed_len:
+        wav = F.pad(wav, (0, fixed_len - wav.shape[-1]))
+    else:
+        wav = wav[..., :fixed_len]
     if waveform:
-        batch["waveform"] = torch.tensor(audio["array"]).unsqueeze(0).float()
+        batch["waveform"] = wav.unsqueeze(0)  # (1, N)
+    if input_features:
+        batch["input_features"] = extractor(wav.numpy(), sampling_rate=audio["sampling_rate"]).input_features[0]
     batch["labels"] = tokenizer(batch["transcription"]).input_ids
     return batch
 
