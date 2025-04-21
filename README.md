@@ -3,7 +3,7 @@ ASR encoder-decoder model with bRoPE (optional Betweenness), optional blending o
 This model's learnable blend (with a sigmoid-mixed parameter) between waveform and spectrogram encodings is a novel and practical way to let the model decide the optimal mix. This form of adaptive fusion is less common in open-source ASR codebases.
 
 Blending waveform and spectrogram features has been explored in some research, but is not standard in any ASR pipelines.
-This learnable blend is a modern, under-explored approach addressing the waveform spectrogram debate. Initial findings of the pilot study are interesting in that the blending of the two significantly improves WER without significantly increasing overhead. 
+This learnable blend is a modern, under-explored approach addressing the waveform spectrogram debate. Initial findings of the pilot study are interesting in that the blending of the two significantly decreases WER without significantly increasing overhead. 
             
 
      Test-1 waveform vs spectrogram vs waveform+spectrogram - pilot run
