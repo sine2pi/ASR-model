@@ -298,25 +298,25 @@ class SEBlock(nn.Module):
         y = self.fc(y).view(b, c, 1)
         return x * y
 
+
 class AudioEncoder(nn.Module):
     def __init__(self, mels: int, ctx: int, dims: int, head: int, layer, act: str = "relu"):
         super().__init__()
 
-        head_dim = dims // head
         self.dropout = 0.1
         act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), 
                    "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
         self.act = act_map.get(act, nn.GELU())
-        self.blend = nn.Parameter(torch.tensor(0.5)) # Learnable blend factor between 0 and 1
-        self.rotary = Rotary(dim=head_dim, learned_freq=True)
 
-        self.se = nn.Sequential(Conv1d(mels, dims, kernel_size=3, padding=1), self.act, 
+        self.blend_sw = nn.Parameter(torch.tensor(0.5), requires_grad=True) # 
+
+        self.se = nn.Sequential(Conv1d(mels, dims, kernel_size=3, padding=1), self.act, # spectrogram encoder
             Conv1d(dims, dims, kernel_size=3, stride=1, padding=2, dilation=2), 
             Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims),     
             Conv1d(dims, dims, kernel_size=1), SEBlock(dims, reduction=16), self.act,
             nn.Dropout(p=self.dropout), Conv1d(dims, dims, kernel_size=3, stride=1, padding=1))
         
-        self.we = nn.Sequential(
+        self.we = nn.Sequential( # waveform encoder
             nn.Conv1d(1, dims, kernel_size=11, stride=5, padding=5),
             nn.GELU(),
             nn.Conv1d(dims, dims, kernel_size=5, stride=2, padding=2),
@@ -330,6 +330,8 @@ class AudioEncoder(nn.Module):
                     for _ in range(layer)]) if layer > 0 else None)
         
         self.ln_enc = RMSNorm(normalized_shape=dims)
+        self.se_norm = RMSNorm(normalized_shape=dims)
+        self.we_norm = RMSNorm(normalized_shape=dims)
 
     def forward(self, x, w) -> Tensor:
         """ x : torch.Tensor, shape = (batch, mels, ctx) the mel spectrogram of the audio input"""
@@ -337,18 +339,19 @@ class AudioEncoder(nn.Module):
         """ x : torch.Tensor, shape = (batch, ctx, dims) the encoder output """
         if x is not None:
             if w is not None:
-                x = self.se(x) 
-                x = x.permute(0, 2, 1) 
-                assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
-                x = (x + self.positional_embedding).to(x.dtype)
-                w = self.we(w).permute(0, 2, 1)
-                blend = torch.sigmoid(self.blend)
-                x = blend * x + (1 - blend) * w
+                se_x = self.se(x)
+                se_x = se_x.permute(0, 2, 1)
+                se_x = self.se_norm(se_x)
+                x = (se_x + 0.1 * self.positional_embedding).to(se_x.dtype)
+                we_w = self.we(w).permute(0, 2, 1)
+                we_w = self.we_norm(we_w)
+                blend = torch.sigmoid(self.blend_sw)
+                x = blend * x + (1 - blend) * we_w
             else:
                 x = self.se(x) 
                 x = x.permute(0, 2, 1) 
                 assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
-                x = (x + self.positional_embedding).to(x.dtype)            
+                x = (x + self.positional_embedding).to(x.dtype)
         else:
             assert w is not None, "You have to provide either x or w"
             x = self.we(w).permute(0, 2, 1)
