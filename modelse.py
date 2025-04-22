@@ -330,8 +330,8 @@ class AudioEncoder(nn.Module):
                     for _ in range(layer)]) if layer > 0 else None)
         
         self.ln_enc = RMSNorm(normalized_shape=dims)
-        self.se_norm = RMSNorm(normalized_shape=dims)
-        self.we_norm = RMSNorm(normalized_shape=dims)
+        # self.se_norm = RMSNorm(normalized_shape=dims)
+        # self.we_norm = RMSNorm(normalized_shape=dims)
 
     def forward(self, x, w) -> Tensor:
         """ x : torch.Tensor, shape = (batch, mels, ctx) the mel spectrogram of the audio input"""
@@ -339,14 +339,11 @@ class AudioEncoder(nn.Module):
         """ x : torch.Tensor, shape = (batch, ctx, dims) the encoder output """
         if x is not None:
             if w is not None:
-                se_x = self.se(x)
-                se_x = se_x.permute(0, 2, 1)
-                se_x = self.se_norm(se_x)
-                x = (se_x + 0.1 * self.positional_embedding).to(se_x.dtype)
-                we_w = self.we(w).permute(0, 2, 1)
-                we_w = self.we_norm(we_w)
+                x = self.se(x).permute(0, 2, 1)
+                x = (x + self.positional_embedding).to(x.dtype)
+                w = self.we(w).permute(0, 2, 1)
                 blend = torch.sigmoid(self.blend_sw)
-                x = blend * x + (1 - blend) * we_w
+                x = blend * x + (1 - blend) * w
             else:
                 x = self.se(x) 
                 x = x.permute(0, 2, 1) 
