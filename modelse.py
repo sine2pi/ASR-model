@@ -159,7 +159,9 @@ class Rotary(nn.Module):
 
 class Multihead(nn.Module):
     blend = False
+    cos = False
     mag = False
+
     def __init__(self, dims: int, head: int):
         super().__init__()
         self.dims = dims
@@ -174,8 +176,9 @@ class Multihead(nn.Module):
         self.o = Linear(dims, dims)
 
         self.use_betweenness = False  
+
         if self.use_betweenness:
-            self.betweenness_rope = BetweennessRoPE(dim=head_dim)
+            self.betweenness_rope = BetweennessRoPE(dim=head_dim, learned_freq=True)
         else:
             self.rotary = Rotary(dim=head_dim, learned_freq=True)
 
@@ -215,6 +218,8 @@ class Multihead(nn.Module):
         return self.o(out), qk
 
     def _forward(self, q: Tensor, k: Tensor, v: Tensor, mask = None):
+        ctx_q = q.shape[1]
+        ctx_k = k.shape[1]
         ctx = q.shape[1]
         dims = self.dims
         scale = (dims // self.head) ** -0.25
@@ -228,25 +233,38 @@ class Multihead(nn.Module):
             freqs_cos, freqs_sin = self.betweenness_rope.precompute_freqs_cis(ctx, q.device)
             q = self.betweenness_rope.apply_rope(q, freqs_cos, freqs_sin, betweenness)
             k = self.betweenness_rope.apply_rope(k, freqs_cos, freqs_sin, betweenness)
+            
         else:
-            freqs_cis = self.rotary(ctx)
-            q = self.rotary.apply_rotary(q, freqs_cis)
-            k = self.rotary.apply_rotary(k, freqs_cis)
-
-        qk = (q * scale) @ (k * scale).transpose(-1, -2)
-        if mask is not None:
-            qk = qk + mask[:ctx, :ctx]
-        qk = qk.float()
-        w = F.softmax(qk.float(), dim=-1).to(q.dtype)
-        w = F.dropout(w, p=self.dropout, training=self.training)
-        out = torch.matmul(w, v)
+            freqs_cis_q = self.rotary(ctx_q)
+            freqs_cis_k = self.rotary(ctx_k)
+            q = self.rotary.apply_rotary(q, freqs_cis_q)
+            k = self.rotary.apply_rotary(k, freqs_cis_k)
 
         if Multihead.blend:
+            qk = (q * scale) @ (k * scale).transpose(-1, -2)
+            if mask is not None:
+                qk = qk + mask[:ctx, :ctx]
+            qk = qk.float()
+            w = F.softmax(qk.float(), dim=-1).to(q.dtype)
+            w = F.dropout(w, p=self.dropout, training=self.training)
+            out = torch.matmul(w, v)
             cos_w, cos_qk = self.compute_cosine_attention(q, k, v, mask)
             blend = torch.sigmoid(self.factor)
             out = blend * cos_w + (1 - blend) * out
             qk = blend * cos_qk + (1 - blend) * qk
-        
+
+        if Multihead.cos:
+            out, qk = self.compute_cosine_attention(q, k, v, mask)
+
+        else:
+            qk = (q * scale) @ (k * scale).transpose(-1, -2)
+            if mask is not None:
+                qk = qk + mask[:ctx, :ctx]
+            qk = qk.float()
+            w = F.softmax(qk.float(), dim=-1).to(q.dtype)
+            w = F.dropout(w, p=self.dropout, training=self.training)
+            out = torch.matmul(w, v)
+
         out = out.permute(0, 2, 1, 3).flatten(start_dim=2)
         qk = qk.detach() if self.training else qk
         return out, qk
