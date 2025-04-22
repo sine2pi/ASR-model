@@ -7,6 +7,10 @@ This learnable blend is a modern, under-explored approach addressing the wavefor
 
 3 tests: spectrogram, waveform, spectrogram+waveform.
 
+<img width="679" alt="smoothed" src="https://github.com/user-attachments/assets/6a042c26-6eae-44f1-8830-dfc7c165c483" />
+<img width="115" alt="legensd" src="https://github.com/user-attachments/assets/c64ec786-94cf-47ac-854b-bc18d3d183d4" />
+
+
      Test-1 waveform vs spectrogram vs waveform+spectrogram - pilot run
 
             input_features=True, waveform=False
