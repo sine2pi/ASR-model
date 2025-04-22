@@ -128,27 +128,29 @@ def sinusoids(length, channels, max_timescale=10000):
     scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)      
 
+
 class Rotary(nn.Module):
-    def __init__(self, dim, base_theta=10000.0, learned_freq=False, device=None):
+    def __init__(self, dim, max_seq_len=4096, learned_freq=True):
         super().__init__()
         self.dim = dim
-        self.base_theta = base_theta
-        self.device = device
+        self.inv_freq = nn.Parameter(
+            1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim)),
+            requires_grad=learned_freq
+        )
+        self.bias = nn.Parameter(torch.zeros(max_seq_len, dim // 2))  
 
-        inv_freq = 1.0 / (base_theta ** (torch.arange(0, dim, 2).float() / dim))
-        if learned_freq:
-            self.inv_freq = nn.Parameter(inv_freq, requires_grad=True)
+    def forward(self, positions):
+        if isinstance(positions, int):
+            t = torch.arange(positions, device=self.inv_freq.device).float()
         else:
-            self.register_buffer("inv_freq", inv_freq)
-
-    def forward(self, seq_len):
-        t = torch.arange(seq_len, device=self.inv_freq.device).float()
+            t = positions.float().to(self.inv_freq.device)
         freqs = torch.einsum('i,j->ij', t, self.inv_freq)
-        freqs_cis = torch.polar(torch.ones_like(freqs.float()), freqs.float())  # (seq_len, dim//2)
+        freqs = freqs + self.bias[:freqs.shape[0]]
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
         return freqs_cis
 
     @staticmethod
-    def apply_rotary(x, freqs_cis): # freqs_cis: (seq_len, dim//2) - x: (..., seq_len, dim)
+    def apply_rotary(x, freqs_cis):
         x1 = x[..., :freqs_cis.shape[-1]*2]
         x2 = x[..., freqs_cis.shape[-1]*2:]
         x1 = x1.float().reshape(*x1.shape[:-1], -1, 2)
@@ -235,10 +237,17 @@ class Multihead(nn.Module):
             k = self.betweenness_rope.apply_rope(k, freqs_cos, freqs_sin, betweenness)
             
         else:
-            freqs_cis_q = self.rotary(ctx_q)
-            freqs_cis_k = self.rotary(ctx_k)
-            q = self.rotary.apply_rotary(q, freqs_cis_q)
-            k = self.rotary.apply_rotary(k, freqs_cis_k)
+            if q.shape[2] == k.shape[2]:
+                freqs_cis = self.rotary(ctx_q)
+                q = self.rotary.apply_rotary(q, freqs_cis)
+                k = self.rotary.apply_rotary(k, freqs_cis)
+            else:
+                pos_q = torch.linspace(0, 1, ctx_q, device=q.device)
+                pos_k = torch.linspace(0, 1, ctx_k, device=k.device)
+                freqs_cis_q = self.rotary(pos_q)
+                freqs_cis_k = self.rotary(pos_k)
+                q = self.rotary.apply_rotary(q, freqs_cis_q)
+                k = self.rotary.apply_rotary(k, freqs_cis_k)
 
         if Multihead.blend:
             qk = (q * scale) @ (k * scale).transpose(-1, -2)
