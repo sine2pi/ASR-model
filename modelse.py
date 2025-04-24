@@ -1,5 +1,3 @@
-
-
 import os
 import warnings
 import logging
@@ -7,11 +5,11 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch import Tensor
-from BetweennessRoPE import BetweennessRoPE
 import numpy as np
 from typing import Optional, Dict
 import gzip
 import base64
+import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, precision_score, f1_score, recall_score
 from datetime import datetime
 from datasets import load_dataset, Audio, DatasetDict
@@ -34,7 +32,6 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 tox = {"device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"), "dtype": torch.float32}
 
-
 @dataclass
 class Dimensions:
     vocab: int
@@ -52,7 +49,7 @@ class Dimensions:
     decoder_start_token_id: int
     act: str 
 
-def visualize_attention_weights(attn_weights): # attn_weights: (batch, heads, seq_len, seq_len)
+def visualize_attention_weights(attn_weights):
     import seaborn as sns
     batch, heads, seq_len, _ = attn_weights.shape
     plt.figure(figsize=(12, 4))
@@ -76,7 +73,7 @@ def visualize_rotary_angles(rotary, seq_len):
     plt.legend()
     plt.show()
 
-def visualize_rotary_effects(x, rotary): # x: (batch, seq_len, dim)
+def visualize_rotary_effects(x, rotary):
     seq_len = x.shape[1]
     freqs_cis = rotary(seq_len)
     x_rot = rotary.apply_rotary(x, freqs_cis)
@@ -102,8 +99,8 @@ class BetweennessModule(nn.Module):
         self.window_size = window_size
 
     def compute_betweenness(self, x):
-        batch, seq_len, dim = x.shape  # x: (batch, seq_len, dim)
-        content = self.content_proj(x)  # (batch, seq_len, dim)
+        batch, seq_len, dim = x.shape
+        content = self.content_proj(x)
         device = x.device
         window = self.window_size
 
@@ -114,15 +111,15 @@ class BetweennessModule(nn.Module):
             j = i + offset
             k = i + 2 * offset
            
-            c_i = content[:, i, :]  # (batch, n_indices, dim)
+            c_i = content[:, i, :]
             c_j = content[:, j, :]
             c_k = content[:, k, :]
 
-            direct = torch.norm(c_i - c_k, dim=-1)  # (batch, n_indices)
+            direct = torch.norm(c_i - c_k, dim=-1)
             path = torch.norm(c_i - c_j, dim=-1) + torch.norm(c_j - c_k, dim=-1)
-            between_score = torch.relu(1.0 - (path - direct) / torch.clamp(direct, min=1e-6))  # (batch, n_indices)
+            between_score = torch.relu(1.0 - (path - direct) / torch.clamp(direct, min=1e-6))
 
-            betweenness[:, j] += between_score # Accumulate scores at position j
+            betweenness[:, j] += between_score
 
         betweenness = betweenness / window
         return betweenness
@@ -226,7 +223,7 @@ class Rotary(nn.Module):
         x1 = x1 * freqs_cis
         x1 = torch.view_as_real(x1).flatten(-2)
         return torch.cat([x1.type_as(x), x2], dim=-1)
-
+    
 class Multihead(nn.Module):
     blend = False
     cos = False
@@ -248,9 +245,9 @@ class Multihead(nn.Module):
         self.use_betweenness = False  
 
         if self.use_betweenness:
-            self.betweenness_rope = BetweennessRoPE(dim=head_dim, learned_freq=True)
-        else:
-            self.rotary = Rotary(dim=head_dim, learned_freq=True)
+            self.betweenness = BetweennessModule(dim=dims, window_size=10)
+
+        self.rotary = Rotary(dim=head_dim, learned_freq=True)
 
         if Multihead.blend:
             self.factor = nn.Parameter(torch.tensor(0.5, **tox))
@@ -298,24 +295,18 @@ class Multihead(nn.Module):
         k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
         v = v.view(*v.shape[:2], self.head, -1).permute(0, 2, 1, 3)
 
-        if self.use_betweenness:
-            betweenness = self.betweenness_rope.compute_betweenness(q)
-            freqs_cos, freqs_sin = self.betweenness_rope.precompute_freqs_cis(ctx, q.device)
-            q = self.betweenness_rope.apply_rope(q, freqs_cos, freqs_sin, betweenness)
-            k = self.betweenness_rope.apply_rope(k, freqs_cos, freqs_sin, betweenness)
-            
+        if q.shape[2] == k.shape[2]:
+            freqs_cis = self.rotary(ctx_q)
+            q = self.rotary.apply_rotary(q, freqs_cis)
+            k = self.rotary.apply_rotary(k, freqs_cis)
+
         else:
-            if q.shape[2] == k.shape[2]:
-                freqs_cis = self.rotary(ctx_q)
-                q = self.rotary.apply_rotary(q, freqs_cis)
-                k = self.rotary.apply_rotary(k, freqs_cis)
-            else:
-                pos_q = torch.linspace(0, 1, ctx_q, device=q.device)
-                pos_k = torch.linspace(0, 1, ctx_k, device=k.device)
-                freqs_cis_q = self.rotary(pos_q)
-                freqs_cis_k = self.rotary(pos_k)
-                q = self.rotary.apply_rotary(q, freqs_cis_q)
-                k = self.rotary.apply_rotary(k, freqs_cis_k)
+            pos_q = torch.linspace(0, 1, ctx_q, device=q.device)
+            pos_k = torch.linspace(0, 1, ctx_k, device=k.device)
+            freqs_cis_q = self.rotary(pos_q)
+            freqs_cis_k = self.rotary(pos_k)
+            q = self.rotary.apply_rotary(q, freqs_cis_q)
+            k = self.rotary.apply_rotary(k, freqs_cis_k)
 
         if Multihead.blend:
             qk = (q * scale) @ (k * scale).transpose(-1, -2)
@@ -335,6 +326,13 @@ class Multihead(nn.Module):
 
         else:
             qk = (q * scale) @ (k * scale).transpose(-1, -2)
+            if self.use_betweenness:
+                # Compute betweenness for the query sequence (shape: batch, heads, seq_len)
+                betweenness = self.betweenness_module.compute_betweenness(q)  # You may need to add self.betweenness_module
+                # Expand to match qk shape: (batch, heads, seq_len, seq_len)
+                betw_bias = betweenness.unsqueeze(-1)  # Broadcast along key dimension
+                qk = qk + betw_bias
+
             if mask is not None:
                 qk = qk + mask[:ctx, :ctx]
             qk = qk.float()
@@ -354,6 +352,9 @@ class Residual(nn.Module):
         self.cross_attention = cross_attention
         self.dropout = 0.1
 
+        self.blend_xa = nn.Parameter(torch.tensor(0.5), requires_grad=True) 
+        self.blend = torch.sigmoid(self.blend_xa)
+
         act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(),
             "tanh": nn.Tanh(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
         self.act = act_map.get(act, nn.GELU())
@@ -372,7 +373,8 @@ class Residual(nn.Module):
         r = x
         x = x + self.attna(self.lna(x), mask=mask, kv_cache=kv_cache)[0]
         if self.attnb and xa is not None:
-            x = x + self.attnb(self.lnb(x), xa, kv_cache=kv_cache)[0] 
+            cross_out = self.attnb(self.lnb(x), xa, kv_cache=kv_cache)[0]
+            x = self.blend * x + (1 - self.blend) * cross_out
         x = x + self.mlp(self.lnc(x))
         x = x + r
         return x
@@ -407,7 +409,11 @@ class AudioEncoder(nn.Module):
         self.blend = torch.sigmoid(self.blend_sw)
         self.ln_enc = RMSNorm(normalized_shape=dims)
         self.register_buffer("positional_embedding", sinusoids(ctx, dims))
-        self.betweenness = BetweennessModule(dim=dims, window_size=100)
+
+        self.use_betweenness = False  
+
+        if self.use_betweenness:
+            self.betweenness = BetweennessModule(dim=dims, window_size=10)
 
         self.se = nn.Sequential(
             Conv1d(mels, dims, kernel_size=3, padding=1), self.act,
@@ -445,8 +451,9 @@ class AudioEncoder(nn.Module):
             assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
             x = (x + self.positional_embedding).to(x.dtype)
 
-        be = self.betweenness.compute_betweenness(x)
-        x = x + be.unsqueeze(-1) 
+        if self.use_betweenness:
+            be = self.betweenness.compute_betweenness(x)
+            x = x + be.unsqueeze(-1) 
 
         for block in chain(self.blockA or []):
             x = block(x)
@@ -456,23 +463,31 @@ class AudioEncoder(nn.Module):
 class TextDecoder(nn.Module):
     def __init__(self, vocab: int, ctx: int, dims: int, head: int, layer):
         super().__init__()
+        head_dim = dims // head
+        self.ctx = ctx
         self.dropout = 0.1
         self.token_embedding = nn.Embedding(num_embeddings=vocab, embedding_dim=dims)
         self.positional_embedding = nn.Parameter(data=torch.empty(ctx, dims))
         self.ln_dec = RMSNorm(normalized_shape=dims)
-
+        self.rotary = Rotary(dim=head_dim, learned_freq=True)
         self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, cross_attention=False) for _ in range(layer)]) if layer > 0 else None)
-
         mask = torch.empty(ctx, ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
     def forward(self, x, xa, kv_cache=None) -> Tensor:
+        
         offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
         x = (self.token_embedding(x) + self.positional_embedding[offset: offset + x.shape[-1]])
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
+        
+        ctx = x.shape[1]
+        freqs_cis = self.rotary(ctx)
+        x = self.rotary.apply_rotary(x, freqs_cis)
+
         x = x.to(xa.dtype)
         for block in chain(self.blockA or []):
             x = block(x, xa=xa, mask=self.mask, kv_cache=kv_cache)
+            
         x = self.ln_dec(x)
         logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
         return logits
@@ -516,8 +531,8 @@ class Echo(nn.Module):
     def logits(self,input_ids: torch.Tensor, audio_features: torch.Tensor):
         return self.decoder(input_ids, audio_features)
 
-    def forward(
-        self, 
+    @torch.autocast(device_type="cuda")
+    def forward(self, 
         input_features: torch.Tensor=None, 
         waveform: Optional[torch.Tensor]=None,
         input_ids=None, 
@@ -543,7 +558,6 @@ class Echo(nn.Module):
             raise ValueError("You have to provide either input_features or waveform")
 
         logits = self.decoder(input_ids, encoded_audio)
-        
         loss = None
         if labels is not None:
             loss = F.cross_entropy(
@@ -648,8 +662,6 @@ class Echo(nn.Module):
                 nn.init.zeros_(module.fc[2].bias)
                 self.init_counts["SEBlock"] += 1
             elif isinstance(module, TextDecoder):
-                # nn.init.xavier_uniform_(module.token_embedding.weight)
-                # nn.init.xavier_uniform_(module.positional_embedding)
                 self.init_counts["TextDecoder"] += 1
             elif isinstance(module, AudioEncoder):
                 nn.init.xavier_uniform_(module.se[0].weight)
@@ -691,10 +703,9 @@ class DataCollator:
         if "input_features" in features[0]:
             input_features = [{"input_features": f["input_features"]} for f in features]
             batch["input_features"] = self.extractor.pad(input_features, return_tensors="pt")["input_features"]
-            # print("input_features shape:", batch["input_features"].shape)
         if "waveform" in features[0]:
             waveforms = [f["waveform"] for f in features]
-            fixed_len = 3000 * 160  # Set a fixed length for all waveforms (e.g., 480000 samples for 30 seconds at 16kHz)
+            fixed_len = 3000 * 160
             padded_waveforms = []
             for w in waveforms:
                 if w.shape[-1] < fixed_len:
@@ -703,7 +714,6 @@ class DataCollator:
                     w = w[..., :fixed_len]
                 padded_waveforms.append(w)
             batch["waveform"] = torch.stack(padded_waveforms)
-            # print("waveform shape:", batch["waveform"].shape)
         label_features = [{"input_ids": f["labels"]} for f in features]
         labels_batch = self.tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
@@ -712,7 +722,7 @@ class DataCollator:
         batch["labels"] = labels
         return batch
 
-def prepare_dataset(batch, input_features=True, waveform=True):
+def prepare_dataset(batch, input_features=False, waveform=True):
     audio = batch["audio"]
     fixed_len = 3000 * 160
     wav = torch.tensor(audio["array"]).float()
@@ -721,7 +731,7 @@ def prepare_dataset(batch, input_features=True, waveform=True):
     else:
         wav = wav[..., :fixed_len]
     if waveform:
-        batch["waveform"] = wav.unsqueeze(0)  # (1, N)
+        batch["waveform"] = wav.unsqueeze(0)
     if input_features:
         batch["input_features"] = extractor(wav.numpy(), sampling_rate=audio["sampling_rate"]).input_features[0]
     batch["labels"] = tokenizer(batch["transcription"]).input_ids
@@ -745,14 +755,7 @@ def compute_metrics(eval_pred):
     pred_flat = pred_ids.flatten()
     labels_flat = label_ids.flatten()
     mask = labels_flat != tokenizer.pad_token_id
-  
-    # samp = [0] # sample = random.randint(0, len(pred_str)-1) sample = random.sample(range(10), 1)
-    # for idx in samp:
-    #     print("-" * 10)
-    #     print(f"Step: {trainer.state.global_step}")
-    #     print(f"Prediction: {pred_str[idx]}")
-    #     print(f"Label: {label_str[idx]}")
-
+    blend_sw = model.encoder.blend_sw.item()
     acc = accuracy_score(y_true=labels_flat[mask], y_pred=pred_flat[mask])
     pre = precision_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], 
     average='weighted', zero_division=0)
@@ -760,14 +763,16 @@ def compute_metrics(eval_pred):
     average='weighted', zero_division=0)
     f1 = f1_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], 
     average='weighted', zero_division=0)
-    
+
     return {
         "wer": wer,
         "accuracy": acc,
         "precision": pre,
         "recall": rec,
-        "f1": f1
+        "f1": f1,
+        "blend_sw": blend_sw,
         }
+
 
 if __name__ == "__main__":
 
@@ -819,10 +824,10 @@ if __name__ == "__main__":
         save_strategy="steps",
         max_steps=100000,
         save_steps=100000,
-        eval_steps=2000,
-        warmup_steps=1000,
+        eval_steps=1000,
+        warmup_steps=100,
         num_train_epochs=1,
-        logging_steps=10,
+        logging_steps=100,
         logging_dir=log_dir,
         report_to=["tensorboard"],
         push_to_hub=False,
@@ -838,14 +843,16 @@ if __name__ == "__main__":
         args=training_args,
         model=model,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["test"],
+        eval_dataset=dataset["test"].take(100),
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         processing_class=extractor,
+
     )
     model.init_weights()
     print("Trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
     print("Total parameters:", sum(p.numel() for p in model.parameters()))
+
     trainer.train(resume_from_checkpoint=False)
 
     from tensorboard import program
@@ -854,5 +861,6 @@ if __name__ == "__main__":
     tb.configure(argv=[None, '--logdir', log_dir])
     url = tb.launch()
     print(f"TensorBoard started at {url}")
+
 
 
