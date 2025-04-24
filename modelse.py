@@ -327,10 +327,11 @@ class Multihead(nn.Module):
         else:
             qk = (q * scale) @ (k * scale).transpose(-1, -2)
             if self.use_betweenness:
-                # Compute betweenness for the query sequence (shape: batch, heads, seq_len)
-                betweenness = self.betweenness_module.compute_betweenness(q)  # You may need to add self.betweenness_module
-                # Expand to match qk shape: (batch, heads, seq_len, seq_len)
-                betw_bias = betweenness.unsqueeze(-1)  # Broadcast along key dimension
+                batch, heads, seq_len, head_dim = q.shape
+                q_reshaped = q.reshape(batch * heads, seq_len, head_dim)
+                betweenness = self.betweenness.compute_betweenness(q_reshaped)
+                betweenness = betweenness.view(batch, heads, seq_len)
+                betw_bias = betweenness.unsqueeze(-1)
                 qk = qk + betw_bias
 
             if mask is not None:
