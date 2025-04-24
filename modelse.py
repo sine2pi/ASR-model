@@ -34,6 +34,7 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 tox = {"device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"), "dtype": torch.float32}
 
+
 @dataclass
 class Dimensions:
     vocab: int
@@ -51,18 +52,85 @@ class Dimensions:
     decoder_start_token_id: int
     act: str 
 
-def visualize_mask(mask, title="Attention Mask"):
-    import matplotlib.pyplot as plt
-    if mask.dim() == 4:
-        mask_vis = mask[0, 0].cpu().detach().numpy()
-    else:
-        mask_vis = mask.cpu().detach().numpy()
-    plt.figure(figsize=(10, 8))
-    plt.imshow(mask_vis, cmap='viridis')
-    plt.title(title)
-    plt.colorbar()
-    plt.savefig(f"{title.replace(' ', '_')}.png")
-    plt.close()
+def visualize_attention_weights(attn_weights): # attn_weights: (batch, heads, seq_len, seq_len)
+    import seaborn as sns
+    batch, heads, seq_len, _ = attn_weights.shape
+    plt.figure(figsize=(12, 4))
+    for h in range(min(4, heads)):
+        plt.subplot(1, min(4, heads), h+1)
+        sns.heatmap(attn_weights[0, h].detach().cpu().numpy())
+        plt.title(f'Head {h}')
+    plt.suptitle("Attention Weights")
+    plt.show()
+
+def visualize_rotary_angles(rotary, seq_len):
+    freqs = rotary.inv_freq.detach().cpu().numpy()
+    t = np.arange(seq_len)
+    angles = np.outer(t, freqs)
+    plt.figure(figsize=(10, 6))
+    for i in range(min(4, angles.shape[1])):
+        plt.plot(angles[:, i], label=f'Freq {i}')
+    plt.title("Rotary Angles per Position")
+    plt.xlabel("Position")
+    plt.ylabel("Angle (radians)")
+    plt.legend()
+    plt.show()
+
+def visualize_rotary_effects(x, rotary): # x: (batch, seq_len, dim)
+    seq_len = x.shape[1]
+    freqs_cis = rotary(seq_len)
+    x_rot = rotary.apply_rotary(x, freqs_cis)
+    idx = 0
+    dims_to_plot = [0, 1, 2, 3]
+    plt.figure(figsize=(10, 6))
+    for d in dims_to_plot:
+        plt.plot(x[idx, :, d].detach().cpu().numpy(), label=f'Orig dim {d}')
+        plt.plot(x_rot[idx, :, d].detach().cpu().numpy(), '--', label=f'Rotary dim {d}')
+    plt.title("Effect of Rotary on Embedding Dimensions")
+    plt.xlabel("Sequence Position")
+    plt.ylabel("Embedding Value")
+    plt.legend()
+    plt.show()
+    
+class BetweennessModule(nn.Module):
+    def __init__(self, dim, adjustment_scale=0.1, window_size=10):
+        super().__init__()
+        self.dim = dim
+        self.adjustment_scale = adjustment_scale
+        self.content_proj = nn.Linear(dim, dim)
+        self.betweenness_gate = nn.Parameter(torch.ones(1) * 0.5)
+        self.window_size = window_size
+
+    def compute_betweenness(self, x):
+        batch, seq_len, dim = x.shape  # x: (batch, seq_len, dim)
+        content = self.content_proj(x)  # (batch, seq_len, dim)
+        device = x.device
+        window = self.window_size
+
+        betweenness = torch.zeros(batch, seq_len, device=device)
+
+        for offset in range(1, window + 1):
+            i = torch.arange(seq_len - 2 * offset, device=device)
+            j = i + offset
+            k = i + 2 * offset
+           
+            c_i = content[:, i, :]  # (batch, n_indices, dim)
+            c_j = content[:, j, :]
+            c_k = content[:, k, :]
+
+            direct = torch.norm(c_i - c_k, dim=-1)  # (batch, n_indices)
+            path = torch.norm(c_i - c_j, dim=-1) + torch.norm(c_j - c_k, dim=-1)
+            between_score = torch.relu(1.0 - (path - direct) / torch.clamp(direct, min=1e-6))  # (batch, n_indices)
+
+            betweenness[:, j] += between_score # Accumulate scores at position j
+
+        betweenness = betweenness / window
+        return betweenness
+
+def apply_to_rope(rope_func, x, positions, betweenness_module):
+    adjustments = betweenness_module.get_position_adjustments(x)
+    adjusted_positions = positions + adjustments
+    return rope_func(x, adjusted_positions)
 
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
     shifted_input_ids = input_ids.new_zeros(input_ids.shape)
@@ -122,12 +190,12 @@ def default(val, d):
     return val if exists(val) else d
 
 def sinusoids(length, channels, max_timescale=10000):
+    """Returns sinusoids for positional embedding"""
     assert channels % 2 == 0
     log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
     inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2))
     scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)      
-
 
 class Rotary(nn.Module):
     def __init__(self, dim, max_seq_len=4096, learned_freq=True):
@@ -153,7 +221,7 @@ class Rotary(nn.Module):
     def apply_rotary(x, freqs_cis):
         x1 = x[..., :freqs_cis.shape[-1]*2]
         x2 = x[..., freqs_cis.shape[-1]*2:]
-        x1 = x1.float().reshape(*x1.shape[:-1], -1, 2)
+        x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous() 
         x1 = torch.view_as_complex(x1)
         x1 = x1 * freqs_cis
         x1 = torch.view_as_real(x1).flatten(-2)
@@ -325,25 +393,30 @@ class SEBlock(nn.Module):
         y = self.fc(y).view(b, c, 1)
         return x * y
 
-
 class AudioEncoder(nn.Module):
     def __init__(self, mels: int, ctx: int, dims: int, head: int, layer, act: str = "relu"):
         super().__init__()
-
+        self.ctx = ctx
         self.dropout = 0.1
-        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), 
+        
+        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(),
                    "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
         self.act = act_map.get(act, nn.GELU())
 
-        self.blend_sw = nn.Parameter(torch.tensor(0.5), requires_grad=True) # 
+        self.blend_sw = nn.Parameter(torch.tensor(0.5), requires_grad=True)
+        self.blend = torch.sigmoid(self.blend_sw)
+        self.ln_enc = RMSNorm(normalized_shape=dims)
+        self.register_buffer("positional_embedding", sinusoids(ctx, dims))
+        self.betweenness = BetweennessModule(dim=dims, window_size=100)
 
-        self.se = nn.Sequential(Conv1d(mels, dims, kernel_size=3, padding=1), self.act, # spectrogram encoder
-            Conv1d(dims, dims, kernel_size=3, stride=1, padding=2, dilation=2), 
-            Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims),     
+        self.se = nn.Sequential(
+            Conv1d(mels, dims, kernel_size=3, padding=1), self.act,
+            Conv1d(dims, dims, kernel_size=3, stride=1, padding=2, dilation=2),
+            Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims),
             Conv1d(dims, dims, kernel_size=1), SEBlock(dims, reduction=16), self.act,
-            nn.Dropout(p=self.dropout), Conv1d(dims, dims, kernel_size=3, stride=1, padding=1))
-        
-        self.we = nn.Sequential( # waveform encoder
+            nn.Dropout(p=self.dropout), Conv1d(dims, dims, kernel_size=3, stride=1, padding=1)
+        )
+        self.we = nn.Sequential(
             nn.Conv1d(1, dims, kernel_size=11, stride=5, padding=5),
             nn.GELU(),
             nn.Conv1d(dims, dims, kernel_size=5, stride=2, padding=2),
@@ -351,29 +424,19 @@ class AudioEncoder(nn.Module):
             nn.AdaptiveAvgPool1d(ctx),
         )
 
-        self.register_buffer("positional_embedding", sinusoids(ctx, dims))       
-
-        self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, cross_attention=False, act = "relu")
+        self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, cross_attention=False, act="relu")
                     for _ in range(layer)]) if layer > 0 else None)
-        
-        self.ln_enc = RMSNorm(normalized_shape=dims)
-        # self.se_norm = RMSNorm(normalized_shape=dims)
-        # self.we_norm = RMSNorm(normalized_shape=dims)
 
     def forward(self, x, w) -> Tensor:
-        """ x : torch.Tensor, shape = (batch, mels, ctx) the mel spectrogram of the audio input"""
-        """ w : torch.Tensor, shape = (batch, 1, ctx) the waveform of the audio input """
-        """ x : torch.Tensor, shape = (batch, ctx, dims) the encoder output """
         if x is not None:
             if w is not None:
                 x = self.se(x).permute(0, 2, 1)
                 x = (x + self.positional_embedding).to(x.dtype)
                 w = self.we(w).permute(0, 2, 1)
-                blend = torch.sigmoid(self.blend_sw)
-                x = blend * x + (1 - blend) * w
+                x = self.blend * x + (1 - self.blend) * w
             else:
-                x = self.se(x) 
-                x = x.permute(0, 2, 1) 
+                x = self.se(x)
+                x = x.permute(0, 2, 1)
                 assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
                 x = (x + self.positional_embedding).to(x.dtype)
         else:
@@ -382,8 +445,12 @@ class AudioEncoder(nn.Module):
             assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
             x = (x + self.positional_embedding).to(x.dtype)
 
+        be = self.betweenness.compute_betweenness(x)
+        x = x + be.unsqueeze(-1) 
+
         for block in chain(self.blockA or []):
             x = block(x)
+
         return self.ln_enc(x)
 
 class TextDecoder(nn.Module):
