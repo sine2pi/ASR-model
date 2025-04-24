@@ -245,7 +245,7 @@ class Multihead(nn.Module):
         self.use_betweenness = False  
 
         if self.use_betweenness:
-            self.betweenness = BetweennessModule(dim=dims, window_size=10)
+            self.betweenness = BetweennessModule(dim=head_dim, window_size=10)
 
         self.rotary = Rotary(dim=head_dim, learned_freq=True)
 
