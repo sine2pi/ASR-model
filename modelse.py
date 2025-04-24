@@ -107,6 +107,9 @@ class BetweennessModule(nn.Module):
         betweenness = torch.zeros(batch, seq_len, device=device)
 
         for offset in range(1, window + 1):
+            n_indices = seq_len - 2 * offset
+            if n_indices <= 0:
+                continue  
             i = torch.arange(seq_len - 2 * offset, device=device)
             j = i + offset
             k = i + 2 * offset
