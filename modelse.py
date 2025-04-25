@@ -19,7 +19,6 @@ from typing import Union, List, Any
 import evaluate
 import transformers
 from dataclasses import dataclass
-from mask import UniversalMask
 from itertools import chain
 
 # torch.backends.cudnn.allow_tf32 = True
@@ -720,23 +719,6 @@ class Echo(nn.Module):
             self.encoder.apply(install_hooks)
         self.decoder.apply(install_hooks)
         return cache, hooks
-    
-    @staticmethod
-    def create_attention_mask(batch_size, ctx, num_heads, is_causal=False, 
-                            device=None, dtype=None, xa_ctx=None):
-        mask_type = "cross_attention" if xa_ctx is not None else "combined"
-        
-        return UniversalMask.create(
-            batch_size=batch_size,
-            ctx=ctx,
-            ctx_kv=xa_ctx if xa_ctx is not None else ctx,
-            num_heads=num_heads,
-            mask_type=mask_type,
-            is_causal=is_causal,
-            padding_mask=None,
-            device=device,
-            dtype=dtype
-        )
     
     def _init_weights(self, module):
         std = 0.02
