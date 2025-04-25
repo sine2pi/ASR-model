@@ -1,3 +1,4 @@
+
 import os
 import warnings
 import logging
@@ -21,8 +22,8 @@ from dataclasses import dataclass
 from mask import UniversalMask
 from itertools import chain
 
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cuda.matmul.allow_tf32 = True
+# torch.backends.cudnn.allow_tf32 = True
+# torch.backends.cuda.matmul.allow_tf32 = True
 transformers.utils.logging.set_verbosity_error()
 device = torch.device(device="cuda:0")
 dtype = torch.float32
@@ -88,7 +89,94 @@ def visualize_rotary_effects(x, rotary):
     plt.ylabel("Embedding Value")
     plt.legend()
     plt.show()
+    
 
+def plot_betweenness(be, title="Betweenness"):
+    """
+    Plots betweenness for a batch of sequences.
+    Args:
+        be: Tensor of shape (batch, seq_len)
+    """
+    be = be.detach().cpu().numpy()
+    plt.figure(figsize=(12, 3))
+    for i in range(min(4, be.shape[0])):
+        plt.plot(be[i], label=f"Sample {i}")
+    plt.title(title)
+    plt.xlabel("Sequence Position")
+    plt.ylabel("Betweenness")
+    plt.legend()
+    plt.show()
+
+def plot_waveform_and_spectrogram(waveform, spectrogram, sample_idx=0, sr=16000, title="Waveform and Spectrogram"):
+    """
+    Plots the waveform and spectrogram for a single sample.
+    Args:
+        waveform: Tensor of shape (batch, 1, n_samples) or (batch, n_samples)
+        spectrogram: Tensor of shape (batch, seq_len, n_mels) or (batch, n_mels, seq_len)
+        sample_idx: which sample in the batch to plot
+        sr: sample rate for x-axis scaling (default 16kHz)
+    """
+    wf = waveform[sample_idx].detach().cpu().numpy()
+    if wf.ndim > 1:
+        wf = wf.squeeze()
+    t = np.arange(len(wf)) / sr
+
+    spec = spectrogram[sample_idx].detach().cpu().numpy()
+    if spec.shape[0] < spec.shape[1]:
+        spec = spec.T
+
+    fig, axs = plt.subplots(2, 1, figsize=(14, 6), sharex=False)
+    axs[0].plot(t, wf, color="tab:blue")
+    axs[0].set_title("Waveform")
+    axs[0].set_xlabel("Time (s)")
+    axs[0].set_ylabel("Amplitude")
+
+    axs[1].imshow(spec.T, aspect="auto", origin="lower", cmap="magma")
+    axs[1].set_title("Spectrogram")
+    axs[1].set_xlabel("Frame")
+    axs[1].set_ylabel("Mel Bin")
+    plt.tight_layout()
+    plt.show()
+
+def plot_betweenness_overlay(be, x, sample_idx=0, title="Betweenness Overlay"):
+    """
+    Overlay betweenness with spectrogram and energy for a single sample.
+    Args:
+        be: Tensor of shape (batch, seq_len)
+        x: Tensor of shape (batch, seq_len, n_mels) or (batch, n_mels, seq_len)
+        sample_idx: which sample in the batch to plot
+    """
+    import matplotlib.pyplot as plt
+
+    be = be[sample_idx].detach().cpu().numpy()
+    if x.shape[1] != be.shape[0] and x.shape[-1] == be.shape[0]:
+        x = x.permute(0, 2, 1)
+    spec = x[sample_idx].detach().cpu().numpy()
+    energy = spec.mean(axis=1)
+
+    fig, ax1 = plt.subplots(figsize=(14, 5))
+    ax1.set_title(title)
+    ax1.set_xlabel("Sequence Position")
+    ax1.set_ylabel("Betweenness", color="tab:red")
+    ax1.plot(be, color="tab:red", label="Betweenness")
+    ax1.tick_params(axis='y', labelcolor="tab:red")
+    ax1.legend(loc="upper left")
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel("Energy", color="tab:blue")
+    ax2.plot(energy, color="tab:blue", alpha=0.5, label="Energy")
+    ax2.tick_params(axis='y', labelcolor="tab:blue")
+    ax2.legend(loc="upper right")
+
+    plt.show()
+
+    plt.figure(figsize=(14, 3))
+    plt.imshow(spec.T, aspect="auto", origin="lower", cmap="magma")
+    plt.colorbar(label="Spectrogram (dB)")
+    plt.title("Input Spectrogram")
+    plt.xlabel("Sequence Position")
+    plt.ylabel("Mel Bin")
+    plt.show()
 
 class BetweennessModule(nn.Module):
     def __init__(self, dim, adjustment_scale=1.0, window_size=10):
@@ -417,6 +505,13 @@ class SEBlock(nn.Module):
 class AudioEncoder(nn.Module):
     def __init__(self, mels: int, ctx: int, dims: int, head: int, layer, act: str = "relu"):
         super().__init__()
+
+        self._counter = 0
+        self.use_betweenness = False  
+        self.dims = dims
+        self.head = head
+        self.head_dim = dims // head
+        self.mels = mels
         self.ctx = ctx
         self.dropout = 0.1
         
@@ -429,10 +524,8 @@ class AudioEncoder(nn.Module):
         self.ln_enc = RMSNorm(normalized_shape=dims)
         self.register_buffer("positional_embedding", sinusoids(ctx, dims))
 
-        self.use_betweenness = False  
-
         if self.use_betweenness:
-            self.betweenness = BetweennessModule(dim=dims, window_size=10)
+            self.betweenness = BetweennessModule(dim=dims, window_size=1, adjustment_scale=0.5)
 
         self.se = nn.Sequential(
             Conv1d(mels, dims, kernel_size=3, padding=1), self.act,
@@ -455,9 +548,13 @@ class AudioEncoder(nn.Module):
     def forward(self, x, w) -> Tensor:
         if x is not None:
             if w is not None:
-                x = self.se(x).permute(0, 2, 1)
-                x = (x + self.positional_embedding).to(x.dtype)
-                w = self.we(w).permute(0, 2, 1)
+                x_spec = self.se(x).permute(0, 2, 1)
+                w_wave = self.we(w).permute(0, 2, 1)
+                if self._counter < 1:
+                    plot_waveform_and_spectrogram(w, x)
+
+                x = (x_spec + self.positional_embedding).to(x.dtype)
+                w = w_wave
                 x = self.blend * x + (1 - self.blend) * w
             else:
                 x = self.se(x)
@@ -476,20 +573,24 @@ class AudioEncoder(nn.Module):
 
         for block in chain(self.blockA or []):
             x = block(x)
-
+        self._counter += 1
         return self.ln_enc(x)
 
 class TextDecoder(nn.Module):
     def __init__(self, vocab: int, ctx: int, dims: int, head: int, layer):
         super().__init__()
+        
         head_dim = dims // head
         self.ctx = ctx
         self.dropout = 0.1
+
         self.token_embedding = nn.Embedding(num_embeddings=vocab, embedding_dim=dims)
         self.positional_embedding = nn.Parameter(data=torch.empty(ctx, dims))
         self.ln_dec = RMSNorm(normalized_shape=dims)
         self.rotary = Rotary(dim=head_dim, learned_freq=True)
+        
         self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, cross_attention=False) for _ in range(layer)]) if layer > 0 else None)
+
         mask = torch.empty(ctx, ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
@@ -575,6 +676,7 @@ class Echo(nn.Module):
             encoded_audio = self.encoder(x=None, w=waveform)
         else:
             raise ValueError("You have to provide either input_features or waveform")
+
 
         logits = self.decoder(input_ids, encoded_audio)
         loss = None
@@ -688,7 +790,6 @@ class Echo(nn.Module):
                 nn.init.xavier_uniform_(module.se[2].weight)
                 nn.init.zeros_(module.se[2].bias)
                 nn.init.xavier_uniform_(module.se[4].weight)
-
                 nn.init.zeros_(module.se[4].bias)
                 self.init_counts["AudioEncoder"] += 1
             elif isinstance(module, Residual):
@@ -724,7 +825,7 @@ class DataCollator:
             batch["input_features"] = self.extractor.pad(input_features, return_tensors="pt")["input_features"]
         if "waveform" in features[0]:
             waveforms = [f["waveform"] for f in features]
-            fixed_len = 3000 * 160
+            fixed_len = 1500 * 160
             padded_waveforms = []
             for w in waveforms:
                 if w.shape[-1] < fixed_len:
@@ -741,9 +842,9 @@ class DataCollator:
         batch["labels"] = labels
         return batch
 
-def prepare_dataset(batch, input_features=False, waveform=True):
+def prepare_dataset(batch, input_features=True, waveform=True):
     audio = batch["audio"]
-    fixed_len = 3000 * 160
+    fixed_len = 1500 * 160
     wav = torch.tensor(audio["array"]).float()
     if wav.shape[-1] < fixed_len:
         wav = F.pad(wav, (0, fixed_len - wav.shape[-1]))
@@ -770,11 +871,19 @@ def compute_metrics(eval_pred):
     label_ids[label_ids == -100] = tokenizer.pad_token_id
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+    if len(pred_ids) > 0:
+        print("\nSample Predictions:")
+        for idx in range(min(1, len(pred_ids))):
+            print(f"  Example {idx+1}:")
+            print(f"• Reference: {label_str[idx]}")
+            print(f"• Prediction: {pred_str[idx]}")
+        print("="*80 + "\n")
+
     wer = 100 * metric.compute(predictions=pred_str, references=label_str)
     pred_flat = pred_ids.flatten()
     labels_flat = label_ids.flatten()
     mask = labels_flat != tokenizer.pad_token_id
-    blend_sw = model.encoder.blend_sw.item()
     acc = accuracy_score(y_true=labels_flat[mask], y_pred=pred_flat[mask])
     pre = precision_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], 
     average='weighted', zero_division=0)
@@ -789,15 +898,142 @@ def compute_metrics(eval_pred):
         "precision": pre,
         "recall": rec,
         "f1": f1,
-        "blend_sw": blend_sw,
         }
 
+class MaxFactor(torch.optim.Optimizer):
+    __version__ = "1.0"
+    
+    def __init__(self, params, lr=0.025, beta2_decay=-0.8, eps=(1e-10, 1e-4), d=1.0, 
+                 weight_decay=0.025, gamma=0.99, max=False, min_lr=1e-7):
+        
+        print(f"Using MaxFactor optimizer v{self.__version__}")
+        
+        defaults = dict(lr=lr, beta2_decay=beta2_decay, eps=eps, d=d, weight_decay=weight_decay, 
+                        gamma=gamma, max=max, min_lr=min_lr)
+        super().__init__(params=params, defaults=defaults)
+
+    def get_lr(self):
+        """Return last-used learning rates for all parameter groups."""
+        param_specific_lrs = []
+        for group in self.param_groups:
+            group_lrs = []
+            for p in group["params"]:
+                state = self.state[p]
+                if "last_alpha" in state:
+                    group_lrs.append(state["last_alpha"])
+            if group_lrs:
+                param_specific_lrs.append(sum(group_lrs) / len(group_lrs))
+            else:
+                param_specific_lrs.append(group["lr"])
+        return param_specific_lrs
+    
+    def get_last_lr(self):
+        return self.get_lr()
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            params_with_grad, grads, row_vars, col_vars, v, state_steps = [], [], [], [], [], []
+            eps1, eps2 = group["eps"]
+            min_lr = group.get("min_lr", 1e-7)
+            
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                    
+                grad = p.grad
+                if grad.dtype in {torch.float16, torch.bfloat16}:
+                    grad = grad.float()
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = torch.tensor(0.0, dtype=torch.float32)
+                    if p.dim() > 1:
+                        row_shape, col_shape = list(p.shape), list(p.shape)
+                        row_shape[-1], col_shape[-2] = 1, 1
+                        state["row_var"] = p.new_zeros(row_shape)
+                        state["col_var"] = p.new_zeros(col_shape)
+                    state["v"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+                row_vars.append(state.get("row_var", None))
+                col_vars.append(state.get("col_var", None))
+                v.append(state["v"])
+                state_steps.append(state["step"])
+                params_with_grad.append(p)
+                grads.append(grad)
+
+            for i, param in enumerate(params_with_grad):
+                grad = grads[i]
+                state = self.state[param]
+
+                if group["max"]:
+                    grad = -grad
+                    
+                step_t = state_steps[i]
+                row_var, col_var, vi = row_vars[i], col_vars[i], v[i]
+
+                if eps1 is None:
+                    eps1 = torch.finfo(param.dtype).eps
+                
+                step_t += 1
+                step_float = step_t.item()
+                
+                one_minus_beta2_t = min(0.999, max(0.001, step_float ** group["beta2_decay"]))
+                
+                rho_t = max(min_lr, min(group["lr"], 1.0 / (step_float ** 0.5)))
+                alpha = max(eps2, (param.norm() / (param.numel() ** 0.5 + 1e-12)).item()) * rho_t
+
+                state["last_alpha"] = alpha
+
+                if group["weight_decay"] > 0:
+                    param.mul_(1 - group["lr"] * group["weight_decay"])
+
+                if grad.dim() > 1:
+                    row_mean = torch.norm(grad, dim=-1, keepdim=True).square_()
+                    row_mean.div_(grad.size(-1) + eps1)
+                    
+                    row_var.lerp_(row_mean, one_minus_beta2_t)
+                    
+                    col_mean = torch.norm(grad, dim=-2, keepdim=True).square_()
+                    col_mean.div_(grad.size(-2) + eps1)
+                    
+                    col_var.lerp_(col_mean, one_minus_beta2_t)
+                    
+                    var_estimate = row_var @ col_var
+                    max_row_var = row_var.max(dim=-2, keepdim=True)[0]  
+                    var_estimate.div_(max_row_var.clamp_(min=eps1))
+                else:
+                    vi.mul_(group["gamma"]).add_(grad.square_(), alpha=1 - group["gamma"])
+                    var_estimate = vi
+
+                update = var_estimate.clamp_(min=eps1 * eps1).rsqrt_().mul_(grad)
+                
+                inf_norm = torch.norm(update, float('inf'))
+                if inf_norm > 0:
+                    update.div_(inf_norm.clamp_(min=eps1))
+                
+                denom = max(1.0, update.norm(2).item() / ((update.numel() ** 0.5) * group["d"]))
+                
+                if param.dim() > 1:
+                    max_vals = update.abs().max(dim=-1, keepdim=True)[0]
+                    param.add_(-alpha / denom * update.sign() * max_vals)
+                else:
+                    param.add_(-alpha / denom * update)
+                
+                state["step"] = step_t
+                
+        return loss
 
 if __name__ == "__main__":
 
     param = Dimensions(
-        mels=80,
-        audio_ctx=3000,
+        mels=128,
+        audio_ctx=1500,
         audio_head=4,
         encoder_idx=4,
         audio_dims=512,
@@ -816,7 +1052,7 @@ if __name__ == "__main__":
 
     token=""
     extractor = WhisperFeatureExtractor.from_pretrained(
-        "openai/whisper-small", token=token, feature_size=80, sampling_rate=16000, do_normalize=True, return_tensors="pt")
+        "openai/whisper-small", token=token, feature_size=128, sampling_rate=16000, do_normalize=True, return_tensors="pt", chunk_length=15)
     tokenizer = WhisperTokenizerFast.from_pretrained(
         "openai/whisper-small", language="en", task="transcribe", token=token)
     data_collator = DataCollator(extractor=extractor,
@@ -841,10 +1077,10 @@ if __name__ == "__main__":
         bf16=True,
         eval_strategy="steps",
         save_strategy="steps",
-        max_steps=100000,
-        save_steps=100000,
+        max_steps=10000,
+        save_steps=10000,
         eval_steps=1000,
-        warmup_steps=100,
+        warmup_steps=1000,
         num_train_epochs=1,
         logging_steps=100,
         logging_dir=log_dir,
@@ -854,32 +1090,275 @@ if __name__ == "__main__":
         save_total_limit=1,
         label_names=["labels"],
         eval_on_start=False,
-        optim="adafactor",
+        # optim="adafactor",
         save_safetensors=True,
     )
+
+    optimizer = MaxFactorA(model.parameters(), lr = 0.025,
+    beta2_decay = -0.8,
+    eps = (1e-10, 0.0001),
+    d = 1,
+    weight_decay = 0.025,
+    gamma = 0.99,
+    max = False,
+    min_lr = 1e-7)
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000, eta_min=1e-6)
 
     trainer = Seq2SeqTrainer(
         args=training_args,
         model=model,
-        train_dataset=dataset["train"],
+        train_dataset=dataset["train"].shuffle(seed=42).take(1000),
         eval_dataset=dataset["test"].take(100),
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         processing_class=extractor,
-
+        optimizers=(optimizer, scheduler),  
     )
+
     model.init_weights()
     print("Trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
     print("Total parameters:", sum(p.numel() for p in model.parameters()))
 
     trainer.train(resume_from_checkpoint=False)
 
-    from tensorboard import program
-    log_dir = "./output/logs" 
-    tb = program.TensorBoard()
-    tb.configure(argv=[None, '--logdir', log_dir])
-    url = tb.launch()
-    print(f"TensorBoard started at {url}")
 
+
+## pytorch loop
+
+# def train(
+#     model,
+#     dataset,
+#     data_collator,
+#     tokenizer,
+#     optimizer=None,
+#     scheduler=None,
+#     train_set=None,
+#     eval_set=None,
+#     epochs=3,
+#     batch_size=1,
+#     lr=2e-4,
+#     device="cuda",
+#     grad_accum_steps=1,
+#     max_grad_norm=1.0,
+#     log_dir="./output/logs",
+#     save_best=True,
+#     early_stopping_patience=None,
+#     max_steps=10000,
+#     eval_steps=1000,
+# ):
+#     from torch.utils.tensorboard import SummaryWriter
+#     import os
+
+#     writer = SummaryWriter(log_dir=log_dir)
+#     model = model.to(device)
+#     optimizer = optimizer
+#     scheduler = scheduler
+#     scaler = torch.amp.GradScaler('cuda')
+#     train_set = dataset["train"]
+#     eval_set = dataset["test"]
+
+#     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, collate_fn=data_collator)
+#     eval_loader = DataLoader(eval_set, batch_size=batch_size, shuffle=False, collate_fn=data_collator)
+
+#     best_wer = float("inf")
+#     best_step = 0
+#     patience_counter = 0
+#     global_step = 0
+#     running_loss = 0
+
+#     train_iter = iter(train_loader)
+#     pbar = tqdm(total=max_steps, desc="Training", dynamic_ncols=True)
+#     model.train()
+#     optimizer.zero_grad()
+
+
+#     while global_step < max_steps:
+#         try:
+#             batch = next(train_iter)
+#         except StopIteration:
+#             train_iter = iter(train_loader)
+#             batch = next(train_iter)
+#         for k in batch:
+#             if isinstance(batch[k], torch.Tensor):
+#                 batch[k] = batch[k].to(device)
+#         with torch.cuda.amp.autocast():
+#             outputs = model(
+#                 input_features=batch.get("input_features", None),
+#                 waveform=batch.get("waveform", None),
+#                 input_ids=None,
+#                 labels=batch["labels"]
+#             )
+#             loss = outputs["loss"] / grad_accum_steps
+#         scaler.scale(loss).backward()
+#         running_loss += loss.item() * grad_accum_steps
+
+#         if (global_step + 1) % grad_accum_steps == 0:
+#             scaler.unscale_(optimizer)
+#             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+#             scaler.step(optimizer)
+#             scaler.update()
+#             optimizer.zero_grad()
+
+#             if scheduler is not None:
+#                 scheduler.step()
+#             writer.add_scalar("train/loss", loss.item() * grad_accum_steps, global_step)
+#             writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+
+
+#         pbar.set_postfix({
+#             "loss": f"{loss.item() * grad_accum_steps:.4f}",
+#             "lr": optimizer.param_groups[0]["lr"]
+#         })
+#         pbar.update(1)
+#         global_step += 1
+
+#         if global_step % eval_steps == 0 or global_step == max_steps:
+#             model.eval()
+#             all_preds, all_labels = [], []
+#             eval_loss = 0
+#             with torch.no_grad():
+#                 for batch_eval in tqdm(eval_loader, desc=f"Eval@step{global_step}", leave=False):
+#                     for k in batch_eval:
+#                         if isinstance(batch_eval[k], torch.Tensor):
+#                             batch_eval[k] = batch_eval[k].to(device)
+#                     outputs = model(
+#                         input_features=batch_eval.get("input_features", None),
+#                         waveform=batch_eval.get("waveform", None),
+#                         input_ids=None,
+#                         labels=batch_eval["labels"]
+#                     )
+#                     logits = outputs["logits"]
+#                     labels = batch_eval["labels"]
+#                     loss = outputs["loss"]
+#                     eval_loss += loss.item()
+#                     preds = torch.argmax(logits, dim=-1)
+#                     labels_for_decode = labels.clone()
+#                     labels_for_decode[labels_for_decode == -100] = tokenizer.pad_token_id
+#                     all_preds.extend(preds.cpu().numpy())
+#                     all_labels.extend(labels_for_decode.cpu().numpy())
+#             avg_eval_loss = eval_loss / len(eval_loader)
+#             pred_str = tokenizer.batch_decode(all_preds, skip_special_tokens=True)
+#             label_str = tokenizer.batch_decode(all_labels, skip_special_tokens=True)
+
+#             if len(all_preds) > 0:
+#                 print("\nSample Predictions:")
+#                 for idx in range(min(1, len(all_preds))):
+#                     print(f"  Example {idx+1}:")
+#                     print(f"• Reference: {label_str[idx]}")
+#                     print(f"• Prediction: {pred_str[idx]}")
+#                 print("="*80 + "\n")
+
+#             wer = 100 * metric.compute(predictions=pred_str, references=label_str)
+#             writer.add_scalar("eval/loss", avg_eval_loss, global_step)
+#             writer.add_scalar("eval/wer", wer, global_step)
+#             # scheduler.step(avg_eval_loss)
+#             scheduler.step()
+#             lr = scheduler.get_last_lr()[0]
+#             pbar.set_postfix({
+#                 "loss": f"{loss.item() * grad_accum_steps:.4f}",
+#                 "lr": lr,
+#                 "eval_wer": f"{wer:.2f}"
+#             })
+#             print(f"\nStep {global_step}: eval loss {avg_eval_loss:.4f}, WER {wer:.2f}")
+
+#             # Save best model
+#             if save_best and wer < best_wer:
+#                 best_wer = wer
+#                 best_step = global_step
+#                 torch.save(model.state_dict(), os.path.join(log_dir, "best_model.pt"))
+#                 print(f"Best model saved at step {global_step} with WER {wer:.2f}")
+
+#             # Early stopping
+#             if early_stopping_patience is not None:
+#                 if wer < best_wer:
+#                     patience_counter = 0
+#                 else:
+#                     patience_counter += 1
+#                     if patience_counter >= early_stopping_patience:
+#                         print(f"Early stopping at step {global_step}")
+#                         break
+#             model.train()
+#             lr = scheduler.get_last_lr()[0]
+#             writer.add_scalar("train/lr", lr, global_step)
+#             pbar.set_postfix({
+#                 "loss": f"{loss.item() * grad_accum_steps:.4f}",
+#                 "lr": lr,
+#                 "eval_wer": f"{wer:.2f}"
+#             })
+
+#     print(f"Training complete. Best WER: {best_wer:.2f} at step {best_step}")
+#     writer.close()
+
+# if __name__ == "__main__":
+
+#     param = Dimensions(
+#         mels=128,
+#         audio_ctx=1500,
+#         audio_head=4,
+#         encoder_idx=4,
+#         audio_dims=512,
+#         vocab=51865,
+#         text_ctx=512,
+#         text_head=4,
+#         decoder_idx=4,
+#         text_dims=512,
+#         decoder_start_token_id = 50258,
+#         pad_token_id = 50257,
+#         eos_token_id = 50257,   
+#         act = "gelu",
+#         )
+
+#     model = Echo(param).to('cuda')
+
+#     token=""
+#     extractor = WhisperFeatureExtractor.from_pretrained(
+#         "openai/whisper-small", token=token, feature_size=128, sampling_rate=16000, do_normalize=True, return_tensors="pt", chunk_length=15)
+#     tokenizer = WhisperTokenizerFast.from_pretrained(
+#         "openai/whisper-small", language="en", task="transcribe", token=token)
+#     data_collator = DataCollator(extractor=extractor,
+#         tokenizer=tokenizer, decoder_start_token_id=50258)
+
+#     log_dir = os.path.join('./output/logs', datetime.now().strftime(format='%m-%d_%H'))
+#     os.makedirs(name=log_dir, exist_ok=True)
+
+#     dataset = DatasetDict()
+#     dataset = load_dataset("google/fleurs", "en_us", token=token, trust_remote_code=True, streaming=False)
+#     dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000))
+#     dataset = dataset.map(function=prepare_dataset,
+#         remove_columns=list(next(iter(dataset.values())).features)).with_format(type="torch")
+    
+#     optimizer = MaxFactorA(model.parameters(), lr = 0.025,
+#     beta2_decay = -0.8,
+#     eps = (1e-10, 0.0001),
+#     d = 1,
+#     weight_decay = 0.025,
+#     gamma = 0.99,
+#     max = False,
+#     min_lr = 1e-7)
+
+#     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000, eta_min=1e-6)
+
+#     train_set = dataset["train"],
+#     eval_set = dataset["test"],
+
+#     train(model=model, dataset=dataset, data_collator=data_collator, tokenizer=tokenizer, 
+#     batch_size=1,
+#     lr=2e-4,
+#     device="cuda",
+#     grad_accum_steps=1,
+#     max_grad_norm=1.0,
+#     log_dir="./output/logs",
+#     save_best=True,
+#     early_stopping_patience=None,
+#     max_steps=10000,
+#     eval_steps=1000,
+#     optimizer=optimizer,
+#     scheduler=scheduler,
+#     train_set=train_set,
+#     eval_set=eval_set,
+#     )
+
+    # tensorboard --logdir ./output/logs
 
 
