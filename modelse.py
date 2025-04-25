@@ -1072,7 +1072,7 @@ if __name__ == "__main__":
         save_total_limit=1,
         label_names=["labels"],
         eval_on_start=False,
-        # optim="adafactor",
+        optim="adafactor",
         save_safetensors=True,
     )
 
@@ -1095,7 +1095,7 @@ if __name__ == "__main__":
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         processing_class=extractor,
-        optimizers=(optimizer, scheduler),  
+        # optimizers=(optimizer, scheduler),  
     )
 
     model.init_weights()
