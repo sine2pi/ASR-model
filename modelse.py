@@ -446,7 +446,7 @@ class Residual(nn.Module):
         self.lnc = RMSNorm(normalized_shape=dims) 
 
     def forward(self, x, xa=None, mask=None, kv_cache=None):
-        mask = mask if isinstance(self, TextDecoder) else None
+
         r = x
         x = x + self.attna(self.lna(x), mask=mask, kv_cache=kv_cache)[0]
         if self.attnb and xa is not None:
