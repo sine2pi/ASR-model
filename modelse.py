@@ -446,7 +446,7 @@ class Residual(nn.Module):
         self.lnc = RMSNorm(normalized_shape=dims) 
 
     def forward(self, x, xa=None, mask=None, kv_cache=None):
-
+        mask = mask if isinstance(self, TextDecoder) else None
         r = x
         x = x + self.attna(self.lna(x), mask=mask, kv_cache=kv_cache)[0]
         if self.attnb and xa is not None:
@@ -565,7 +565,7 @@ class TextDecoder(nn.Module):
         self.register_buffer("mask", mask, persistent=False)
 
     def forward(self, x, xa, kv_cache=None) -> Tensor:
-        
+        mask=self.mask
         offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
         x = (self.token_embedding(x) + self.positional_embedding[offset: offset + x.shape[-1]])
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
@@ -576,7 +576,7 @@ class TextDecoder(nn.Module):
 
         x = x.to(xa.dtype)
         for block in chain(self.blockA or []):
-            x = block(x, xa=xa, mask=self.mask, kv_cache=kv_cache)
+            x = block(x, xa=xa, mask=mask, kv_cache=kv_cache)
             
         x = self.ln_dec(x)
         logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
