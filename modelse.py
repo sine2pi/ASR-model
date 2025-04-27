@@ -1,4 +1,5 @@
 
+
 import os
 import warnings
 import logging
@@ -7,22 +8,25 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torch import Tensor
 import numpy as np
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple, Any, Callable, Union, List
+from contextlib import contextmanager
 import gzip
+import math
 import base64
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, precision_score, f1_score, recall_score
 from datetime import datetime
 from datasets import load_dataset, Audio, DatasetDict
-from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperFeatureExtractor, WhisperTokenizerFast
-from typing import Union, List, Any
+from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperFeatureExtractor, WhisperTokenizer
 import evaluate
 import transformers
 from dataclasses import dataclass
+from mask import UniversalMask
 from itertools import chain
 
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
 transformers.utils.logging.set_verbosity_error()
 device = torch.device(device="cuda:0")
 dtype = torch.float32
@@ -49,72 +53,8 @@ class Dimensions:
     decoder_start_token_id: int
     act: str 
 
-def visualize_attention_weights(attn_weights):
-    import seaborn as sns
-    batch, heads, seq_len, _ = attn_weights.shape
-    plt.figure(figsize=(12, 4))
-    for h in range(min(4, heads)):
-        plt.subplot(1, min(4, heads), h+1)
-        sns.heatmap(attn_weights[0, h].detach().cpu().numpy())
-        plt.title(f'Head {h}')
-    plt.suptitle("Attention Weights")
-    plt.show()
-
-def visualize_rotary_angles(rotary, seq_len):
-    freqs = rotary.inv_freq.detach().cpu().numpy()
-    t = np.arange(seq_len)
-    angles = np.outer(t, freqs)
-    plt.figure(figsize=(10, 6))
-    for i in range(min(4, angles.shape[1])):
-        plt.plot(angles[:, i], label=f'Freq {i}')
-    plt.title("Rotary Angles per Position")
-    plt.xlabel("Position")
-    plt.ylabel("Angle (radians)")
-    plt.legend()
-    plt.show()
-
-def visualize_rotary_effects(x, rotary):
-    seq_len = x.shape[1]
-    freqs_cis = rotary(seq_len)
-    x_rot = rotary.apply_rotary(x, freqs_cis)
-    idx = 0
-    dims_to_plot = [0, 1, 2, 3]
-    plt.figure(figsize=(10, 6))
-    for d in dims_to_plot:
-        plt.plot(x[idx, :, d].detach().cpu().numpy(), label=f'Orig dim {d}')
-        plt.plot(x_rot[idx, :, d].detach().cpu().numpy(), '--', label=f'Rotary dim {d}')
-    plt.title("Effect of Rotary on Embedding Dimensions")
-    plt.xlabel("Sequence Position")
-    plt.ylabel("Embedding Value")
-    plt.legend()
-    plt.show()
-    
-
-def plot_betweenness(be, title="Betweenness"):
-    """
-    Plots betweenness for a batch of sequences.
-    Args:
-        be: Tensor of shape (batch, seq_len)
-    """
-    be = be.detach().cpu().numpy()
-    plt.figure(figsize=(12, 3))
-    for i in range(min(4, be.shape[0])):
-        plt.plot(be[i], label=f"Sample {i}")
-    plt.title(title)
-    plt.xlabel("Sequence Position")
-    plt.ylabel("Betweenness")
-    plt.legend()
-    plt.show()
-
 def plot_waveform_and_spectrogram(waveform, spectrogram, sample_idx=0, sr=16000, title="Waveform and Spectrogram"):
-    """
-    Plots the waveform and spectrogram for a single sample.
-    Args:
-        waveform: Tensor of shape (batch, 1, n_samples) or (batch, n_samples)
-        spectrogram: Tensor of shape (batch, seq_len, n_mels) or (batch, n_mels, seq_len)
-        sample_idx: which sample in the batch to plot
-        sr: sample rate for x-axis scaling (default 16kHz)
-    """
+
     wf = waveform[sample_idx].detach().cpu().numpy()
     if wf.ndim > 1:
         wf = wf.squeeze()
@@ -135,46 +75,6 @@ def plot_waveform_and_spectrogram(waveform, spectrogram, sample_idx=0, sr=16000,
     axs[1].set_xlabel("Frame")
     axs[1].set_ylabel("Mel Bin")
     plt.tight_layout()
-    plt.show()
-
-def plot_betweenness_overlay(be, x, sample_idx=0, title="Betweenness Overlay"):
-    """
-    Overlay betweenness with spectrogram and energy for a single sample.
-    Args:
-        be: Tensor of shape (batch, seq_len)
-        x: Tensor of shape (batch, seq_len, n_mels) or (batch, n_mels, seq_len)
-        sample_idx: which sample in the batch to plot
-    """
-    import matplotlib.pyplot as plt
-
-    be = be[sample_idx].detach().cpu().numpy()
-    if x.shape[1] != be.shape[0] and x.shape[-1] == be.shape[0]:
-        x = x.permute(0, 2, 1)
-    spec = x[sample_idx].detach().cpu().numpy()
-    energy = spec.mean(axis=1)
-
-    fig, ax1 = plt.subplots(figsize=(14, 5))
-    ax1.set_title(title)
-    ax1.set_xlabel("Sequence Position")
-    ax1.set_ylabel("Betweenness", color="tab:red")
-    ax1.plot(be, color="tab:red", label="Betweenness")
-    ax1.tick_params(axis='y', labelcolor="tab:red")
-    ax1.legend(loc="upper left")
-
-    ax2 = ax1.twinx()
-    ax2.set_ylabel("Energy", color="tab:blue")
-    ax2.plot(energy, color="tab:blue", alpha=0.5, label="Energy")
-    ax2.tick_params(axis='y', labelcolor="tab:blue")
-    ax2.legend(loc="upper right")
-
-    plt.show()
-
-    plt.figure(figsize=(14, 3))
-    plt.imshow(spec.T, aspect="auto", origin="lower", cmap="magma")
-    plt.colorbar(label="Spectrogram (dB)")
-    plt.title("Input Spectrogram")
-    plt.xlabel("Sequence Position")
-    plt.ylabel("Mel Bin")
     plt.show()
 
 class BetweennessModule(nn.Module):
@@ -247,44 +147,33 @@ class LayerNorm(nn.LayerNorm):
 
 class RMSNorm(nn.RMSNorm):       
     def forward(self, x: Tensor) -> Tensor:
-        """Preserve the input dtype throughout the normalization"""
+
         x_float = x.float()
         variance = x_float.pow(2).mean(-1, keepdim=True)
         eps = self.eps if self.eps is not None else torch.finfo(x_float.dtype).eps
-        x_normalized = x_float * torch.rsqrt(variance + eps)
+        x_normalized = x_float * torch.rsqrt(variance + eps).to(x.device, x.dtype)
         if self.weight is not None:
-            return (x_normalized * self.weight).type(x.dtype)
-        return x_normalized.type(x.dtype)
-
+            return (x_normalized * self.weight).to(x.device, x.dtype)
+        return x_normalized.to(x.device, x.dtype)
+    
 class Linear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
-        return F.linear(x, self.weight.to(x.dtype),
-            None if self.bias is None else self.bias.to(x.dtype))
+        return F.linear(
+            x, 
+            self.weight.to(x.device, x.dtype),
+            None if self.bias is None else self.bias.to(x.device, x.dtype)
+        )
     
 class Conv1d(nn.Conv1d):
     def _conv_forward(
         self, x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> Tensor:
-        return super()._conv_forward(x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype))
+        return super()._conv_forward(x, weight.to(x.device, x.dtype), None if bias is None else bias.to(x.device, x.dtype))
 
 class Conv2d(nn.Conv2d):
     def _conv_forward(
         self, x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> Tensor:
         return super()._conv_forward(
-            x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype))
-
-class ParameterCycler:
-    def __init__(self, parameters):
-        self.parameters = parameters
-        self.current_idx = 0
-
-    def toggle_requires_grad(self):
-        for i, param in enumerate(self.parameters):
-            param.requires_grad = i == self.current_idx
-        self.current_idx = (self.current_idx + 1) % len(self.parameters)
-
-def _shape(self, tensor: torch.Tensor, ctx: int, batch: int):
-    return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
-
+            x, weight.to(x.device, x.dtype), None if bias is None else bias.to(x.device, x.dtype))
 def exists(val):
     return val is not None
 
@@ -316,144 +205,110 @@ class Rotary(nn.Module):
             t = positions.float().to(self.inv_freq.device)
         freqs = torch.einsum('i,j->ij', t, self.inv_freq)
         freqs = freqs + self.bias[:freqs.shape[0]]
-        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
-        return freqs_cis
+        freqs = torch.polar(torch.ones_like(freqs), freqs)
+        return freqs
 
     @staticmethod
-    def apply_rotary(x, freqs_cis):
-        x1 = x[..., :freqs_cis.shape[-1]*2]
-        x2 = x[..., freqs_cis.shape[-1]*2:]
+    def apply_rotary(x, freqs):
+        x1 = x[..., :freqs.shape[-1]*2]
+        x2 = x[..., freqs.shape[-1]*2:]
         x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous() 
         x1 = torch.view_as_complex(x1)
-        x1 = x1 * freqs_cis
+        x1 = x1 * freqs
         x1 = torch.view_as_real(x1).flatten(-2)
         return torch.cat([x1.type_as(x), x2], dim=-1)
-
+        
 class Multihead(nn.Module):
-    blend = False
-    cos = False
-    mag = False
 
     def __init__(self, dims: int, head: int):
         super().__init__()
-        self.dims = dims
         self.head = head
+        self.dims = dims
         head_dim = dims // head
-        self.head_dim = head_dim
-        self.dropout = 0.1
-
-        self.q = Linear(dims, dims)
-        self.k = Linear(dims, dims, bias=False)
-        self.v = Linear(dims, dims)
-        self.o = Linear(dims, dims)
+        self.query = Linear(dims, dims)
+        self.key = Linear(dims, dims, bias=False)
+        self.value = Linear(dims, dims)
+        self.out = Linear(dims, dims)
 
         self.rotary = Rotary(dim=head_dim, learned_freq=True)
-        if Multihead.blend:
-            self.factor = nn.Parameter(torch.tensor(0.5, **tox))
 
-    def compute_cosine_attention(self, q, k, v, mask):
-        ctx = q.shape[1]
-        qn = F.normalize(q, dim=-1, eps=1e-12)
-        kn = F.normalize(k, dim=-1, eps=1e-12)
-        qk = torch.matmul(qn, kn.transpose(-1, -2))
-        if Multihead.mag:
-            qm = torch.norm(q, dim=-1, keepdim=True)
-            km = torch.norm(k, dim=-1, keepdim=True)
-            ms = (qm * km.transpose(-1, -2)) ** 0.5
-            ms = torch.clamp(ms, min=1e-8)
-            qk = qk * ms
-        if mask is not None:
-            qk = qk + mask[:ctx, :ctx]
-        w = F.softmax(qk.float(), dim=-1).to(q.dtype)
-        w = F.dropout(w, p=self.dropout, training=self.training)
-        out = torch.matmul(w, v)
-        return out, qk
+    def forward(
+        self,
+        x: Tensor,
+        xa: Optional[Tensor] = None,
+        mask: Optional[Tensor] = None,
+        kv_cache: Optional[dict] = None,
+    ):
+        q = self.query(x).to(x.device, x.dtype)
 
-    def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask = None, kv_cache = None):
-        q = self.q(x)
-        if kv_cache is None or xa is None or self.k not in kv_cache:
-            k = self.k(x if xa is None else xa)
-            v = self.v(x if xa is None else xa)
+        if kv_cache is None or xa is None or self.key not in kv_cache:
+            k = self.key(x if xa is None else xa)
+            v = self.value(x if xa is None else xa)
         else:
-            k = kv_cache[self.k]
-            v = kv_cache[self.v]
-        out, qk = self._forward(q, k, v, mask)
-        return self.o(out), qk
+            k = kv_cache[self.key]
+            v = kv_cache[self.value]
 
-    def _forward(self, q: Tensor, k: Tensor, v: Tensor, mask = None):
-        ctx_q = q.shape[1]
-        ctx_k = k.shape[1]
-        dims = self.dims
+        wv, qk = self._attention(q, k, v, mask)
+        return self.out(wv), qk
+    
+    def _attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        batch, ctx, dims = q.shape
         scale = (dims // self.head) ** -0.25
-
+        
         q = q.view(*q.shape[:2], self.head, -1).permute(0, 2, 1, 3)
         k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
         v = v.view(*v.shape[:2], self.head, -1).permute(0, 2, 1, 3)
 
-        # Only one branch runs
-        if Multihead.blend:
-            qk = (q * scale) @ (k * scale).transpose(-1, -2)
-            if mask is not None:
-                qk = qk + mask[:ctx_q, :ctx_k]
-            qk = qk.float()
-            w = F.softmax(qk, dim=-1).to(q.dtype)
-            w = F.dropout(w, p=self.dropout, training=self.training)
-            out = torch.matmul(w, v)
-            cos_w, cos_qk = self.compute_cosine_attention(q, k, v, mask)
-            blend = torch.sigmoid(self.factor)
-            out = blend * cos_w + (1 - blend) * out
-            qk = blend * cos_qk + (1 - blend) * qk
-        elif Multihead.cos:
-            out, qk = self.compute_cosine_attention(q, k, v, mask)
-        else:
-            freqs_cis = self.rotary(ctx_q)
-            q = self.rotary.apply_rotary(q, freqs_cis)
-            k = self.rotary.apply_rotary(k, freqs_cis)
-            qk = (q * scale) @ (k * scale).transpose(-1, -2)
-            if mask is not None:
-                qk = qk + mask[:ctx_q, :ctx_k]
-            qk = qk.float()
-            w = F.softmax(qk, dim=-1).to(q.dtype)
-            w = F.dropout(w, p=self.dropout, training=self.training)
-            out = torch.matmul(w, v)
+        freq = self.rotary(ctx)
+        q = self.rotary.apply_rotary(q, freq)
+        k = self.rotary.apply_rotary(k, freq)
 
-        out = out.permute(0, 2, 1, 3).flatten(start_dim=2)
-        qk = qk.detach() if self.training else qk
-        return out, qk
+        qk = (q * scale) @ (k * scale).transpose(-1, -2)
+
+        mask = torch.triu(torch.ones(ctx, ctx), diagonal=1)
+        scaling_factors_causal = torch.where(mask == 1, torch.tensor(0.0), torch.tensor(1.0))
+
+        token_ids = k[:, :, :, 0]
+        scaling_factors_silence = torch.ones_like(token_ids).to(q.device, q.dtype)
+        scaling_factors_silence[token_ids == 0] = 0.001
+        scaling_factors_silence = scaling_factors_silence.unsqueeze(-2).expand(qk.shape).to(q.device, q.dtype)
+
+        combined_scaling_factors = scaling_factors_causal.unsqueeze(0).to(q.device, q.dtype)  * scaling_factors_silence.to(q.device, q.dtype)
+        qk *= combined_scaling_factors
+        qk = qk.float()
+        w = F.softmax(qk, dim=-1).to(q.dtype)
+        out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
+        return out, qk.detach()
 
 class Residual(nn.Module):
-    def __init__(self, dims: int, head: int, cross_attention: bool = False, act = "relu"):
+    def __init__(self, dims: int, head: int, cross_attention: bool = False):
         super().__init__()
-        self.dims = dims
-        self.head = head
-        self.cross_attention = cross_attention
-        self.dropout = 0.1
 
-        self.blend_xa = nn.Parameter(torch.tensor(0.5), requires_grad=True) 
-        self.blend = torch.sigmoid(self.blend_xa)
+        self.attn = Multihead(dims, head)
+        self.attn_ln = LayerNorm(dims)
 
-        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(),
-            "tanh": nn.Tanh(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
-        self.act = act_map.get(act, nn.GELU())
+        self.cross_attn = (
+            Multihead(dims, head) if cross_attention else None
+        )
+        self.cross_attn_ln = LayerNorm(dims) if cross_attention else None
 
-        self.attna = Multihead(dims=dims, head=head)
-        self.attnb = Multihead(dims=dims, head=head) if cross_attention else None
-    
-        mlp = dims * 4
-        self.mlp = nn.Sequential(Linear(dims, mlp), self.act, Linear(mlp, dims))
-        self.lna = RMSNorm(normalized_shape=dims)    
-        self.lnb = RMSNorm(normalized_shape=dims) if cross_attention else None
-        self.lnc = RMSNorm(normalized_shape=dims) 
+        n_mlp = dims * 4
+        self.mlp = nn.Sequential(
+            Linear(dims, n_mlp), nn.GELU(), Linear(n_mlp, dims)
+        )
+        self.mlp_ln = LayerNorm(dims)
 
-    def forward(self, x, xa=None, mask=None, kv_cache=None):
-        mask = mask if isinstance(self, TextDecoder) else None
-        r = x
-        x = x + self.attna(self.lna(x), mask=mask, kv_cache=kv_cache)[0]
-        if self.attnb and xa is not None:
-            cross_out = self.attnb(self.lnb(x), xa, kv_cache=kv_cache)[0]
-            x = self.blend * x + (1 - self.blend) * cross_out
-        x = x + self.mlp(self.lnc(x))
-        x = x + r
+    def forward(
+        self,
+        x: Tensor,
+        xa: Optional[Tensor] = None,
+        mask: Optional[Tensor] = None,
+        kv_cache: Optional[dict] = None,
+    ):
+        x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
+        if self.cross_attn:
+            x = x + self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)[0]
+        x = x + self.mlp(self.mlp_ln(x))
         return x
 
 class SEBlock(nn.Module):
@@ -472,30 +327,58 @@ class SEBlock(nn.Module):
         y = self.fc(y).view(b, c, 1)
         return x * y
 
-class AudioEncoder(nn.Module):
-    def __init__(self, mels: int, ctx: int, dims: int, head: int, layer, act: str = "relu"):
+class EncoderBottleneck(nn.Module):
+    def __init__(self, dims, latent_dim, iterations=2):
         super().__init__()
+        self.to_latent = nn.Linear(dims, latent_dim, **tox)
+        self.to_decoder = nn.Linear(latent_dim, dims, **tox)
+        self.to_latent_dec = nn.Linear(dims, latent_dim, **tox)
+        self.to_encoder = nn.Linear(latent_dim, dims, **tox)
+        self.iterations = iterations
 
+    def forward(self, enc_x=None, dec_x=None):
+        if enc_x is not None:
+            if enc_x.dim() == 3:
+                enc_latent = self.to_latent(enc_x.mean(dim=1))
+            else:
+                enc_latent = self.to_latent(enc_x)
+
+        else:
+            assert dec_x is not None, "You have to provide either enc_x or dec_x"
+            enc_latent = self.to_latent(dec_x)
+    
+        if dec_x is not None:
+            if dec_x.dim() == 3:
+                dec_latent = self.to_latent_dec(dec_x.mean(dim=1))
+            else:
+                dec_latent = self.to_latent_dec(dec_x)
+        else:
+            dec_latent = torch.zeros_like(enc_latent, **tox)
+
+        for _ in range(self.iterations):
+            enc_latent = enc_latent + 0.5 * dec_latent
+            dec_latent = dec_latent + 0.5 * enc_latent
+        enc_to_dec = self.to_decoder(enc_latent)
+        dec_to_enc = self.to_encoder(dec_latent)
+        return enc_to_dec, dec_to_enc
+
+class AudioEncoder(nn.Module):
+    def __init__(self, mels: int, ctx: int, dims: int, head: int, layer, act, cross_attention = False):
+        super().__init__()
+        self.debug = False
         self._counter = 0
-        self.use_betweenness = False  
-        self.dims = dims
-        self.head = head
-        self.head_dim = dims // head
-        self.mels = mels
-        self.ctx = ctx
         self.dropout = 0.1
-        
+
+        self.bottleneck = EncoderBottleneck(dims, latent_dim=128)  
         act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(),
                    "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
         self.act = act_map.get(act, nn.GELU())
 
-        self.blend_sw = nn.Parameter(torch.tensor(0.5), requires_grad=True)
+        self.blend_sw = nn.Parameter(torch.tensor(0.5, device=tox["device"], dtype=tox["dtype"]), requires_grad=False)
         self.blend = torch.sigmoid(self.blend_sw)
-        self.ln_enc = RMSNorm(normalized_shape=dims)
+        self.ln_enc = RMSNorm(normalized_shape=dims, **tox)
         self.register_buffer("positional_embedding", sinusoids(ctx, dims))
 
-        if self.use_betweenness:
-            self.betweenness = BetweennessModule(dim=dims, window_size=1, adjustment_scale=0.5)
 
         self.se = nn.Sequential(
             Conv1d(mels, dims, kernel_size=3, padding=1), self.act,
@@ -512,74 +395,85 @@ class AudioEncoder(nn.Module):
             nn.AdaptiveAvgPool1d(ctx),
         )
 
-        self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, cross_attention=False, act="relu")
+        self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, cross_attention=cross_attention)
                     for _ in range(layer)]) if layer > 0 else None)
 
     def forward(self, x, w) -> Tensor:
         if x is not None:
             if w is not None:
-                x_spec = self.se(x).permute(0, 2, 1)
-                w_wave = self.we(w).permute(0, 2, 1)
                 if self._counter < 1:
                     plot_waveform_and_spectrogram(w, x)
-
-                x = (x_spec + self.positional_embedding).to(x.dtype)
-                w = w_wave
+                x = self.se(x).permute(0, 2, 1)
+                w = self.we(w).permute(0, 2, 1)
+                x = (x + self.positional_embedding).to(x.device, x.dtype)
                 x = self.blend * x + (1 - self.blend) * w
             else:
                 x = self.se(x)
                 x = x.permute(0, 2, 1)
                 assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
-                x = (x + self.positional_embedding).to(x.dtype)
+                x = (x + self.positional_embedding).to(x.device, x.dtype)
         else:
             assert w is not None, "You have to provide either x or w"
             x = self.we(w).permute(0, 2, 1)
             assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
-            x = (x + self.positional_embedding).to(x.dtype)
+            x = (x + self.positional_embedding).to(x.device, x.dtype)
 
-        if self.use_betweenness:
-            be = self.betweenness.compute_betweenness(x)
-            x = x + be.unsqueeze(-1) 
+        _, dec_to_enc = self.bottleneck(enc_x=x)
+        x = x + dec_to_enc
 
         for block in chain(self.blockA or []):
             x = block(x)
         self._counter += 1
+        if self.debug:
+            print(f"Encoder output shape: {x.shape}, x shape: {x.shape}, w shape: {w.shape}")
+       
         return self.ln_enc(x)
-
+    
 class TextDecoder(nn.Module):
-    def __init__(self, vocab: int, ctx: int, dims: int, head: int, layer):
+    def __init__(self, vocab: int, ctx: int, dims: int, head: int, layer, cross_attention = False):
         super().__init__()
-        
+        self.debug = False
+    
         head_dim = dims // head
-        self.ctx = ctx
         self.dropout = 0.1
 
         self.token_embedding = nn.Embedding(num_embeddings=vocab, embedding_dim=dims)
-        self.positional_embedding = nn.Parameter(data=torch.empty(ctx, dims))
-        self.ln_dec = RMSNorm(normalized_shape=dims)
-        self.rotary = Rotary(dim=head_dim, learned_freq=True)
-        
-        self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, cross_attention=False) for _ in range(layer)]) if layer > 0 else None)
+        with torch.no_grad():
+            self.token_embedding.weight[0].zero_()
 
-        mask = torch.empty(ctx, ctx).fill_(-np.inf).triu_(1)
+        self.positional_embedding = nn.Parameter(data=torch.empty(ctx, dims), requires_grad=True)
+        self.ln_dec = RMSNorm(normalized_shape=dims)
+        self.rotary = Rotary(dim=dims, learned_freq=True)
+        
+        self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, cross_attention=cross_attention) for _ in range(layer)]) if layer > 0 else None)
+
+        self.bottleneck = EncoderBottleneck(dims, latent_dim=128)  
+
+        # mask = torch.empty(ctx, ctx).fill_(-np.inf).triu_(1)
+        mask = torch.triu(torch.ones(ctx, ctx), diagonal=1)
         self.register_buffer("mask", mask, persistent=False)
 
     def forward(self, x, xa, kv_cache=None) -> Tensor:
-        mask=self.mask
+
         offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
         x = (self.token_embedding(x) + self.positional_embedding[offset: offset + x.shape[-1]])
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
-        
         ctx = x.shape[1]
-        freqs_cis = self.rotary(ctx)
-        x = self.rotary.apply_rotary(x, freqs_cis)
-
+        freqs = self.rotary(ctx)
+        x = self.rotary.apply_rotary(x, freqs)
         x = x.to(xa.dtype)
+
+        enc_to_dec, _ = self.bottleneck(dec_x=x)
+        x = x + enc_to_dec
+
         for block in chain(self.blockA or []):
-            x = block(x, xa=xa, mask=mask, kv_cache=kv_cache)
-            
+            x = block(x, xa=xa, mask=self.mask, kv_cache=kv_cache)
         x = self.ln_dec(x)
         logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
+
+        if self.debug:
+            print(f"Logits shape: {logits.shape}, x shape: {x.shape}, xa shape: {xa.shape}")
+
         return logits
 
 class Echo(nn.Module):
@@ -618,42 +512,59 @@ class Echo(nn.Module):
     def embed_audio(self, input_features: torch.Tensor):
         return self.encoder(input_features)
 
-    def logits(self,input_ids: torch.Tensor, audio_features: torch.Tensor):
-        return self.decoder(input_ids, audio_features)
-
+    def logits(self,input_ids: torch.Tensor, encoder_output: torch.Tensor):
+        return self.decoder(input_ids, encoder_output)
+    
     @torch.autocast(device_type="cuda")
     def forward(self, 
+        decoder_input_ids=None,
+        labels=None,
         input_features: torch.Tensor=None, 
         waveform: Optional[torch.Tensor]=None,
         input_ids=None, 
-        labels=None, 
-        decoder_inputs_embeds=None,
-        ) -> Dict[str, torch.Tensor]:
-        
-        if input_ids is None and decoder_inputs_embeds is None:
-            if labels is not None:
-                input_ids = shift_tokens_right(
-                    labels, self.param.pad_token_id, self.param.decoder_start_token_id)
-            else:
-                raise ValueError("You have to provide either decoder_input_ids or labels")
-            
+    ) -> Dict[str, torch.Tensor]:
+
+        if labels is not None:
+            if labels.shape[1] > self.param.text_ctx:
+                raise ValueError(
+                    f"Labels' sequence length {labels.shape[1]} cannot exceed the maximum allowed length of {self.param.text_ctx} tokens."
+                )
+            if decoder_input_ids is None:
+                decoder_input_ids = shift_tokens_right(
+                    labels, self.param.pad_token_id, self.param.decoder_start_token_id
+                ).to('cuda')
+            input_ids = decoder_input_ids
+            if input_ids.shape[1] > self.param.text_ctx:
+                raise ValueError(
+                    f"Input IDs' sequence length {input_ids.shape[1]} cannot exceed the maximum allowed length of {self.param.text_ctx} tokens."
+                )
+
+        if input_ids is not None and input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+
         if input_features is not None:    
             if waveform is not None:
-                encoded_audio = self.encoder(x=input_features, w=waveform)
+                encoder_output = self.encoder(x=input_features, w=waveform)
             else:
-                encoded_audio = self.encoder(x=input_features, w=None)
+                encoder_output = self.encoder(x=input_features, w=None)
         elif waveform is not None:
-            encoded_audio = self.encoder(x=None, w=waveform)
+            encoder_output = self.encoder(x=None, w=waveform)
         else:
             raise ValueError("You have to provide either input_features or waveform")
-
-
-        logits = self.decoder(input_ids, encoded_audio)
+        logits = self.decoder(input_ids, encoder_output).to('cuda')
         loss = None
         if labels is not None:
             loss = F.cross_entropy(
-                logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=-100)
-        return {"logits": logits, "loss": loss, "labels": labels, "input_ids": input_ids, "audio_features": encoded_audio}
+                logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=0)
+            
+        return {
+            "logits": logits,
+            "loss": loss,
+            "labels": labels,
+            "input_ids": input_ids,
+            "decoder_input_ids": decoder_input_ids,
+            "encoder_output": encoder_output
+        }
 
     @property
     def device(self):
@@ -691,77 +602,23 @@ class Echo(nn.Module):
         self.decoder.apply(install_hooks)
         return cache, hooks
     
-    def _init_weights(self, module):
-        std = 0.02
-        self.init_counts = {"Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0,
-            "Conv2d": 0, "SEBlock": 0, "TextDecoder": 0, "AudioEncoder": 0, "Residual": 0,
-                            "Multihead": 0, "MultiheadA": 0, "MultiheadB": 0, "MultiheadC": 0}
-
-        for name, module in self.named_modules():
-            if isinstance(module, Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-                self.init_counts["Linear"] += 1
-            elif isinstance(module, Conv1d):
-                nn.init.normal_(module.weight, mean=0.0, std=std)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-                self.init_counts["Conv1d"] += 1
-            elif isinstance(module, LayerNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-                self.init_counts["LayerNorm"] += 1
-            elif isinstance(module, RMSNorm):
-                nn.init.ones_(module.weight)
-                self.init_counts["RMSNorm"] += 1
-            elif isinstance(module, Multihead):
-                nn.init.xavier_uniform_(module.q.weight)
-                nn.init.zeros_(module.q.bias)
-                nn.init.xavier_uniform_(module.k.weight)
-                nn.init.xavier_uniform_(module.v.weight)
-                nn.init.xavier_uniform_(module.o.weight)
-                if module.o.bias is not None:
-                    nn.init.zeros_(module.o.bias)
-                self.init_counts["Multihead"] += 1
-            elif isinstance(module, Conv2d):
-                nn.init.normal_(module.weight, mean=0.0, std=std)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-                self.init_counts["Conv2d"] += 1
-            elif isinstance(module, SEBlock):
-                nn.init.ones_(module.fc[0].weight)
-                nn.init.zeros_(module.fc[0].bias)
-                nn.init.ones_(module.fc[2].weight)
-                nn.init.zeros_(module.fc[2].bias)
-                self.init_counts["SEBlock"] += 1
-            elif isinstance(module, TextDecoder):
-                self.init_counts["TextDecoder"] += 1
-            elif isinstance(module, AudioEncoder):
-                nn.init.xavier_uniform_(module.se[0].weight)
-                nn.init.zeros_(module.se[0].bias)
-                nn.init.xavier_uniform_(module.se[2].weight)
-                nn.init.zeros_(module.se[2].bias)
-                nn.init.xavier_uniform_(module.se[4].weight)
-                nn.init.zeros_(module.se[4].bias)
-                self.init_counts["AudioEncoder"] += 1
-            elif isinstance(module, Residual):
-                nn.init.xavier_uniform_(module.attna.q.weight)
-                nn.init.zeros_(module.attna.q.bias)
-                nn.init.xavier_uniform_(module.attna.k.weight)
-                nn.init.xavier_uniform_(module.attna.v.weight)
-                nn.init.xavier_uniform_(module.attna.o.weight)
-                if module.attna.o.bias is not None:
-                    nn.init.zeros_(module.attna.o.bias)
-                self.init_counts["Residual"] += 1    
-                                                 
-    def init_weights(self):
-        print("Initializing all weights")
-        self.apply(self._init_weights)
-        print("Initialization summary:")
-        for module_type, count in self.init_counts.items():
-            print(f"{module_type}: {count}")
-
+    @staticmethod
+    def create_attention_mask(batch_size, ctx, num_heads, is_causal=False, 
+                            device=None, dtype=None, xa_ctx=None):
+        mask_type = "cross_attention" if xa_ctx is not None else "combined"
+        
+        return UniversalMask.create(
+            batch_size=batch_size,
+            ctx=ctx,
+            ctx_kv=xa_ctx if xa_ctx is not None else ctx,
+            num_heads=num_heads,
+            mask_type=mask_type,
+            is_causal=is_causal,
+            padding_mask=None,
+            device=device,
+            dtype=dtype
+        )
+    
 metric = evaluate.load(path="wer")
 
 @dataclass
@@ -772,29 +629,21 @@ class DataCollator:
 
     def __call__(self, features: List[Dict[str, Union[List[int], Tensor]]]) -> Dict[str, Tensor]:
         batch = {}
+        self.debug = False
 
         if "input_features" in features[0]:
-            input_features = [{"input_features": f["input_features"]} for f in features]
-            batch["input_features"] = self.extractor.pad(input_features, return_tensors="pt")["input_features"]
+            batch["input_features"] = torch.stack([f["input_features"] for f in features])
         if "waveform" in features[0]:
-            waveforms = [f["waveform"] for f in features]
-            fixed_len = 1500 * 160
-            padded_waveforms = []
-            for w in waveforms:
-                if w.shape[-1] < fixed_len:
-                    w = F.pad(w, (0, fixed_len - w.shape[-1]))
-                else:
-                    w = w[..., :fixed_len]
-                padded_waveforms.append(w)
-            batch["waveform"] = torch.stack(padded_waveforms)
+            batch["waveform"] = torch.stack([f["waveform"] for f in features])
         label_features = [{"input_ids": f["labels"]} for f in features]
         labels_batch = self.tokenizer.pad(label_features, return_tensors="pt")
-        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), 0)
         if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
             labels = labels[:, 1:]
         batch["labels"] = labels
+        batch["input_ids"] = labels_batch["input_ids"]
         return batch
-
+    
 def prepare_dataset(batch, input_features=True, waveform=True):
     audio = batch["audio"]
     fixed_len = 1500 * 160
@@ -805,45 +654,78 @@ def prepare_dataset(batch, input_features=True, waveform=True):
         wav = wav[..., :fixed_len]
     if waveform:
         batch["waveform"] = wav.unsqueeze(0)
+
     if input_features:
-        batch["input_features"] = extractor(wav.numpy(), sampling_rate=audio["sampling_rate"]).input_features[0]
+        features = extractor(wav.numpy(), sampling_rate=audio["sampling_rate"]).input_features[0]
+        features = torch.tensor(features)
+        pad_val = features.min().item() 
+        features = torch.where(features == pad_val, torch.tensor(0.0, dtype=features.dtype), features)
+        target_shape = (128, 1500)
+        padded = torch.zeros(target_shape, dtype=features.dtype)
+        padded[:, :features.shape[1]] = features[:, :target_shape[1]]
+        batch["input_features"] = padded
+
     batch["labels"] = tokenizer(batch["transcription"]).input_ids
+    batch["input_ids"] = batch["labels"]
     return batch
 
-def compute_metrics(eval_pred):
+def compute_metrics(eval_pred, compute_result: bool = True):
     pred_logits = eval_pred.predictions
     label_ids = eval_pred.label_ids
+
+    if hasattr(pred_logits, "cpu"):
+        pred_logits = pred_logits.cpu()
+    if hasattr(label_ids, "cpu"):
+        label_ids = label_ids.cpu()
 
     if isinstance(pred_logits, tuple):
         pred_ids = pred_logits[0]
     else:
         pred_ids = pred_logits
-    if pred_ids.ndim == 3:
-        pred_ids = np.argmax(pred_ids, axis=-1)
 
-    label_ids[label_ids == -100] = tokenizer.pad_token_id
+    if hasattr(pred_ids, "ndim") and pred_ids.ndim == 3:
+        if not isinstance(pred_ids, torch.Tensor):
+            pred_ids = torch.tensor(pred_ids)
+        pred_ids = pred_ids.argmax(dim=-1)
+        pred_ids = pred_ids.tolist()
+    elif hasattr(pred_ids, "tolist"):
+        pred_ids = pred_ids.tolist()
+
+    if hasattr(label_ids, "tolist"):
+        label_ids = label_ids.tolist()
+
+    label_ids = [
+        [tokenizer.pad_token_id if token == -100 else token for token in seq]
+        for seq in label_ids
+    ]
+
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
-    if len(pred_ids) > 0:
-        print("\nSample Predictions:")
-        for idx in range(min(1, len(pred_ids))):
-            print(f"  Example {idx+1}:")
-            print(f"• Reference: {label_str[idx]}")
-            print(f"• Prediction: {pred_str[idx]}")
-        print("="*80 + "\n")
+    pred_flat = list(chain.from_iterable(pred_ids))
+    labels_flat = list(chain.from_iterable(label_ids))
+    mask = [l != tokenizer.pad_token_id for l in labels_flat]
 
+    acc = accuracy_score(
+        [l for l, m in zip(labels_flat, mask) if m],
+        [p for p, m in zip(pred_flat, mask) if m]
+    )
+    pre = precision_score(
+        [l for l, m in zip(labels_flat, mask) if m],
+        [p for p, m in zip(pred_flat, mask) if m],
+        average='weighted', zero_division=0
+    )
+    rec = recall_score(
+        [l for l, m in zip(labels_flat, mask) if m],
+        [p for p, m in zip(pred_flat, mask) if m],
+        average='weighted', zero_division=0
+    )
+    f1 = f1_score(
+        [l for l, m in zip(labels_flat, mask) if m],
+        [p for p, m in zip(pred_flat, mask) if m],
+        average='weighted', zero_division=0
+    )
     wer = 100 * metric.compute(predictions=pred_str, references=label_str)
-    pred_flat = pred_ids.flatten()
-    labels_flat = label_ids.flatten()
-    mask = labels_flat != tokenizer.pad_token_id
-    acc = accuracy_score(y_true=labels_flat[mask], y_pred=pred_flat[mask])
-    pre = precision_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], 
-    average='weighted', zero_division=0)
-    rec = recall_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], 
-    average='weighted', zero_division=0)
-    f1 = f1_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], 
-    average='weighted', zero_division=0)
 
     return {
         "wer": wer,
@@ -851,7 +733,9 @@ def compute_metrics(eval_pred):
         "precision": pre,
         "recall": rec,
         "f1": f1,
-        }
+    }
+
+
 
 if __name__ == "__main__":
 
@@ -867,7 +751,7 @@ if __name__ == "__main__":
         decoder_idx=4,
         text_dims=512,
         decoder_start_token_id = 50258,
-        pad_token_id = 50257,
+        pad_token_id = 0,
         eos_token_id = 50257,   
         act = "gelu",
         )
@@ -876,9 +760,13 @@ if __name__ == "__main__":
 
     token=""
     extractor = WhisperFeatureExtractor.from_pretrained(
-        "openai/whisper-small", token=token, feature_size=128, sampling_rate=16000, do_normalize=True, return_tensors="pt", chunk_length=15)
-    tokenizer = WhisperTokenizerFast.from_pretrained(
-        "openai/whisper-small", language="en", task="transcribe", token=token)
+        "openai/whisper-small", token=token, feature_size=128, sampling_rate=16000, do_normalize=True, return_tensors="pt", chunk_length=15, padding_value=0.0)
+    
+    tokenizer = WhisperTokenizer.from_pretrained(
+        "./tokenizer", language="en", task="transcribe", pad_token="0", token=token, local_files_only=True, pad_token_id = 0)
+
+    tokenizer.pad_token_id = 0
+
     data_collator = DataCollator(extractor=extractor,
         tokenizer=tokenizer, decoder_start_token_id=50258)
 
@@ -887,9 +775,19 @@ if __name__ == "__main__":
 
     dataset = DatasetDict()
     dataset = load_dataset("google/fleurs", "en_us", token=token, trust_remote_code=True, streaming=False)
+
     dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000))
+    dataset = dataset.filter(lambda x: len(x["transcription"]) < 512)
+    dataset = dataset.filter(lambda x: len(x["transcription"]) > 0)
+    dataset = dataset.filter(lambda x: len(x["audio"]["array"]) > 0)
+    dataset = dataset.filter(lambda x: len(x["audio"]["array"]) < 1500 * 160)
+    print("Dataset size:", dataset["train"].num_rows, dataset["test"].num_rows)
+
     dataset = dataset.map(function=prepare_dataset,
         remove_columns=list(next(iter(dataset.values())).features)).with_format(type="torch")
+    
+    train_dataset = dataset["train"]
+    test_dataset = dataset["test"].select(range(100))
 
     training_args = Seq2SeqTrainingArguments(
         output_dir=log_dir,
@@ -906,273 +804,33 @@ if __name__ == "__main__":
         eval_steps=1000,
         warmup_steps=1000,
         num_train_epochs=1,
-        logging_steps=100,
+        logging_steps=1,
         logging_dir=log_dir,
         report_to=["tensorboard"],
         push_to_hub=False,
         disable_tqdm=False,
         save_total_limit=1,
         label_names=["labels"],
-        eval_on_start=False,
-        optim="adafactor",
-        save_safetensors=True,
-    )
 
+        optim="adamw_torch",
+        learning_rate=0.00025,
+        weight_decay=0.2,
+        save_safetensors=True,
+        eval_on_start=False,
+        group_by_length=False,
+        remove_unused_columns=False,
+    )
 
     trainer = Seq2SeqTrainer(
         args=training_args,
         model=model,
-        train_dataset=dataset["train"].shuffle(seed=42).take(1000),
-        eval_dataset=dataset["test"].take(100),
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        processing_class=extractor,
-        # optimizers=(optimizer, scheduler),  # uncomment forr maxfactor
     )
 
-    model.init_weights()
-    print("Trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
-    print("Total parameters:", sum(p.numel() for p in model.parameters()))
+    trainer.train()
 
-    trainer.train(resume_from_checkpoint=False)
-
-
-
-## pytorch loop
-
-# def train(
-#     model,
-#     dataset,
-#     data_collator,
-#     tokenizer,
-#     optimizer=None,
-#     scheduler=None,
-#     train_set=None,
-#     eval_set=None,
-#     epochs=3,
-#     batch_size=1,
-#     lr=2e-4,
-#     device="cuda",
-#     grad_accum_steps=1,
-#     max_grad_norm=1.0,
-#     log_dir="./output/logs",
-#     save_best=True,
-#     early_stopping_patience=None,
-#     max_steps=10000,
-#     eval_steps=1000,
-# ):
-#     from torch.utils.tensorboard import SummaryWriter
-#     import os
-
-#     writer = SummaryWriter(log_dir=log_dir)
-#     model = model.to(device)
-#     optimizer = optimizer
-#     scheduler = scheduler
-#     scaler = torch.amp.GradScaler('cuda')
-#     train_set = dataset["train"]
-#     eval_set = dataset["test"]
-
-#     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, collate_fn=data_collator)
-#     eval_loader = DataLoader(eval_set, batch_size=batch_size, shuffle=False, collate_fn=data_collator)
-
-#     best_wer = float("inf")
-#     best_step = 0
-#     patience_counter = 0
-#     global_step = 0
-#     running_loss = 0
-
-#     train_iter = iter(train_loader)
-#     pbar = tqdm(total=max_steps, desc="Training", dynamic_ncols=True)
-#     model.train()
-#     optimizer.zero_grad()
-
-
-#     while global_step < max_steps:
-#         try:
-#             batch = next(train_iter)
-#         except StopIteration:
-#             train_iter = iter(train_loader)
-#             batch = next(train_iter)
-#         for k in batch:
-#             if isinstance(batch[k], torch.Tensor):
-#                 batch[k] = batch[k].to(device)
-#         with torch.cuda.amp.autocast():
-#             outputs = model(
-#                 input_features=batch.get("input_features", None),
-#                 waveform=batch.get("waveform", None),
-#                 input_ids=None,
-#                 labels=batch["labels"]
-#             )
-#             loss = outputs["loss"] / grad_accum_steps
-#         scaler.scale(loss).backward()
-#         running_loss += loss.item() * grad_accum_steps
-
-#         if (global_step + 1) % grad_accum_steps == 0:
-#             scaler.unscale_(optimizer)
-#             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-#             scaler.step(optimizer)
-#             scaler.update()
-#             optimizer.zero_grad()
-
-#             if scheduler is not None:
-#                 scheduler.step()
-#             writer.add_scalar("train/loss", loss.item() * grad_accum_steps, global_step)
-#             writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
-
-
-#         pbar.set_postfix({
-#             "loss": f"{loss.item() * grad_accum_steps:.4f}",
-#             "lr": optimizer.param_groups[0]["lr"]
-#         })
-#         pbar.update(1)
-#         global_step += 1
-
-#         if global_step % eval_steps == 0 or global_step == max_steps:
-#             model.eval()
-#             all_preds, all_labels = [], []
-#             eval_loss = 0
-#             with torch.no_grad():
-#                 for batch_eval in tqdm(eval_loader, desc=f"Eval@step{global_step}", leave=False):
-#                     for k in batch_eval:
-#                         if isinstance(batch_eval[k], torch.Tensor):
-#                             batch_eval[k] = batch_eval[k].to(device)
-#                     outputs = model(
-#                         input_features=batch_eval.get("input_features", None),
-#                         waveform=batch_eval.get("waveform", None),
-#                         input_ids=None,
-#                         labels=batch_eval["labels"]
-#                     )
-#                     logits = outputs["logits"]
-#                     labels = batch_eval["labels"]
-#                     loss = outputs["loss"]
-#                     eval_loss += loss.item()
-#                     preds = torch.argmax(logits, dim=-1)
-#                     labels_for_decode = labels.clone()
-#                     labels_for_decode[labels_for_decode == -100] = tokenizer.pad_token_id
-#                     all_preds.extend(preds.cpu().numpy())
-#                     all_labels.extend(labels_for_decode.cpu().numpy())
-#             avg_eval_loss = eval_loss / len(eval_loader)
-#             pred_str = tokenizer.batch_decode(all_preds, skip_special_tokens=True)
-#             label_str = tokenizer.batch_decode(all_labels, skip_special_tokens=True)
-
-#             if len(all_preds) > 0:
-#                 print("\nSample Predictions:")
-#                 for idx in range(min(1, len(all_preds))):
-#                     print(f"  Example {idx+1}:")
-#                     print(f"• Reference: {label_str[idx]}")
-#                     print(f"• Prediction: {pred_str[idx]}")
-#                 print("="*80 + "\n")
-
-#             wer = 100 * metric.compute(predictions=pred_str, references=label_str)
-#             writer.add_scalar("eval/loss", avg_eval_loss, global_step)
-#             writer.add_scalar("eval/wer", wer, global_step)
-#             # scheduler.step(avg_eval_loss)
-#             scheduler.step()
-#             lr = scheduler.get_last_lr()[0]
-#             pbar.set_postfix({
-#                 "loss": f"{loss.item() * grad_accum_steps:.4f}",
-#                 "lr": lr,
-#                 "eval_wer": f"{wer:.2f}"
-#             })
-#             print(f"\nStep {global_step}: eval loss {avg_eval_loss:.4f}, WER {wer:.2f}")
-
-#             # Save best model
-#             if save_best and wer < best_wer:
-#                 best_wer = wer
-#                 best_step = global_step
-#                 torch.save(model.state_dict(), os.path.join(log_dir, "best_model.pt"))
-#                 print(f"Best model saved at step {global_step} with WER {wer:.2f}")
-
-#             # Early stopping
-#             if early_stopping_patience is not None:
-#                 if wer < best_wer:
-#                     patience_counter = 0
-#                 else:
-#                     patience_counter += 1
-#                     if patience_counter >= early_stopping_patience:
-#                         print(f"Early stopping at step {global_step}")
-#                         break
-#             model.train()
-#             lr = scheduler.get_last_lr()[0]
-#             writer.add_scalar("train/lr", lr, global_step)
-#             pbar.set_postfix({
-#                 "loss": f"{loss.item() * grad_accum_steps:.4f}",
-#                 "lr": lr,
-#                 "eval_wer": f"{wer:.2f}"
-#             })
-
-#     print(f"Training complete. Best WER: {best_wer:.2f} at step {best_step}")
-#     writer.close()
-
-# if __name__ == "__main__":
-
-#     param = Dimensions(
-#         mels=128,
-#         audio_ctx=1500,
-#         audio_head=4,
-#         encoder_idx=4,
-#         audio_dims=512,
-#         vocab=51865,
-#         text_ctx=512,
-#         text_head=4,
-#         decoder_idx=4,
-#         text_dims=512,
-#         decoder_start_token_id = 50258,
-#         pad_token_id = 50257,
-#         eos_token_id = 50257,   
-#         act = "gelu",
-#         )
-
-#     model = Echo(param).to('cuda')
-
-#     token=""
-#     extractor = WhisperFeatureExtractor.from_pretrained(
-#         "openai/whisper-small", token=token, feature_size=128, sampling_rate=16000, do_normalize=True, return_tensors="pt", chunk_length=15)
-#     tokenizer = WhisperTokenizerFast.from_pretrained(
-#         "openai/whisper-small", language="en", task="transcribe", token=token)
-#     data_collator = DataCollator(extractor=extractor,
-#         tokenizer=tokenizer, decoder_start_token_id=50258)
-
-#     log_dir = os.path.join('./output/logs', datetime.now().strftime(format='%m-%d_%H'))
-#     os.makedirs(name=log_dir, exist_ok=True)
-
-#     dataset = DatasetDict()
-#     dataset = load_dataset("google/fleurs", "en_us", token=token, trust_remote_code=True, streaming=False)
-#     dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000))
-#     dataset = dataset.map(function=prepare_dataset,
-#         remove_columns=list(next(iter(dataset.values())).features)).with_format(type="torch")
-    
-#     optimizer = MaxFactorA(model.parameters(), lr = 0.025,
-#     beta2_decay = -0.8,
-#     eps = (1e-10, 0.0001),
-#     d = 1,
-#     weight_decay = 0.025,
-#     gamma = 0.99,
-#     max = False,
-#     min_lr = 1e-7)
-
-#     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000, eta_min=1e-6)
-
-#     train_set = dataset["train"],
-#     eval_set = dataset["test"],
-
-#     train(model=model, dataset=dataset, data_collator=data_collator, tokenizer=tokenizer, 
-#     batch_size=1,
-#     lr=2e-4,
-#     device="cuda",
-#     grad_accum_steps=1,
-#     max_grad_norm=1.0,
-#     log_dir="./output/logs",
-#     save_best=True,
-#     early_stopping_patience=None,
-#     max_steps=10000,
-#     eval_steps=1000,
-#     optimizer=optimizer,
-#     scheduler=scheduler,
-#     train_set=train_set,
-#     eval_set=eval_set,
-#     )
-
-    # tensorboard --logdir ./output/logs
 
 
