@@ -46,7 +46,7 @@ def _attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Op
 3 tests: spectrogram, waveform, spectrogram+waveform.
 ### IN PROGRESS
 
-Full model and loop(s).. hugging face trainer or pytorch.
+Full model and loop(s).. hugging face trainer and pytorch loop (for those who dont like HF).
 ```python
 
 
