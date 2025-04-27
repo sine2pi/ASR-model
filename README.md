@@ -7,13 +7,14 @@ This learnable blend is a modern, under-explored approach addressing the wavefor
 
 This model uses 0 for padding masking and silence and as such the attention mechanism uses multiplicative masking instead of additive. The 0.001 is so that the model can still learn to identify silence. This gives silence tokens a tiny but meaningful attention weight rather than completely masking them out. This is conceptually sound because:
 
-Silence/pauses in speech carry rhythmic and semantic information.
-The 0.001 factor means silence is "whispered" to the model rather than "shouted".
-The model can learn timing patterns where pauses are meaningful.
+- Silence/pauses in speech carry rhythmic and semantic information.
+- The 0.001 factor means silence is "whispered" to the model rather than "shouted".
+- The model can learn timing patterns where pauses are meaningful.
 
 
 
-    def _attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+
+        def _attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch, ctx, dims = q.shape
         scale = (dims // self.head) ** -0.25
         
