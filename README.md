@@ -1198,18 +1198,6 @@ if __name__ == "__main__":
     print("Trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
     print("Total parameters:", sum(p.numel() for p in model.parameters()))
 
-    sanity_check = False
-    if sanity_check:
-        print("Sanity check")
-        print(dataset["test"]["labels"][0], dataset["test"]["input_features"][0].shape, dataset["test"]["waveform"][0].shape)
-        print(dataset["train"]["labels"][0], dataset["train"]["input_features"][0].shape, dataset["train"]["waveform"][0].shape)
-
-        trainer.evaluate(eval_dataset=dataset["test"].take(10), metric_key_prefix="test")
-        trainer.save_model(os.path.join(log_dir, "Sanity_model"))
-
-        print("Training complete")
-        print("Model saved to:", log_dir)
-
     trainer.train()
 
 
