@@ -9,11 +9,8 @@ import torch.nn as nn
 from torch import Tensor
 import numpy as np
 from typing import Optional, Dict, Tuple, Any, Union, List
-from contextlib import contextmanager
 import gzip
-import math
 import base64
-import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, precision_score, f1_score, recall_score
 from datetime import datetime
 from datasets import load_dataset, Audio, DatasetDict
@@ -21,7 +18,6 @@ from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperFeatur
 import evaluate
 import transformers
 from dataclasses import dataclass
-from mask import UniversalMask
 from itertools import chain
 
 torch.backends.cudnn.allow_tf32 = True
@@ -52,295 +48,6 @@ class Dimensions:
     eos_token_id: int
     decoder_start_token_id: int
     act: str 
-
-def make_causal_bool_mask(input_ids: torch.Tensor, pad_token_id: int = 0) -> torch.Tensor:
-    if input_ids.dim() == 1:
-        input_ids = input_ids.unsqueeze(0)
-    elif input_ids.dim() > 2:
-        input_ids = input_ids.view(-1, input_ids.shape[-1])
-    batch_size, seq_len = input_ids.shape
-    causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=input_ids.device)).unsqueeze(0).expand(batch_size, -1, -1)
-    nonzero_mask = (input_ids != pad_token_id).unsqueeze(1).expand(-1, seq_len, -1)
-    mask = (causal_mask * nonzero_mask).to(torch.int)
-    print(f"mask shape: {mask.shape if mask is not None else None}")
-    return mask
-
-class rotary2(nn.Module):
-    def __init__(self, ctx, dims, heads, base=10000, theta_learnable=False,
-        rot_learnable=False, matrix_learnable=False, freq_learnable=False,
-        debug=False
-    ):
-        super().__init__()
-        self.ctx = ctx
-        self.dims = dims
-        self.heads = heads
-        self.base = base
-
-        self.head_dim = self.dims // self.heads
-        self.rot = self.head_dim // 2
-
-        self.thetas = nn.Parameter(torch.zeros(self.rot))
-        self.r_pairs = nn.Parameter(torch.rand(self.rot, 2) * self.head_dim)
-        self.theta_scale = nn.Parameter(torch.ones(1), requires_grad=theta_learnable)
-        self.rot_scale = nn.Parameter(torch.ones(1), requires_grad=rot_learnable)
-        self.r_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=matrix_learnable)
-
-        freq_data = 1.0 / (self.base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
-        self.inv_freq = nn.Parameter(freq_data, requires_grad=freq_learnable)
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.orthogonal_(self.r_matrix)
-        nn.init.zeros_(self.thetas)
-
-    def q_rotation(self, x, theta, u, v):
-        u = u / torch.norm(u)
-        v = v / torch.norm(v)
-
-        half_theta = theta / 2
-        cos_ht = torch.cos(half_theta)
-        sin_ht = torch.sin(half_theta)
-
-        q = torch.cat([cos_ht.unsqueeze(0), sin_ht * u])
-        q_conj = torch.cat([cos_ht.unsqueeze(0), -sin_ht * u])
-
-        x_shape = x.shape
-        x = x.view(-1, 3)
-
-        uv_cross = torch.cross(u.unsqueeze(0), x)
-        uuv_cross = torch.cross(u.unsqueeze(0), uv_cross)
-        x_rot = x + 2 * (q[0] * uv_cross + uuv_cross)
-
-        x_rot = x_rot.view(*x_shape)
-        return x_rot
-
-    def rotation_matrix(self, dims, i, j, theta):
-        G = torch.eye(dims, device=theta.device)
-        c, s = torch.cos(theta), torch.sin(theta)
-        G[i, i], G[j, j] = c, c
-        G[i, j], G[j, i] = -s, s
-
-        if dims == 3:
-            u = torch.eye(dims, device=theta.device)[i]
-            v = torch.eye(dims, device=theta.device)[j]
-            Q = self.q_rotation(
-                torch.eye(dims, device=theta.device), theta=theta, u=u, v=v)
-            G = (G + Q) / 2
-        return G
-
-    def apply_rotations(self, x):
-        adjusted_rot = int(torch.round(self.rot_scale * self.rot))
-        for k in range(adjusted_rot):
-            i, j = self.r_pairs[k].long()
-            theta = self.thetas[k] * self.theta_scale
-            G = self.rotation_matrix(self.head_dim, i.item(), j.item(), theta)
-            x = x @ G
-        return x
-
-    def forward(self, x):
-        batch_size, seq_len, *rest = x.size()
-
-        if len(rest) == 1:
-            dims = rest[0]
-            if dims != self.heads * self.head_dim:
-                raise ValueError(
-                    f"Needed {self.heads * self.head_dim}, but got too many {dims}"
-                )
-        elif len(rest) == 2:
-            heads, head_dim = rest
-            if heads != self.heads or head_dim != self.head_dim:
-                raise ValueError(
-                    f"This many heads {self.heads} and head_dims {self.head_dim} we need, got this many heads {heads} and head_dims {head_dim} we did."
-                )
-        else:
-            raise ValueError(f"Expected the thingy to be 3D or 4D, but got {x.dim()}D")
-
-        x = x.view(batch_size, seq_len, self.heads, self.head_dim)
-        x = x.reshape(-1, self.head_dim)
-
-        x = self.apply_rotations(x)
-        x = x @ self.r_matrix
-
-        x = x.view(batch_size, seq_len, self.heads, self.head_dim)
-
-        position = torch.arange(seq_len, device=x.device, dtype=x.dtype).unsqueeze(1)
-        div_term = self.inv_freq.unsqueeze(0)
-        sinusoid_inp = position * div_term
-
-        sin = torch.sin(sinusoid_inp).unsqueeze(0).unsqueeze(2)
-        cos = torch.cos(sinusoid_inp).unsqueeze(0).unsqueeze(2)
-
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        x = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
-        x = x.view(batch_size, seq_len, self.dims)
-        x = x * math.sqrt(self.dims)
-        return x
-
-def visualize_attention_weights(attn_weights):
-    import seaborn as sns
-    batch, heads, seq_len, _ = attn_weights.shape
-    plt.figure(figsize=(12, 4))
-    for h in range(min(4, heads)):
-        plt.subplot(1, min(4, heads), h+1)
-        sns.heatmap(attn_weights[0, h].detach().cpu().numpy())
-        plt.title(f'Head {h}')
-    plt.suptitle("Attention Weights")
-    plt.show()
-
-def visualize_rotary_angles(rotary, seq_len):
-    freqs = rotary.inv_freq.detach().cpu().numpy()
-    t = np.arange(seq_len)
-    angles = np.outer(t, freqs)
-    plt.figure(figsize=(10, 6))
-    for i in range(min(4, angles.shape[1])):
-        plt.plot(angles[:, i], label=f'Freq {i}')
-    plt.title("Rotary Angles per Position")
-    plt.xlabel("Position")
-    plt.ylabel("Angle (radians)")
-    plt.legend()
-    plt.show()
-
-def visualize_rotary_effects(x, rotary):
-    seq_len = x.shape[1]
-    freqs = rotary(seq_len)
-    x_rot = rotary.apply_rotary(x, freqs)
-    idx = 0
-    dims_to_plot = [0, 1, 2, 3]
-    plt.figure(figsize=(10, 6))
-    for d in dims_to_plot:
-        plt.plot(x[idx, :, d].detach().cpu().numpy(), label=f'Orig dim {d}')
-        plt.plot(x_rot[idx, :, d].detach().cpu().numpy(), '--', label=f'Rotary dim {d}')
-    plt.title("Effect of Rotary on Embedding Dimensions")
-    plt.xlabel("Sequence Position")
-    plt.ylabel("Embedding Value")
-    plt.legend()
-    plt.show()
-
-def plot_betweenness(be, title="Betweenness"):
-    be = be.detach().cpu().numpy()
-    plt.figure(figsize=(12, 3))
-    for i in range(min(4, be.shape[0])):
-        plt.plot(be[i], label=f"Sample {i}")
-    plt.title(title)
-    plt.xlabel("Sequence Position")
-    plt.ylabel("Betweenness")
-    plt.legend()
-    plt.show()
-
-def plot_waveform_and_spectrogram(waveform, spectrogram, sample_idx=0, sr=16000, title="Waveform and Spectrogram"):
-    wf = waveform[sample_idx].detach().cpu().numpy()
-    if wf.ndim > 1:
-        wf = wf.squeeze()
-    t = np.arange(len(wf)) / sr
-
-    spec = spectrogram[sample_idx].detach().cpu().numpy()
-    if spec.shape[0] < spec.shape[1]:
-        spec = spec.T
-
-    fig, axs = plt.subplots(2, 1, figsize=(14, 6), sharex=False)
-    axs[0].plot(t, wf, color="tab:blue")
-    axs[0].set_title("Waveform")
-    axs[0].set_xlabel("Time (s)")
-    axs[0].set_ylabel("Amplitude")
-
-    axs[1].imshow(spec.T, aspect="auto", origin="lower", cmap="magma")
-    axs[1].set_title("Spectrogram")
-    axs[1].set_xlabel("Frame")
-    axs[1].set_ylabel("Mel Bin")
-    plt.tight_layout()
-    plt.show()
-
-def plot_betweenness_overlay(be, x, sample_idx=0, title="Betweenness Overlay"):
-
-    import matplotlib.pyplot as plt
-
-    be = be[sample_idx].detach().cpu().numpy()
-    if x.shape[1] != be.shape[0] and x.shape[-1] == be.shape[0]:
-        x = x.permute(0, 2, 1)
-    spec = x[sample_idx].detach().cpu().numpy()
-    energy = spec.mean(axis=1)
-
-    fig, ax1 = plt.subplots(figsize=(14, 5))
-    ax1.set_title(title)
-    ax1.set_xlabel("Sequence Position")
-    ax1.set_ylabel("Betweenness", color="tab:red")
-    ax1.plot(be, color="tab:red", label="Betweenness")
-    ax1.tick_params(axis='y', labelcolor="tab:red")
-    ax1.legend(loc="upper left")
-
-    ax2 = ax1.twinx()
-    ax2.set_ylabel("Energy", color="tab:blue")
-    ax2.plot(energy, color="tab:blue", alpha=0.5, label="Energy")
-    ax2.tick_params(axis='y', labelcolor="tab:blue")
-    ax2.legend(loc="upper right")
-
-    plt.show()
-
-    plt.figure(figsize=(14, 3))
-    plt.imshow(spec.T, aspect="auto", origin="lower", cmap="magma")
-    plt.colorbar(label="Spectrogram (dB)")
-    plt.title("Input Spectrogram")
-    plt.xlabel("Sequence Position")
-    plt.ylabel("Mel Bin")
-    plt.show()
-
-class BetweennessModule(nn.Module):
-    def __init__(self, dim, adjustment_scale=1.0, window_size=10):
-        super().__init__()
-        self.dim = dim
-        self.adjustment_scale = adjustment_scale
-        self.content_proj = nn.Linear(dim, dim)
-        self.betweenness_gate = nn.Parameter(torch.ones(1) * 0.5)
-        self.window_size = window_size
-        self.norm = nn.LayerNorm(dim)
-        self.dropout = nn.Dropout(0.1)
-
-    def compute_betweenness(self, x):
-        batch, seq_len, dim = x.shape
-        content = self.norm(self.content_proj(self.dropout(x)))
-        device = x.device
-        window = self.window_size
-
-        betweenness = torch.zeros(batch, seq_len, device=device)
-
-        for offset in range(1, window + 1):
-            n_indices = seq_len - 2 * offset
-            if n_indices <= 0:
-                continue
-            i = torch.arange(n_indices, device=device)
-            j = i + offset
-            k = i + 2 * offset
-
-            c_i = content[:, i, :]
-            c_j = content[:, j, :]
-            c_k = content[:, k, :]
-
-            def cos_dist(a, b):
-                a = F.normalize(a, dim=-1)
-                b = F.normalize(b, dim=-1)
-                return 1 - (a * b).sum(dim=-1)
-
-            direct = cos_dist(c_i, c_k)
-            path = cos_dist(c_i, c_j) + cos_dist(c_j, c_k)
-            safe_direct = torch.clamp(direct, min=1e-3)
-            between_score = 1.0 - (path - direct) / safe_direct
-            betweenness[:, j] += between_score
-
-        betweenness = betweenness / max(window, 1)
-        betweenness = betweenness - betweenness.mean(dim=1, keepdim=True)
-        std = betweenness.std(dim=1, keepdim=True) + 1e-6
-        betweenness = betweenness / std
-
-        betweenness = self.betweenness_gate * self.adjustment_scale * betweenness
-        betweenness = torch.clamp(betweenness, -2.0, 2.0)
-
-        return betweenness
-
-def apply_to_rope(rope_func, x, positions, betweenness_module):
-    adjustments = betweenness_module.get_position_adjustments(x)
-    adjusted_positions = positions + adjustments
-    return rope_func(x, adjusted_positions)
 
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
     shifted_input_ids = input_ids.new_zeros(input_ids.shape)
@@ -382,16 +89,6 @@ class Conv2d(nn.Conv2d):
         self, x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> Tensor:
         return super()._conv_forward(
             x, weight.to(x.device, x.dtype), None if bias is None else bias.to(x.device, x.dtype))
-
-class ParameterCycler:
-    def __init__(self, parameters):
-        self.parameters = parameters
-        self.current_idx = 0
-
-    def toggle_requires_grad(self):
-        for i, param in enumerate(self.parameters):
-            param.requires_grad = i == self.current_idx
-        self.current_idx = (self.current_idx + 1) % len(self.parameters)
 
 def _shape(self, tensor: torch.Tensor, ctx: int, batch: int):
     return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
@@ -486,8 +183,12 @@ class Multihead(nn.Module):
 
         qk = (q * scale) @ (k * scale).transpose(-1, -2)
 
-        mask = torch.triu(torch.ones(ctx, ctx), diagonal=1)
-        scaling_factors_causal = torch.where(mask == 1, torch.tensor(0.0), torch.tensor(1.0))
+        if mask is None:
+            causal_mask = torch.triu(torch.ones(ctx, ctx, device=q.device), diagonal=1)
+        else:
+            causal_mask = mask.to(q.device)
+
+        scaling_factors_causal = torch.where(causal_mask == 1, torch.tensor(0.0), torch.tensor(1.0))
 
         token_ids = k[:, :, :, 0]
         scaling_factors_silence = torch.ones_like(token_ids).to(q.device, q.dtype)
@@ -567,7 +268,6 @@ class EncoderBottleneck(nn.Module):
                 enc_latent = self.to_latent(enc_x.mean(dim=1))
             else:
                 enc_latent = self.to_latent(enc_x)
-
         else:
             assert dec_x is not None, "You have to provide either enc_x or dec_x"
             enc_latent = self.to_latent(dec_x)
@@ -626,8 +326,6 @@ class AudioEncoder(nn.Module):
     def forward(self, x, w) -> Tensor:
         if x is not None:
             if w is not None:
-                if self._counter < 1:
-                    plot_waveform_and_spectrogram(w, x)
                 x = self.se(x).permute(0, 2, 1)
                 w = self.we(w).permute(0, 2, 1)
                 x = (x + self.positional_embedding).to(x.device, x.dtype)
@@ -658,8 +356,6 @@ class TextDecoder(nn.Module):
     def __init__(self, vocab: int, ctx: int, dims: int, head: int, layer, cross_attention = False):
         super().__init__()
         self.debug = False
-    
-        head_dim = dims // head
         self.dropout = 0.1
 
         self.token_embedding = nn.Embedding(num_embeddings=vocab, embedding_dim=dims)
@@ -794,112 +490,6 @@ class Echo(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    def install_kv_cache_hooks(self, cache: Optional[dict] = None):
-        cache = {**cache} if cache is not None else {}
-        hooks = []
-        def save_to_cache(module, _, output):
-            if module not in cache or output.shape[1] > self.param.text_ctx:
-                cache[module] = output
-            else:
-                cache[module] = torch.cat([cache[module], output], dim=1).detach()
-            return cache[module]
-
-        def save_adaptive_output(module, _, output):
-            if isinstance(output, tuple) and len(output) == 2:
-                tensor_output, cache_updates = output
-                module_k = f"{module}_k"
-                module_v = f"{module}_v"
-                if module_k not in cache or tensor_output.shape[1] > self.param.text_ctx:
-                    cache[module_k] = cache_updates["k_cache"]
-                    cache[module_v] = cache_updates["v_cache"]
-                else:
-                    cache[module_k] = torch.cat([cache[module_k], cache_updates["k_cache"]], dim=1).detach()
-                    cache[module_v] = torch.cat([cache[module_v], cache_updates["v_cache"]], dim=1).detach()
-                return tensor_output
-            return output
-        
-        def install_hooks(layer: nn.Module):
-            if isinstance(layer, Multihead):
-                hooks.append(layer.k.register_forward_hook(save_to_cache))
-                hooks.append(layer.v.register_forward_hook(save_to_cache))
-            self.encoder.apply(install_hooks)
-        self.decoder.apply(install_hooks)
-        return cache, hooks
-    
-    @staticmethod
-    def create_attention_mask(batch_size, ctx, num_heads, is_causal=False, 
-                            device=None, dtype=None, xa_ctx=None):
-        mask_type = "cross_attention" if xa_ctx is not None else "combined"
-        
-        return UniversalMask.create(
-            batch_size=batch_size,
-            ctx=ctx,
-            ctx_kv=xa_ctx if xa_ctx is not None else ctx,
-            num_heads=num_heads,
-            mask_type=mask_type,
-            is_causal=is_causal,
-            padding_mask=None,
-            device=device,
-            dtype=dtype
-        )
-    
-    def _init_weights(self, module):
-        std = 0.02
-        self.init_counts = {"Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0,
-            "Conv2d": 0, "SEBlock": 0, "TextDecoder": 0, "AudioEncoder": 0, "Residual": 0,
-                            "Multihead": 0, "MultiheadA": 0, "MultiheadB": 0, "MultiheadC": 0}
-
-        for name, module in self.named_modules():
-            if isinstance(module, Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-                self.init_counts["Linear"] += 1
-            elif isinstance(module, Conv1d):
-                nn.init.normal_(module.weight, mean=0.0, std=std)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-                self.init_counts["Conv1d"] += 1
-            elif isinstance(module, LayerNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-                self.init_counts["LayerNorm"] += 1
-            elif isinstance(module, RMSNorm):
-                nn.init.ones_(module.weight)
-                self.init_counts["RMSNorm"] += 1
-            elif isinstance(module, Multihead):
-                self.init_counts["Multihead"] += 1
-            elif isinstance(module, Conv2d):
-                nn.init.normal_(module.weight, mean=0.0, std=std)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-                self.init_counts["Conv2d"] += 1
-            elif isinstance(module, SEBlock):
-                nn.init.ones_(module.fc[0].weight)
-                nn.init.zeros_(module.fc[0].bias)
-                nn.init.ones_(module.fc[2].weight)
-                nn.init.zeros_(module.fc[2].bias)
-                self.init_counts["SEBlock"] += 1
-            elif isinstance(module, TextDecoder):
-                self.init_counts["TextDecoder"] += 1
-            elif isinstance(module, AudioEncoder):
-                nn.init.xavier_uniform_(module.se[0].weight)
-                nn.init.zeros_(module.se[0].bias)
-                nn.init.xavier_uniform_(module.se[2].weight)
-                nn.init.zeros_(module.se[2].bias)
-                nn.init.xavier_uniform_(module.se[4].weight)
-                nn.init.zeros_(module.se[4].bias)
-                self.init_counts["AudioEncoder"] += 1
-            elif isinstance(module, Residual):
-                self.init_counts["Residual"] += 1    
-                                                 
-    def init_weights(self):
-        print("Initializing all weights")
-        self.apply(self._init_weights)
-        print("Initialization summary:")
-        for module_type, count in self.init_counts.items():
-            print(f"{module_type}: {count}")
-
 def shift_with_zeros(input_ids: torch.Tensor) -> torch.Tensor:
     """Shift tokens right, using zeros as both start and end markers."""
     shifted_input_ids = input_ids.new_zeros(input_ids.shape)
@@ -929,27 +519,6 @@ class DataCollator:
             labels = labels[:, 1:]
         batch["labels"] = labels
         batch["decoder_input_ids"] = shift_with_zeros(labels)
-
-        if self.debug:
-            print(f"Batch input_ids shape: {batch['input_ids'].shape}")
-            print(f"Batch labels shape: {batch['labels'].shape}")
-            print(f"Batch labels: {batch['labels']}")
-            print(f"Batch input_ids: {batch['input_ids']}")
-
-            if "input_features" in batch:
-                print(f"Batch input_features shape: {batch['input_features'].shape}")
-                print(f"Batch input_features: {batch['input_features'][0]}")
-                print(f"Batch input_features: {batch['input_features']}")
-                print("Sum of input_features:", batch["input_features"].sum().item())
-                print("Max of input_features:", batch["input_features"].max().item())
-                print(batch["input_features"][0, :, 0:20])
-                print(batch["input_features"][0, :, 700:720])
-                print(f"Batch input_features: {len(batch['input_features'][0])}")
-
-            if "waveform" in batch:
-                print(f"Batch waveform shape: {batch['waveform'].shape}")
-                print(f"Batch waveform: {batch['waveform']}")
-            print(f"Batch decoder_start_token_id: {self.decoder_start_token_id}")
 
         return batch
     
@@ -1144,21 +713,9 @@ if __name__ == "__main__":
         compute_metrics=compute_metrics,
     )
 
-    model.init_weights()
+
     print("Trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
     print("Total parameters:", sum(p.numel() for p in model.parameters()))
-
-    sanity_check = False
-    if sanity_check:
-        print("Sanity check")
-        print(dataset["test"]["labels"][0], dataset["test"]["input_features"][0].shape, dataset["test"]["waveform"][0].shape)
-        print(dataset["train"]["labels"][0], dataset["train"]["input_features"][0].shape, dataset["train"]["waveform"][0].shape)
-
-        trainer.evaluate(eval_dataset=dataset["test"].take(10), metric_key_prefix="test")
-        trainer.save_model(os.path.join(log_dir, "Sanity_model"))
-
-        print("Training complete")
-        print("Model saved to:", log_dir)
 
     trainer.train()
 
