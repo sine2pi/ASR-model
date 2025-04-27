@@ -11,10 +11,10 @@ This model uses 0 for padding masking and silence and as such the attention mech
 - The 0.001 factor means silence is "whispered" to the model rather than "shouted".
 - The model can learn timing patterns where pauses are meaningful.
 
+```python
 
 
-
-        def _attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+def _attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch, ctx, dims = q.shape
         scale = (dims // self.head) ** -0.25
         
@@ -42,7 +42,7 @@ This model uses 0 for padding masking and silence and as such the attention mech
         w = F.softmax(qk, dim=-1).to(q.dtype)
         out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
         return out, qk.detach()
-
+```
 3 tests: spectrogram, waveform, spectrogram+waveform.
 ### IN PROGRESS
 
