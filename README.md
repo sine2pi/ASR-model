@@ -14,6 +14,7 @@ This model uses 0 for padding masking and silence and no special tokens, as such
 - No more token mess
 - Teacher forcing is the same just shift and add 0s.
 - 0 is a natural boundry. As the model learns to ignore silence which are 0's due to the nature of my log mel spectrograms it learns to understand the boundries of speech and silence. BOS EOS SOT etcetc tokens can hold the model back from developing a deeper understanding of sound. Those special tokens are no longer necessary.
+- This model has a cross talk bridge so that there is communication between the encoder and decoder outside of cross attention. 
 
 ```python
 
