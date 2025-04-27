@@ -5,11 +5,13 @@ This model's learnable blend (with a sigmoid-mixed parameter) between waveform a
 Blending waveform and spectrogram features has been explored in some research, but is not standard in ASR pipelines.
 This learnable blend is a modern, under-explored approach addressing the waveform spectrogram debate. Initial findings of the pilot run suggest that the blending of the two significantly decreases WER compared to standalone waveform and spectrogram without significantly increasing overhead. 
 
-This model uses 0 for padding masking and silence and no special tokens, as such the attention mechanism uses multiplicative masking instead of additive. The 0.001 is so that the model can still learn to identify silence. This gives silence tokens a tiny but meaningful attention weight rather than completely masking them out. This is conceptually sound because:
+This model uses 0 for padding masking and silence and no special tokens, as such the attention mechanism uses multiplicative masking instead of additive. The 0.001 is so that the model can still learn to identify silence. This gives silence tokens a tiny but meaningful attention weight rather than completely masking them out.  This is conceptually sound because:
 
 - Silence/pauses in speech carry rhythmic and semantic information.
-- The 0.001 factor means silence is "whispered" to the model rather than "shouted".
+- The 0.001 factor means silence is "whispered" to the model rather than "shouted". Can be set to 0.0 if you are worried about leakage.
+- This method allows "0's" to have different weights if one were so inclined.
 - The model can learn timing patterns where pauses are meaningful.
+
 
 ```python
 
