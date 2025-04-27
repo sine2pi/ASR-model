@@ -11,7 +11,9 @@ This model uses 0 for padding masking and silence and no special tokens, as such
 - The 0.001 factor means silence is "whispered" to the model rather than "shouted". Can be set to 0.0 if you are worried about leakage.
 - This method allows "0's" to have different weights if one were so inclined.
 - The model can learn timing patterns where pauses are meaningful.
-
+- No more token mess
+- Teacher forcing is the same just shift and add 0s.
+- 0 is a natural boundry. As the model learns to ignore silence which are 0's due to the nature of my log mel spectrograms it learns to understand the boundries of speech and silence. BOS EOS SOT etcetc tokens can hold the model back from developing a deeper understanding of sound. Those special tokens are no longer necessary.
 
 ```python
 
