@@ -217,8 +217,28 @@ class Rotary(nn.Module):
         x1 = x1 * freqs
         x1 = torch.view_as_real(x1).flatten(-2)
         return torch.cat([x1.type_as(x), x2], dim=-1)
-        
+    
+
+try:
+    from torch.nn.functional import scaled_dot_product_attention
+
+    SDPA_AVAILABLE = True
+except (ImportError, RuntimeError, OSError):
+    scaled_dot_product_attention = None
+    SDPA_AVAILABLE = False
+
+@contextmanager
+def disable_sdpa():
+    prev_state = Multihead.use_sdpa
+    try:
+        Multihead.use_sdpa = False
+        yield
+    finally:
+        Multihead.use_sdpa = prev_state
+
+
 class Multihead(nn.Module):
+    use_sdpa = True
 
     def __init__(self, dims: int, head: int):
         super().__init__()
@@ -641,7 +661,11 @@ class DataCollator:
         if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
             labels = labels[:, 1:]
         batch["labels"] = labels
-        batch["input_ids"] = labels_batch["input_ids"]
+        # batch["input_ids"] = labels_batch["input_ids"]
+        # batch["input_ids"] = shift_tokens_right(
+        #     labels, self.tokenizer.pad_token_id, self.decoder_start_token_id
+        # )
+
         return batch
     
 def prepare_dataset(batch, input_features=True, waveform=True):
@@ -666,7 +690,7 @@ def prepare_dataset(batch, input_features=True, waveform=True):
         batch["input_features"] = padded
 
     batch["labels"] = tokenizer(batch["transcription"]).input_ids
-    batch["input_ids"] = batch["labels"]
+    # batch["input_ids"] = batch["labels"]
     return batch
 
 def compute_metrics(eval_pred, compute_result: bool = True):
