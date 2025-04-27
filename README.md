@@ -7,11 +7,9 @@ This learnable blend is a modern, under-explored approach addressing the wavefor
 
 This model uses 0 for padding masking and silence and as such the attention mechanism uses multiplicative masking instead of additive. The 0.001 is so that the model can still learn to identify silence. This gives silence tokens a tiny but meaningful attention weight rather than completely masking them out. This is conceptually sound because:
 
-Silence/pauses in speech carry rhythmic and semantic information
-
-The 0.001 factor means silence is "whispered" to the model rather than "shouted"
-
-The model can learn timing patterns where pauses are meaningful
+Silence/pauses in speech carry rhythmic and semantic information.
+The 0.001 factor means silence is "whispered" to the model rather than "shouted".
+The model can learn timing patterns where pauses are meaningful.
 
 
 
