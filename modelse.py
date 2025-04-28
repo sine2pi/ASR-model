@@ -183,12 +183,8 @@ class Multihead(nn.Module):
 
         qk = (q * scale) @ (k * scale).transpose(-1, -2)
 
-        if mask is None:
-            causal_mask = torch.triu(torch.ones(ctx, ctx, device=q.device), diagonal=1)
-        else:
-            causal_mask = mask.to(q.device)
-
-        scaling_factors_causal = torch.where(causal_mask == 1, torch.tensor(0.0), torch.tensor(1.0))
+        mask = torch.triu(torch.ones(ctx, ctx), diagonal=1)
+        scaling_factors_causal = torch.where(mask == 1, torch.tensor(0.0), torch.tensor(1.0))
 
         token_ids = k[:, :, :, 0]
         scaling_factors_silence = torch.ones_like(token_ids).to(q.device, q.dtype)
