@@ -61,10 +61,13 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch import Tensor
+from einops import rearrange
 import numpy as np
 from typing import Optional, Dict, Tuple, Any, Union, List
 import gzip
+import math
 import base64
+import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, precision_score, f1_score, recall_score
 from datetime import datetime
 from datasets import load_dataset, Audio, DatasetDict
@@ -102,6 +105,247 @@ class Dimensions:
     eos_token_id: int
     decoder_start_token_id: int
     act: str 
+
+
+class rotary2(nn.Module):
+    def __init__(self, dims, heads, freq=10000, max_ctx=4096, cache=False, tlearnable=False, rlearnable=False, mlearnable=False, flearnable=False, rscale=None, tscale=None, device=None, ):
+        super().__init__()
+        self.dims = dims
+        self.heads = heads
+        self.freq = freq
+        self.device = device if device is not None else torch.device('cpu')
+        self.dtype = torch.float32
+        self.head_dim = self.dims // self.heads
+        self.rot = self.head_dim // 2
+
+        def custom_fn(maxctx, dims):
+            return torch.linspace(1., maxctx, dims // 2) ** 2
+        def y(x):
+            return x is not None
+     
+        self.thetas = nn.Parameter(torch.zeros(self.rot, device=self.device))
+        self.pairs = nn.Parameter(torch.rand(self.rot, 2, device=self.device) * self.head_dim)
+        if tscale is not None:
+            self.tscale = nn.Parameter(tscale.to(self.device), requires_grad=tlearnable)
+        else:
+            self.tscale = nn.Parameter(torch.ones(1, device=self.device), requires_grad=tlearnable)
+        if rscale is not None:
+            self.rscale = nn.Parameter(rscale.to(self.device), requires_grad=rlearnable)
+        else:
+            self.rscale = nn.Parameter(torch.ones(1, device=self.device), requires_grad=rlearnable)
+        self.matrix = nn.Parameter(torch.eye(self.head_dim, device=self.device), requires_grad=mlearnable)
+        findices = torch.arange(0, self.head_dim, 2, device=self.device).float()
+        fdata = 1.0 / (self.freq ** (findices / self.head_dim))
+        self.invf = nn.Parameter(data=fdata, requires_grad=flearnable)
+
+        self.register_buffer('cached_freqs', torch.zeros(cache, self.dim), persistent = False)
+        self.max_ctx = 0
+
+        self.reset_parameters()
+        
+    def reset_parameters(self):
+        nn.init.orthogonal_(tensor=self.matrix)
+        nn.init.zeros_(tensor=self.thetas)
+
+    def q_rotation(self, x, theta, u, v):
+        x = x.to(self.device, self.dtype)
+        theta = theta.to(self.device, self.dtype) if not isinstance(theta, (int, float)) else theta
+        u = u.to(self.device)
+        v = v.to(self.device)
+        u = u / torch.norm(u)
+        v = v / torch.norm(v)
+        half_theta = theta / 2
+        cos_ht = torch.cos(half_theta)
+        sin_ht = torch.sin(half_theta)
+        q = torch.cat([cos_ht.unsqueeze(0), sin_ht * u])
+        q_ = torch.cat([cos_ht.unsqueeze(0), -sin_ht * u])
+        x_shape = x.shape
+        x = x.view(-1, 3)
+        uv_cross = torch.cross(u.unsqueeze(0), x)
+        uuv_cross = torch.cross(u.unsqueeze(0), uv_cross)
+        x_rot = x + 2 * (q[0] * uv_cross + uuv_cross)
+
+        x_rot = x_rot.view(*x_shape)
+        return x_rot
+
+    def rotation_matrix(self, dims, i, j, theta):
+        G = torch.eye(dims, device=theta.device)
+        c, s = torch.cos(theta), torch.sin(theta)
+        G[i, i], G[j, j] = c, c
+        G[i, j], G[j, i] = -s, s
+        if dims == 3:
+            u = torch.eye(dims, device=theta.device)[i]
+            v = torch.eye(dims, device=theta.device)[j]
+            if theta < 0: 
+                Q = self.q_rotation(torch.eye(dims, device=theta.device), theta=abs(theta), u=u, v=v)
+            else:
+                Q = self.q_rotation(torch.eye(dims, device=theta.device), theta=theta, u=u, v=v)
+            G = (G + Q) / 2
+        return G
+
+    def rotate(self, x):
+        rotate = int(torch.round(self.rscale * self.rot))
+        for k in range(rotate):
+            i, j = self.r_pairs[k].long()
+            theta = self.thetas[k] * self.tscale
+            G = self.rotation_matrix(dims=self.head_dim, i=i.item(), j=j.item(), theta=theta)
+            x = x @ G
+        return x
+
+    def forward(self, x):
+        x = x.to(self.device)
+        batch, ctx, *rest = x.size()
+
+        if len(rest) == 1:
+            dims = rest[0]
+            if dims != self.heads * self.head_dim:
+                raise ValueError(
+                    f"Needed {self.heads * self.head_dim}, but got too many {dims}"
+                )
+        elif len(rest) == 2:
+            heads, head_dim = rest
+            if heads != self.heads or head_dim != self.head_dim:
+                raise ValueError(
+                    f"This many heads {self.heads} and head_dims {self.head_dim} we need, got this many heads {heads} and head_dims {head_dim} we did."
+)
+        else:
+            raise ValueError(f"Expected the thingy to be 3D or 4D, but got {x.dim()}D")
+
+        x = rearrange(x, 'b s (h d) -> (b s) d', h=self.heads)
+        x = self.rotate(x)
+        x = x @ self.matrix
+        x = rearrange(x, '(b s) d -> b s (h d)', b=batch, h=self.heads)
+        position = torch.arange(end=ctx, device=self.device, dtype=self.dtype)
+        position = rearrange(tensor=position, pattern='s -> s 1')  # [seq_len, 1]
+        div_term = rearrange(tensor=self.invf, pattern='d -> 1 d')  # [1, dim/2]
+        sinusoid = position * div_term  # [seq_len, dim/2]
+        sin = rearrange(tensor=torch.sin(input=sinusoid), pattern='s d -> 1 s 1 d')  # [1, seq_len, 1, dim/2]
+        cos = rearrange(tensor=torch.cos(input=sinusoid), pattern='s d -> 1 s 1 d')  # [1, seq_len, 1, dim/2]
+        x = rearrange(tensor=x, pattern='b s (h d) -> b s h d', h=heads)
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        x_out = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+        x_out = rearrange(x_out, 'b s h d -> b s (h d)')
+        x_out = x_out * math.sqrt(dims)
+        return x_out
+
+def visualize_attention_weights(attn_weights):
+    import seaborn as sns
+    batch, heads, seq_len, _ = attn_weights.shape
+    plt.figure(figsize=(12, 4))
+    for h in range(min(4, heads)):
+        plt.subplot(1, min(4, heads), h+1)
+        sns.heatmap(attn_weights[0, h].detach().cpu().numpy())
+        plt.title(f'Head {h}')
+    plt.suptitle("Attention Weights")
+    plt.show()
+
+def visualize_rotary_angles(rotary, seq_len):
+    freqs = rotary.inv_freq.detach().cpu().numpy()
+    t = np.arange(seq_len)
+    angles = np.outer(t, freqs)
+    plt.figure(figsize=(10, 6))
+    for i in range(min(4, angles.shape[1])):
+        plt.plot(angles[:, i], label=f'Freq {i}')
+    plt.title("Rotary Angles per Position")
+    plt.xlabel("Position")
+    plt.ylabel("Angle (radians)")
+    plt.legend()
+    plt.show()
+
+def visualize_rotary_effects(x, rotary):
+    seq_len = x.shape[1]
+    freqs = rotary(seq_len)
+    x_rot = rotary.apply_rotary(x, freqs)
+    idx = 0
+    dims_to_plot = [0, 1, 2, 3]
+    plt.figure(figsize=(10, 6))
+    for d in dims_to_plot:
+        plt.plot(x[idx, :, d].detach().cpu().numpy(), label=f'Orig dim {d}')
+        plt.plot(x_rot[idx, :, d].detach().cpu().numpy(), '--', label=f'Rotary dim {d}')
+    plt.title("Effect of Rotary on Embedding Dimensions")
+    plt.xlabel("Sequence Position")
+    plt.ylabel("Embedding Value")
+    plt.legend()
+    plt.show()
+
+def plot_waveform_and_spectrogram(waveform, spectrogram, sample_idx=0, sr=16000, title="Waveform and Spectrogram"):
+    wf = waveform[sample_idx].detach().cpu().numpy()
+    if wf.ndim > 1:
+        wf = wf.squeeze()
+    t = np.arange(len(wf)) / sr
+    spec = spectrogram[sample_idx].detach().cpu().numpy()
+    if spec.shape[0] < spec.shape[1]:
+        spec = spec.T
+
+    fig, axs = plt.subplots(2, 1, figsize=(14, 6), sharex=False)
+    axs[0].plot(t, wf, color="tab:blue")
+    axs[0].set_title("Waveform")
+    axs[0].set_xlabel("Time (s)")
+    axs[0].set_ylabel("Amplitude")
+
+    axs[1].imshow(spec.T, aspect="auto", origin="lower", cmap="magma")
+    axs[1].set_title("Spectrogram")
+    axs[1].set_xlabel("Frame")
+    axs[1].set_ylabel("Mel Bin")
+    plt.tight_layout()
+    plt.show()
+
+class BetweennessModule(nn.Module):
+    def __init__(self, dim, adjustment_scale=1.0, window_size=10):
+        super().__init__()
+        self.dim = dim
+        self.adjustment_scale = adjustment_scale
+        self.content_proj = nn.Linear(dim, dim)
+        self.betweenness_gate = nn.Parameter(torch.ones(1) * 0.5)
+        self.window_size = window_size
+        self.norm = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(0.1)
+
+    def compute_betweenness(self, x):
+        batch, seq_len, dim = x.shape
+        content = self.norm(self.content_proj(self.dropout(x)))
+        device = x.device
+        window = self.window_size
+
+        betweenness = torch.zeros(batch, seq_len, device=device)
+
+        for offset in range(1, window + 1):
+            n_indices = seq_len - 2 * offset
+            if n_indices <= 0:
+                continue
+            i = torch.arange(n_indices, device=device)
+            j = i + offset
+            k = i + 2 * offset
+
+            c_i = content[:, i, :]
+            c_j = content[:, j, :]
+            c_k = content[:, k, :]
+
+            def cos_dist(a, b):
+                a = F.normalize(a, dim=-1)
+                b = F.normalize(b, dim=-1)
+                return 1 - (a * b).sum(dim=-1)
+
+            direct = cos_dist(c_i, c_k)
+            path = cos_dist(c_i, c_j) + cos_dist(c_j, c_k)
+            safe_direct = torch.clamp(direct, min=1e-3)
+            between_score = 1.0 - (path - direct) / safe_direct
+            betweenness[:, j] += between_score
+
+        betweenness = betweenness / max(window, 1)
+        betweenness = betweenness - betweenness.mean(dim=1, keepdim=True)
+        std = betweenness.std(dim=1, keepdim=True) + 1e-6
+        betweenness = betweenness / std
+
+        betweenness = self.betweenness_gate * self.adjustment_scale * betweenness
+        betweenness = torch.clamp(betweenness, -2.0, 2.0)
+
+        return betweenness
+
+def apply_to_rope(rope_func, x, positions, betweenness_module):
+    adjustments = betweenness_module.get_position_adjustments(x)
+    adjusted_positions = positions + adjustments
+    return rope_func(x, adjusted_positions)
 
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
     shifted_input_ids = input_ids.new_zeros(input_ids.shape)
@@ -143,6 +387,16 @@ class Conv2d(nn.Conv2d):
         self, x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> Tensor:
         return super()._conv_forward(
             x, weight.to(x.device, x.dtype), None if bias is None else bias.to(x.device, x.dtype))
+
+class ParameterCycler:
+    def __init__(self, parameters):
+        self.parameters = parameters
+        self.current_idx = 0
+
+    def toggle_requires_grad(self):
+        for i, param in enumerate(self.parameters):
+            param.requires_grad = i == self.current_idx
+        self.current_idx = (self.current_idx + 1) % len(self.parameters)
 
 def _shape(self, tensor: torch.Tensor, ctx: int, batch: int):
     return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
@@ -252,7 +506,6 @@ class Multihead(nn.Module):
         out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
         return out, qk.detach()
 
-
 class Residual(nn.Module):
     def __init__(self, dims: int, head: int, cross_attention: bool = False, act = "relu"):
         super().__init__()
@@ -302,7 +555,46 @@ class SEBlock(nn.Module):
         y = self.pool(x).view(b, c)
         y = self.fc(y).view(b, c, 1)
         return x * y
+    
+class Bridge:
+    _instance = None
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(Bridge, cls).__new__(cls)
+            cls._instance.encoder_features = None
+        return cls._instance
+    def store_encoder_features(self, features):
+        self.encoder_features = features
+    def get_encoder_features(self):
+        return self.encoder_features
 
+class FeedforwardBridge(nn.Module):
+    def __init__(self, dims, is_encoder=False, dropout=0.1):
+        super(FeedforwardBridge, self).__init__()
+        self.is_encoder = is_encoder
+        self.dims = dims
+        self.store = Bridge()
+        self.feedforward = nn.Linear(dims, dims)
+        self.activation = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.cross_gate = nn.Parameter(torch.ones(1) * 0.5)
+        
+    def forward(self, x):
+        transformed = self.feedforward(x)
+        transformed = self.activation(transformed)
+        transformed = self.dropout(transformed)
+        if self.is_encoder:
+            self.store.store_encoder_features(transformed)
+            return transformed
+        else:
+            encoder_features = self.store.get_encoder_features()
+            if encoder_features is not None:
+                if encoder_features.shape[1:] != x.shape[1:]:
+                    encoder_features = encoder_features.mean(dim=1, keepdim=True).expand(-1, x.shape[1], -1)
+                gate = torch.sigmoid(self.cross_gate)
+                return gate * transformed + (1 - gate) * encoder_features
+            return transformed
+        
 class EncoderBottleneck(nn.Module):
     def __init__(self, dims, latent_dim, iterations=2):
         super().__init__()
@@ -391,8 +683,8 @@ class AudioEncoder(nn.Module):
             assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
             x = (x + self.positional_embedding).to(x.device, x.dtype)
 
-        _, dec_to_enc = self.bottleneck(enc_x=x)
-        x = x + dec_to_enc
+        # _, dec_to_enc = self.bottleneck(enc_x=x)
+        # x = x + dec_to_enc
 
         for block in chain(self.blockA or []):
             x = block(x)
@@ -401,7 +693,7 @@ class AudioEncoder(nn.Module):
             print(f"Encoder output shape: {x.shape}, x shape: {x.shape}, w shape: {w.shape}")
        
         return self.ln_enc(x)
-    
+        
 class TextDecoder(nn.Module):
     def __init__(self, vocab: int, ctx: int, dims: int, head: int, layer, cross_attention = False):
         super().__init__()
@@ -428,22 +720,19 @@ class TextDecoder(nn.Module):
         offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
         x = (self.token_embedding(x) + self.positional_embedding[offset: offset + x.shape[-1]])
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
+        
         ctx = x.shape[1]
         freqs = self.rotary(ctx)
         x = self.rotary.apply_rotary(x, freqs)
         x = x.to(xa.dtype)
 
-        enc_to_dec, _ = self.bottleneck(dec_x=x)
-        x = x + enc_to_dec
+        # enc_to_dec, _ = self.bottleneck(dec_x=x)
+        # x = x + enc_to_dec
 
         for block in chain(self.blockA or []):
             x = block(x, xa=xa, mask=self.mask, kv_cache=kv_cache)
         x = self.ln_dec(x)
         logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
-
-        if self.debug:
-            print(f"Logits shape: {logits.shape}, x shape: {x.shape}, xa shape: {xa.shape}")
-
         return logits
 
 class Echo(nn.Module):
@@ -540,8 +829,96 @@ class Echo(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
+    def install_kv_cache_hooks(self, cache: Optional[dict] = None):
+        cache = {**cache} if cache is not None else {}
+        hooks = []
+        def save_to_cache(module, _, output):
+            if module not in cache or output.shape[1] > self.param.text_ctx:
+                cache[module] = output
+            else:
+                cache[module] = torch.cat([cache[module], output], dim=1).detach()
+            return cache[module]
+
+        def save_adaptive_output(module, _, output):
+            if isinstance(output, tuple) and len(output) == 2:
+                tensor_output, cache_updates = output
+                module_k = f"{module}_k"
+                module_v = f"{module}_v"
+                if module_k not in cache or tensor_output.shape[1] > self.param.text_ctx:
+                    cache[module_k] = cache_updates["k_cache"]
+                    cache[module_v] = cache_updates["v_cache"]
+                else:
+                    cache[module_k] = torch.cat([cache[module_k], cache_updates["k_cache"]], dim=1).detach()
+                    cache[module_v] = torch.cat([cache[module_v], cache_updates["v_cache"]], dim=1).detach()
+                return tensor_output
+            return output
+        
+        def install_hooks(layer: nn.Module):
+            if isinstance(layer, Multihead):
+                hooks.append(layer.k.register_forward_hook(save_to_cache))
+                hooks.append(layer.v.register_forward_hook(save_to_cache))
+            self.encoder.apply(install_hooks)
+        self.decoder.apply(install_hooks)
+        return cache, hooks
+        
+    def _init_weights(self, module):
+        std = 0.02
+        self.init_counts = {"Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0,
+            "Conv2d": 0, "SEBlock": 0, "TextDecoder": 0, "AudioEncoder": 0, "Residual": 0,
+                            "Multihead": 0, "MultiheadA": 0, "MultiheadB": 0, "MultiheadC": 0}
+
+        for name, module in self.named_modules():
+            if isinstance(module, Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                self.init_counts["Linear"] += 1
+            elif isinstance(module, Conv1d):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                self.init_counts["Conv1d"] += 1
+            elif isinstance(module, LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+                self.init_counts["LayerNorm"] += 1
+            elif isinstance(module, RMSNorm):
+                nn.init.ones_(module.weight)
+                self.init_counts["RMSNorm"] += 1
+            elif isinstance(module, Multihead):
+                self.init_counts["Multihead"] += 1
+            elif isinstance(module, Conv2d):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                self.init_counts["Conv2d"] += 1
+            elif isinstance(module, SEBlock):
+                nn.init.ones_(module.fc[0].weight)
+                nn.init.zeros_(module.fc[0].bias)
+                nn.init.ones_(module.fc[2].weight)
+                nn.init.zeros_(module.fc[2].bias)
+                self.init_counts["SEBlock"] += 1
+            elif isinstance(module, TextDecoder):
+                self.init_counts["TextDecoder"] += 1
+            elif isinstance(module, AudioEncoder):
+                nn.init.xavier_uniform_(module.se[0].weight)
+                nn.init.zeros_(module.se[0].bias)
+                nn.init.xavier_uniform_(module.se[2].weight)
+                nn.init.zeros_(module.se[2].bias)
+                nn.init.xavier_uniform_(module.se[4].weight)
+                nn.init.zeros_(module.se[4].bias)
+                self.init_counts["AudioEncoder"] += 1
+            elif isinstance(module, Residual):
+                self.init_counts["Residual"] += 1    
+                                                 
+    def init_weights(self):
+        print("Initializing all weights")
+        self.apply(self._init_weights)
+        print("Initialization summary:")
+        for module_type, count in self.init_counts.items():
+            print(f"{module_type}: {count}")
+
 def shift_with_zeros(input_ids: torch.Tensor) -> torch.Tensor:
-    """Shift tokens right, using zeros as both start and end markers."""
     shifted_input_ids = input_ids.new_zeros(input_ids.shape)
     shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()   
     return shifted_input_ids
@@ -569,6 +946,27 @@ class DataCollator:
             labels = labels[:, 1:]
         batch["labels"] = labels
         batch["decoder_input_ids"] = shift_with_zeros(labels)
+
+        if self.debug:
+            print(f"Batch input_ids shape: {batch['input_ids'].shape}")
+            print(f"Batch labels shape: {batch['labels'].shape}")
+            print(f"Batch labels: {batch['labels']}")
+            print(f"Batch input_ids: {batch['input_ids']}")
+
+            if "input_features" in batch:
+                print(f"Batch input_features shape: {batch['input_features'].shape}")
+                print(f"Batch input_features: {batch['input_features'][0]}")
+                print(f"Batch input_features: {batch['input_features']}")
+                print("Sum of input_features:", batch["input_features"].sum().item())
+                print("Max of input_features:", batch["input_features"].max().item())
+                print(batch["input_features"][0, :, 0:20])  # First 20 frames
+                print(batch["input_features"][0, :, 700:720])  # Middle frames
+                print(f"Batch input_features: {len(batch['input_features'][0])}")
+
+            if "waveform" in batch:
+                print(f"Batch waveform shape: {batch['waveform'].shape}")
+                print(f"Batch waveform: {batch['waveform']}")
+            print(f"Batch decoder_start_token_id: {self.decoder_start_token_id}")
 
         return batch
     
@@ -627,6 +1025,10 @@ def compute_metrics(eval_pred, compute_result: bool = True):
 
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+    
+    print("--------------------------------")
+    print(f"Prediction: {pred_str[0]}")
+    print(f"Label: {label_str[0]}")
 
     pred_flat = list(chain.from_iterable(pred_ids))
     labels_flat = list(chain.from_iterable(label_ids))
@@ -674,9 +1076,9 @@ if __name__ == "__main__":
         text_head=4,
         decoder_idx=4,
         text_dims=512,
-        decoder_start_token_id = 0,
+        decoder_start_token_id = 0,#50258,
         pad_token_id = 0,
-        eos_token_id = 0,
+        eos_token_id = 0,#50257,   
         act = "gelu",
         )
 
@@ -692,10 +1094,10 @@ if __name__ == "__main__":
         token=token, local_files_only=True, pad_token_id=0
     )
 
-    tokenizer.pad_token_id = 0
-    tokenizer.bos_token_id = 0
-    tokenizer.eos_token_id = 0
-    tokenizer.decoder_start_token_id = 0
+    tokenizer.pad_token_id = 0  # Was 50257 
+    tokenizer.bos_token_id = 0  # Was 50258
+    tokenizer.eos_token_id = 0  # Was 50257 
+    tokenizer.decoder_start_token_id = 0  # Was 50258
 
     data_collator = DataCollator(extractor=extractor,
         tokenizer=tokenizer, decoder_start_token_id=tokenizer.decoder_start_token_id)
@@ -729,7 +1131,7 @@ if __name__ == "__main__":
         bf16=True,
         eval_strategy="steps",
         save_strategy="steps",
-        max_steps=10000,
+        max_steps=100000,
         save_steps=10000,
         eval_steps=1000,
         warmup_steps=1000,
@@ -742,14 +1144,15 @@ if __name__ == "__main__":
         save_total_limit=1,
         label_names=["labels"],
 
-        optim="adamw_torch",
-        learning_rate=0.00025,
-        weight_decay=0.2,
+        optim="adafactor",
+        lr_scheduler_type="cosine",
+        learning_rate=0.0025,
+        weight_decay=0.25,
         save_safetensors=True,
         eval_on_start=False,
-        include_num_input_tokens_seen=True,
-        include_tokens_per_second=True,
-        batch_eval_metrics=True,
+        include_num_input_tokens_seen=False,
+        include_tokens_per_second=False,
+        batch_eval_metrics=False,
         group_by_length=False,
         remove_unused_columns=False,
     )
@@ -761,15 +1164,27 @@ if __name__ == "__main__":
         eval_dataset=test_dataset,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
+        # optimizers=(optimizer, scheduler),
     )
 
-
+    model.init_weights()
     print("Trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
     print("Total parameters:", sum(p.numel() for p in model.parameters()))
 
+    sanity_check = False
+    if sanity_check:
+        print("Sanity check")
+        print(dataset["test"]["labels"][0], dataset["test"]["input_features"][0].shape, dataset["test"]["waveform"][0].shape)
+        print(dataset["train"]["labels"][0], dataset["train"]["input_features"][0].shape, dataset["train"]["waveform"][0].shape)
+
+        trainer.evaluate(eval_dataset=dataset["test"].take(10), metric_key_prefix="test")
+        trainer.save_model(os.path.join(log_dir, "Sanity_model"))
+
+        print("Training complete")
+        print("Model saved to:", log_dir)
+
     trainer.train()
-
-
+    
 
 
 
