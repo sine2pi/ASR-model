@@ -51,7 +51,6 @@ class Dimensions:
     decoder_start_token_id: int
     act: str 
 
-
 class rotary2(nn.Module):
     def __init__(self, dims, heads, freq=10000, max_ctx=4096, cache=False, tlearnable=False, rlearnable=False, mlearnable=False, flearnable=False, rscale=None, tscale=None, device=None, ):
         super().__init__()
