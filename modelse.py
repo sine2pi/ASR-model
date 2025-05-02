@@ -935,7 +935,7 @@ def prepare_dataset(batch, input_features=True, waveform=True):
         padded = torch.zeros(target_shape, dtype=features.dtype)
         padded[:, :features.shape[1]] = features[:, :target_shape[1]]
         batch["input_features"] = padded
-        batch["labels"] = tokenizer(batch["transcription"], add_special_tokens=False).input_ids
+    batch["labels"] = tokenizer(batch["transcription"], add_special_tokens=False).input_ids
     return batch
 
 def compute_metrics(eval_pred, compute_result: bool = True):
