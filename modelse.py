@@ -160,11 +160,11 @@ class rotary2(nn.Module):
         x = x @ self.matrix
         x = rearrange(x, '(b s) d -> b s (h d)', b=batch, h=self.heads)
         position = torch.arange(end=ctx, device=self.device, dtype=self.dtype)
-        position = rearrange(tensor=position, pattern='s -> s 1')  # [seq_len, 1]
-        div_term = rearrange(tensor=self.invf, pattern='d -> 1 d')  # [1, dim/2]
-        sinusoid = position * div_term  # [seq_len, dim/2]
-        sin = rearrange(tensor=torch.sin(input=sinusoid), pattern='s d -> 1 s 1 d')  # [1, seq_len, 1, dim/2]
-        cos = rearrange(tensor=torch.cos(input=sinusoid), pattern='s d -> 1 s 1 d')  # [1, seq_len, 1, dim/2]
+        position = rearrange(tensor=position, pattern='s -> s 1')
+        div_term = rearrange(tensor=self.invf, pattern='d -> 1 d')
+        sinusoid = position * div_term
+        sin = rearrange(tensor=torch.sin(input=sinusoid), pattern='s d -> 1 s 1 d')
+        cos = rearrange(tensor=torch.cos(input=sinusoid), pattern='s d -> 1 s 1 d')
         x = rearrange(tensor=x, pattern='b s (h d) -> b s h d', h=heads)
         x1, x2 = x[..., ::2], x[..., 1::2]
         x_out = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
@@ -174,7 +174,7 @@ class rotary2(nn.Module):
 
 def visualize_attention_weights(attn_weights):
     import seaborn as sns
-    batch, heads, seq_len, _ = attn_weights.shape
+    batch, heads, ctx, _ = attn_weights.shape
     plt.figure(figsize=(12, 4))
     for h in range(min(4, heads)):
         plt.subplot(1, min(4, heads), h+1)
@@ -183,9 +183,9 @@ def visualize_attention_weights(attn_weights):
     plt.suptitle("Attention Weights")
     plt.show()
 
-def visualize_rotary_angles(rotary, seq_len):
+def visualize_rotary_angles(rotary, ctx):
     freqs = rotary.inv_freq.detach().cpu().numpy()
-    t = np.arange(seq_len)
+    t = np.arange(ctx)
     angles = np.outer(t, freqs)
     plt.figure(figsize=(10, 6))
     for i in range(min(4, angles.shape[1])):
@@ -197,8 +197,8 @@ def visualize_rotary_angles(rotary, seq_len):
     plt.show()
 
 def visualize_rotary_effects(x, rotary):
-    seq_len = x.shape[1]
-    freqs = rotary(seq_len)
+    ctx = x.shape[1]
+    freqs = rotary(ctx)
     x_rot = rotary.apply_rotary(x, freqs)
     idx = 0
     dims_to_plot = [0, 1, 2, 3]
@@ -246,15 +246,15 @@ class BetweennessModule(nn.Module):
         self.dropout = nn.Dropout(0.1)
 
     def compute_betweenness(self, x):
-        batch, seq_len, dim = x.shape
+        batch, ctx, dim = x.shape
         content = self.norm(self.content_proj(self.dropout(x)))
         device = x.device
         window = self.window_size
 
-        betweenness = torch.zeros(batch, seq_len, device=device)
+        betweenness = torch.zeros(batch, ctx, device=device)
 
         for offset in range(1, window + 1):
-            n_indices = seq_len - 2 * offset
+            n_indices = ctx - 2 * offset
             if n_indices <= 0:
                 continue
             i = torch.arange(n_indices, device=device)
@@ -297,6 +297,12 @@ def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start
     shifted_input_ids[:, 0] = decoder_start_token_id
     shifted_input_ids.masked_fill_(shifted_input_ids == -100, pad_token_id)
     return shifted_input_ids
+
+def shift_with_zeros(input_ids: torch.Tensor) -> torch.Tensor:
+    shifted_input_ids = input_ids.new_zeros(input_ids.shape)
+    shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()   
+    return shifted_input_ids
+
 
 class LayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
@@ -360,14 +366,14 @@ def sinusoids(length, channels, max_timescale=10000):
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)      
 
 class Rotary(nn.Module):
-    def __init__(self, dim, max_seq_len=4096, learned_freq=True):
+    def __init__(self, dim, max_ctx=4096, learned_freq=True):
         super().__init__()
         self.dim = dim
         self.inv_freq = nn.Parameter(
             1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim)),
             requires_grad=learned_freq
         )
-        self.bias = nn.Parameter(torch.zeros(max_seq_len, dim // 2))  
+        self.bias = nn.Parameter(torch.zeros(max_ctx, dim // 2))  
 
     def forward(self, positions):
         if isinstance(positions, int):
@@ -612,6 +618,8 @@ class AudioEncoder(nn.Module):
     def forward(self, x, w) -> Tensor:
         if x is not None:
             if w is not None:
+                if self._counter < 1:
+                    plot_waveform_and_spectrogram(w, x)
                 x = self.se(x).permute(0, 2, 1)
                 w = self.we(w).permute(0, 2, 1)
                 x = (x + self.positional_embedding).to(x.device, x.dtype)
@@ -626,9 +634,6 @@ class AudioEncoder(nn.Module):
             x = self.we(w).permute(0, 2, 1)
             assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
             x = (x + self.positional_embedding).to(x.device, x.dtype)
-
-        # _, dec_to_enc = self.bottleneck(enc_x=x)
-        # x = x + dec_to_enc
 
         for block in chain(self.blockA or []):
             x = block(x)
@@ -669,9 +674,6 @@ class TextDecoder(nn.Module):
         freqs = self.rotary(ctx)
         x = self.rotary.apply_rotary(x, freqs)
         x = x.to(xa.dtype)
-
-        # enc_to_dec, _ = self.bottleneck(dec_x=x)
-        # x = x + enc_to_dec
 
         for block in chain(self.blockA or []):
             x = block(x, xa=xa, mask=self.mask, kv_cache=kv_cache)
@@ -732,18 +734,15 @@ class Echo(nn.Module):
                 raise ValueError(
                     f"Labels' sequence length {labels.shape[1]} cannot exceed the maximum allowed length of {self.param.text_ctx} tokens."
                 )
-            if decoder_input_ids is None:
-                decoder_input_ids = shift_tokens_right(
+            if input_ids is None:
+                input_ids = shift_with_zeros(
                     labels, self.param.pad_token_id, self.param.decoder_start_token_id
                 ).to('cuda')
-            input_ids = decoder_input_ids
+            decoder_input_ids = input_ids
             if input_ids.shape[1] > self.param.text_ctx:
                 raise ValueError(
                     f"Input IDs' sequence length {input_ids.shape[1]} cannot exceed the maximum allowed length of {self.param.text_ctx} tokens."
                 )
-
-        if input_ids is not None and input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
 
         if input_features is not None:    
             if waveform is not None:
@@ -862,11 +861,6 @@ class Echo(nn.Module):
         for module_type, count in self.init_counts.items():
             print(f"{module_type}: {count}")
 
-def shift_with_zeros(input_ids: torch.Tensor) -> torch.Tensor:
-    shifted_input_ids = input_ids.new_zeros(input_ids.shape)
-    shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()   
-    return shifted_input_ids
-
 metric = evaluate.load(path="wer")
 
 @dataclass
@@ -889,7 +883,7 @@ class DataCollator:
         if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
             labels = labels[:, 1:]
         batch["labels"] = labels
-        batch["decoder_input_ids"] = shift_with_zeros(labels)
+        batch["input_ids"] = shift_with_zeros(labels)
 
         if self.debug:
             print(f"Batch input_ids shape: {batch['input_ids'].shape}")
@@ -903,8 +897,8 @@ class DataCollator:
                 print(f"Batch input_features: {batch['input_features']}")
                 print("Sum of input_features:", batch["input_features"].sum().item())
                 print("Max of input_features:", batch["input_features"].max().item())
-                print(batch["input_features"][0, :, 0:20])  # First 20 frames
-                print(batch["input_features"][0, :, 700:720])  # Middle frames
+                print(batch["input_features"][0, :, 0:20])
+                print(batch["input_features"][0, :, 700:720])
                 print(f"Batch input_features: {len(batch['input_features'][0])}")
 
             if "waveform" in batch:
@@ -916,12 +910,12 @@ class DataCollator:
     
 def prepare_dataset(batch, input_features=True, waveform=True):
     audio = batch["audio"]
-    fixed_len = 1500 * 160
+    len = 1500 * 160
     wav = torch.tensor(audio["array"]).float()
-    if wav.shape[-1] < fixed_len:
-        wav = F.pad(wav, (0, fixed_len - wav.shape[-1]))
+    if wav.shape[-1] < len:
+        wav = F.pad(wav, (0, len - wav.shape[-1]))
     else:
-        wav = wav[..., :fixed_len]
+        wav = wav[..., :len]
     if waveform:
         batch["waveform"] = wav.unsqueeze(0)
 
@@ -1020,9 +1014,9 @@ if __name__ == "__main__":
         text_head=4,
         decoder_idx=4,
         text_dims=512,
-        decoder_start_token_id = 0,#50258,
+        decoder_start_token_id = 0,
         pad_token_id = 0,
-        eos_token_id = 0,#50257,   
+        eos_token_id = 0,
         act = "gelu",
         )
 
@@ -1038,10 +1032,10 @@ if __name__ == "__main__":
         token=token, local_files_only=True, pad_token_id=0
     )
 
-    tokenizer.pad_token_id = 0  # Was 50257 
-    tokenizer.bos_token_id = 0  # Was 50258
-    tokenizer.eos_token_id = 0  # Was 50257 
-    tokenizer.decoder_start_token_id = 0  # Was 50258
+    tokenizer.pad_token_id = 0
+    tokenizer.bos_token_id = 0
+    tokenizer.eos_token_id = 0
+    tokenizer.decoder_start_token_id = 0
 
     data_collator = DataCollator(extractor=extractor,
         tokenizer=tokenizer, decoder_start_token_id=tokenizer.decoder_start_token_id)
@@ -1087,7 +1081,6 @@ if __name__ == "__main__":
         disable_tqdm=False,
         save_total_limit=1,
         label_names=["labels"],
-
         optim="adafactor",
         lr_scheduler_type="cosine",
         learning_rate=0.0025,
@@ -1108,7 +1101,6 @@ if __name__ == "__main__":
         eval_dataset=test_dataset,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        # optimizers=(optimizer, scheduler),
     )
 
     model.init_weights()
@@ -1129,3 +1121,14 @@ if __name__ == "__main__":
 
     trainer.train()
     
+# from tensorboard import program
+# log_dir = "./output/logs" 
+# tb = program.TensorBoard()
+# tb.configure(argv=[None, '--logdir', log_dir])
+# url = tb.launch()
+# print(f"TensorBoard started at {url}")
+
+
+
+
+
