@@ -11,7 +11,7 @@ This model uses 0 for padding masking and silence and no special tokens, as such
 - The 0.001 factor means silence is "whispered" to the model rather than "shouted". Can be set to 0.0 if you are worried about leakage.
 - This method allows "0's" to have different weights if one were so inclined.
 - The model can learn timing patterns where pauses are meaningful.
-- As the model learns to ignore silence it learns the natural boundries of speech making tokens such as BOS EOS SOT unnecessary.
+- By learning to ignore silence the model learns the natural boundries of speech making tokens such as BOS EOS SOT unnecessary.
 
 
 
