@@ -13,6 +13,8 @@ This model uses 0 for padding masking and silence and no special tokens, as such
 - The model can learn timing patterns where pauses are meaningful.
 - As the model learns to ignore silence it learns to understand the natural boundries of speech and silence making tokens such as BOS EOS SOT unnecessary.
 
+
+
 ```python
 
 
@@ -44,6 +46,73 @@ def _attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Op
         w = F.softmax(qk, dim=-1).to(q.dtype)
         out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
         return out, qk.detach()
+
+
+class AudioEncoder(nn.Module):
+    def __init__(self, mels: int, ctx: int, dims: int, head: int, layer, act, cross_attention = False):
+        super().__init__()
+
+        self.debug = False
+        self._counter = 0
+        self.dropout = 0.1
+
+        self.bottleneck = EncoderBottleneck(dims, latent_dim=128)  
+        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(),
+                   "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
+        self.act = act_map.get(act, nn.GELU())
+
+        self.blend_sw = nn.Parameter(torch.tensor(0.5, device=tox["device"], dtype=tox["dtype"]), requires_grad=False)
+        self.blend = torch.sigmoid(self.blend_sw)
+        self.ln_enc = RMSNorm(normalized_shape=dims, **tox)
+        self.register_buffer("positional_embedding", sinusoids(ctx, dims))
+
+        self.se = nn.Sequential(
+            Conv1d(mels, dims, kernel_size=3, padding=1), self.act,
+            Conv1d(dims, dims, kernel_size=3, stride=1, padding=2, dilation=2),
+            Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims),
+            Conv1d(dims, dims, kernel_size=1), SEBlock(dims, reduction=16), self.act,
+            nn.Dropout(p=self.dropout), Conv1d(dims, dims, kernel_size=3, stride=1, padding=1)
+        )
+        self.we = nn.Sequential(
+            nn.Conv1d(1, dims, kernel_size=11, stride=5, padding=5),
+            nn.GELU(),
+            nn.Conv1d(dims, dims, kernel_size=5, stride=2, padding=2),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(ctx),
+        )
+
+        self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, cross_attention=cross_attention)
+                    for _ in range(layer)]) if layer > 0 else None)
+
+    def forward(self, x, w) -> Tensor:
+        if x is not None:
+            if w is not None:
+                if self._counter < 1:
+                    plot_waveform_and_spectrogram(w, x)
+                x = self.se(x).permute(0, 2, 1)
+                w = self.we(w).permute(0, 2, 1)
+                x = (x + self.positional_embedding).to(x.device, x.dtype)
+                x = self.blend * x + (1 - self.blend) * w
+            else:
+                x = self.se(x)
+                x = x.permute(0, 2, 1)
+                assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
+                x = (x + self.positional_embedding).to(x.device, x.dtype)
+        else:
+            assert w is not None, "You have to provide either x or w"
+            x = self.we(w).permute(0, 2, 1)
+            assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
+            x = (x + self.positional_embedding).to(x.device, x.dtype)
+
+        for block in chain(self.blockA or []):
+            x = block(x)
+        self._counter += 1
+        if self.debug:
+            print(f"Encoder output shape: {x.shape}, x shape: {x.shape}, w shape: {w.shape}")
+       
+        return self.ln_enc(x)
+
+
 ```
 3 tests: spectrogram, waveform, spectrogram+waveform.
 ### IN PROGRESS
