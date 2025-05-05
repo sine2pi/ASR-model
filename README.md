@@ -5,15 +5,45 @@ This model's learnable blend (with a sigmoid-mixed parameter) between waveform a
 Blending waveform and spectrogram features has been explored in some research, but is not standard in ASR pipelines.
 This learnable blend is a modern, under-explored approach addressing the waveform spectrogram debate. Initial findings of the pilot run suggest that the blending of the two significantly decreases WER compared to standalone waveform and spectrogram without significantly increasing overhead. Further testing is currently underway.
 
-This model uses 0 for padding masking and silence and no special tokens, as such the attention mechanism uses multiplicative masking instead of additive. The 0.001 is so that the model can still learn to identify silence. This gives silence tokens a tiny but meaningful attention weight rather than completely masking them out.  This is conceptually sound because:
+This model uses 0 for padding masking and silence and no special tokens, as such the attention mechanism uses multiplicative masking instead of additive. 
+
+## Understanding Zero-Value Handling in Speech Attention
+
+### Log-Mel Spectrograms and Zeros
+
+log-mel spectrograms, zeros (or very small values) generally represent:
+- Silence regions
+- Very low amplitude sounds
+- Background noise below threshold
+
+### Attention Implementation
+
+token_ids = k[:, :, :, 0].to(q.device, q.dtype)
+scaled_zero = torch.ones_like(token_ids).to(q.device, q.dtype)
+scaled_zero[token_ids == 0] = 0.000001
+scaling_factors = scaled_mask.unsqueeze(0) * scaled_zero.unsqueeze(-2).expand(qk.shape)
+
+This creates several key benefits:
+
+1. **Soft Signal Processing**: Unlike hard masking (`-inf`), your approach creates a "soft focus" mechanism that doesn't completely eliminate attention to silence
+   
+2. **Temporal Pattern Learning**: Speech contains meaningful pauses - by keeping minimal attention on zeros, your model can learn timing and rhythm patterns
+
+3. **Information Bridge**: Silence between words can actually carry information (prosody, emotion, accent) - your approach preserves this
+
+4. **Audio-Text Alignment**: By using the same mechanism for text padding tokens and audio silence, you create a unified representation across modalities
+
+5. **Gradient Flow**: Soft masking allows some gradient to flow through all positions, potentially improving stability during training
+
+This approach might be particularly valuable for speech recognition where silence is semantically meaningful, not just "missing data." This diverges from standard NLP approaches where padding tokens contain truly no information.
+
+This elegant design choice creates a more natural handling of the audio-text connection.
 
 - Silence/pauses in speech carry rhythmic and semantic information.
 - The zero factor means silence is "whispered" to the model rather than "shouted". Can be set to 0.0 if you are worried about leakage.
 - This method allows "0's" to have different weights if one were so inclined.
 - The model can learn timing patterns where pauses are meaningful.
 - By learning to ignore silence the model learns the natural boundries of speech making tokens such as BOS EOS SOT unnecessary.
-
-
 
 ```python
 import warnings
