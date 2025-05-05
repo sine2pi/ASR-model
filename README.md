@@ -8,7 +8,7 @@ This learnable blend is a modern, under-explored approach addressing the wavefor
 This model uses 0 for padding masking and silence and no special tokens, as such the attention mechanism uses multiplicative masking instead of additive. The 0.001 is so that the model can still learn to identify silence. This gives silence tokens a tiny but meaningful attention weight rather than completely masking them out.  This is conceptually sound because:
 
 - Silence/pauses in speech carry rhythmic and semantic information.
-- The 0.001 factor means silence is "whispered" to the model rather than "shouted". Can be set to 0.0 if you are worried about leakage.
+- The zero factor means silence is "whispered" to the model rather than "shouted". Can be set to 0.0 if you are worried about leakage.
 - This method allows "0's" to have different weights if one were so inclined.
 - The model can learn timing patterns where pauses are meaningful.
 - By learning to ignore silence the model learns the natural boundries of speech making tokens such as BOS EOS SOT unnecessary.
@@ -18,7 +18,7 @@ This model uses 0 for padding masking and silence and no special tokens, as such
 ```python
 
 
-def _attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _attention(self, q: torch.Tensor, k: torch.Tensor, v = None, mask = None):
         batch, ctx, dims = q.shape
         scale = (dims // self.head) ** -0.25
         
@@ -31,19 +31,15 @@ def _attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Op
         k = self.rotary.apply_rotary(k, freq)
 
         qk = (q * scale) @ (k * scale).transpose(-1, -2)
-
         mask = torch.triu(torch.ones(ctx, ctx), diagonal=1)
-        scaling_factors_causal = torch.where(mask == 1, torch.tensor(0.0), torch.tensor(1.0))
-
-        token_ids = k[:, :, :, 0]
-        scaling_factors_silence = torch.ones_like(token_ids).to(q.device, q.dtype)
-        scaling_factors_silence[token_ids == 0] = 0.001
-        scaling_factors_silence = scaling_factors_silence.unsqueeze(-2).expand(qk.shape).to(q.device, q.dtype)
-
-        combined_scaling_factors = scaling_factors_causal.unsqueeze(0).to(q.device, q.dtype)  * scaling_factors_silence.to(q.device, q.dtype)
-        qk *= combined_scaling_factors
+        scaled_mask = torch.where(mask == 1, torch.tensor(0.0), torch.tensor(1.0)).to(q.device, q.dtype)
+        token_ids = k[:, :, :, 0].to(q.device, q.dtype)
+        scaled_zero = torch.ones_like(token_ids).to(q.device, q.dtype)
+        scaled_zero[token_ids == 0] = 0.000001 # zero factor
+        scaling_factors = scaled_mask.unsqueeze(0) * scaled_zero.unsqueeze(-2).expand(qk.shape)
+        qk *= scaling_factors
         qk = qk.float()
-        w = F.softmax(qk, dim=-1).to(q.dtype)
+        w = F.softmax(qk, dim=-1).to(q.device, q.dtype)
         out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
         return out, qk.detach()
 
