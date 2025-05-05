@@ -117,6 +117,7 @@ Full model and loop(s).
 ```python
 
 
+
 import os
 import warnings
 import logging
@@ -124,16 +125,15 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch import Tensor
-from einops import rearrange
 import numpy as np
-from typing import Optional, Dict, Tuple, Any, Union, List
+from typing import Optional, Dict, Union, List
+from functools import partial
 import gzip
-import math
 import base64
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, precision_score, f1_score, recall_score
 from datetime import datetime
-from datasets import load_dataset, Audio, DatasetDict
+from datasets import load_dataset, Audio
 from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperFeatureExtractor, WhisperTokenizer
 import evaluate
 import transformers
@@ -152,6 +152,14 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 tox = {"device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"), "dtype": torch.float32}
 
+extractor = None
+tokenizer = None
+
+def set_extractor_and_tokenizer(extractor_, tokenizer_):
+    global extractor, tokenizer
+    extractor = extractor_
+    tokenizer = tokenizer_
+
 @dataclass
 class Dimensions:
     vocab: int
@@ -167,29 +175,61 @@ class Dimensions:
     pad_token_id: int
     eos_token_id: int
     decoder_start_token_id: int
-    act: str
+    act: str 
 
-def plot_waveform_and_spectrogram(waveform, spectrogram, sample_idx=0, sr=16000, title="Waveform and Spectrogram"):
-    wf = waveform[sample_idx].detach().cpu().numpy()
-    if wf.ndim > 1:
-        wf = wf.squeeze()
-    t = np.arange(len(wf)) / sr
-    spec = spectrogram[sample_idx].detach().cpu().numpy()
-    if spec.shape[0] < spec.shape[1]:
-        spec = spec.T
 
-    fig, axs = plt.subplots(2, 1, figsize=(14, 6), sharex=False)
-    axs[0].plot(t, wf, color="tab:blue")
-    axs[0].set_title("Waveform")
-    axs[0].set_xlabel("Time (s)")
-    axs[0].set_ylabel("Amplitude")
+def plot_waveform_and_spectrogram(x=None, w=None, sample_idx=0, sr=16000, title="Waveform and Spectrogram"):
+    """Plot waveform and/or spectrogram based on available inputs."""
+    if x is not None and w is not None:
+        x_np = x[sample_idx].detach().cpu().numpy()
+        if x_np.shape[0] < x_np.shape[1]:
+            x_np = x_np.T
+    
+        w_np = w[sample_idx].detach().cpu().numpy()
+        if w_np.ndim > 1:
+            w_np = w_np.squeeze()
+        t = np.arange(len(w_np)) / sr
 
-    axs[1].imshow(spec.T, aspect="auto", origin="lower", cmap="magma")
-    axs[1].set_title("Spectrogram")
-    axs[1].set_xlabel("Frame")
-    axs[1].set_ylabel("Mel Bin")
-    plt.tight_layout()
-    plt.show()
+        fig, axs = plt.subplots(2, 1, figsize=(14, 6), sharex=False)
+        axs[0].plot(t, w_np, color="tab:blue")
+        axs[0].set_title("Waveform")
+        axs[0].set_xlabel("Time (s)")
+        axs[0].set_ylabel("Amplitude")
+
+        axs[1].imshow(x_np.T, aspect="auto", origin="lower", cmap="magma")
+        axs[1].set_title("Spectrogram")
+        axs[1].set_xlabel("Frame")
+        axs[1].set_ylabel("Mel Bin")
+        plt.tight_layout()
+        plt.show()
+
+    elif x is not None:
+        x_np = x[sample_idx].detach().cpu().numpy()
+        if x_np.shape[0] < x_np.shape[1]:
+            x_np = x_np.T
+        fig, ax = plt.subplots(1, 1, figsize=(14, 6))
+        ax.imshow(x_np.T, aspect="auto", origin="lower", cmap="magma")
+        ax.set_title("Spectrogram")
+        ax.set_xlabel("Frame")
+        ax.set_ylabel("Mel Bin")
+        plt.tight_layout()
+        plt.show()     
+
+    elif w is not None:
+        w_np = w[sample_idx].detach().cpu().numpy()
+        if w_np.ndim > 1:
+            w_np = w_np.squeeze()
+        t = np.arange(len(w_np)) / sr
+        
+        fig, ax = plt.subplots(1, 1, figsize=(14, 6))
+        ax.plot(t, w_np, color="tab:blue")
+        ax.set_title("Waveform")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Amplitude")
+        plt.tight_layout()
+        plt.show()
+    else:
+        raise ValueError("No data to plot. Please provide at least one input tensor.")
 
 def shift_with_zeros(input_ids: torch.Tensor) -> torch.Tensor:
     shifted_input_ids = input_ids.new_zeros(input_ids.shape)
@@ -279,16 +319,9 @@ class Multihead(nn.Module):
         self.key = Linear(dims, dims, bias=False)
         self.value = Linear(dims, dims)
         self.out = Linear(dims, dims)
-
         self.rotary = Rotary(dim=head_dim, learned_freq=True)
 
-    def forward(
-        self,
-        x: Tensor,
-        xa: Optional[Tensor] = None,
-        mask: Optional[Tensor] = None,
-        kv_cache: Optional[dict] = None,
-    ):
+    def forward(self, x: Tensor, xa: Optional[Tensor] = None,  mask: Optional[Tensor] = None, kv_cache: Optional[dict] = None):
         q = self.query(x).to(x.device, x.dtype)
 
         if kv_cache is None or xa is None or self.key not in kv_cache:
@@ -301,7 +334,7 @@ class Multihead(nn.Module):
         wv, qk = self._attention(q, k, v, mask)
         return self.out(wv), qk
     
-    def _attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _attention(self, q: torch.Tensor, k: torch.Tensor, v = None, mask = None):
         batch, ctx, dims = q.shape
         scale = (dims // self.head) ** -0.25
         
@@ -316,17 +349,15 @@ class Multihead(nn.Module):
         qk = (q * scale) @ (k * scale).transpose(-1, -2)
 
         mask = torch.triu(torch.ones(ctx, ctx), diagonal=1)
-        scaling_factors_causal = torch.where(mask == 1, torch.tensor(0.0), torch.tensor(1.0))
+        scaled_mask = torch.where(mask == 1, torch.tensor(0.0), torch.tensor(1.0)).to(q.device, q.dtype)
 
-        token_ids = k[:, :, :, 0]
-        scaling_factors_silence = torch.ones_like(token_ids).to(q.device, q.dtype)
-        scaling_factors_silence[token_ids == 0] = 0.001
-        scaling_factors_silence = scaling_factors_silence.unsqueeze(-2).expand(qk.shape).to(q.device, q.dtype)
-
-        combined_scaling_factors = scaling_factors_causal.unsqueeze(0).to(q.device, q.dtype)  * scaling_factors_silence.to(q.device, q.dtype)
-        qk *= combined_scaling_factors
+        token_ids = k[:, :, :, 0].to(q.device, q.dtype)
+        scaled_zero = torch.ones_like(token_ids).to(q.device, q.dtype)
+        scaled_zero[token_ids == 0] = 0.000001
+        scaling_factors = scaled_mask.unsqueeze(0) * scaled_zero.unsqueeze(-2).expand(qk.shape)
+        qk *= scaling_factors
         qk = qk.float()
-        w = F.softmax(qk, dim=-1).to(q.dtype)
+        w = F.softmax(qk, dim=-1).to(q.device, q.dtype)
         out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
         return out, qk.detach()
 
@@ -387,7 +418,7 @@ class AudioEncoder(nn.Module):
         self.debug = False
         self._counter = 0
         self.dropout = 0.1
- 
+
         act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(),
                    "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
         self.act = act_map.get(act, nn.GELU())
@@ -414,12 +445,13 @@ class AudioEncoder(nn.Module):
 
         self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, cross_attention=cross_attention)
                     for _ in range(layer)]) if layer > 0 else None)
-
+        
     def forward(self, x, w) -> Tensor:
+        if self._counter < 1:
+            plot_waveform_and_spectrogram(x=x, w=w)
+            
         if x is not None:
             if w is not None:
-                if self._counter < 1:
-                    plot_waveform_and_spectrogram(w, x)
                 x = self.se(x).permute(0, 2, 1)
                 w = self.we(w).permute(0, 2, 1)
                 x = (x + self.positional_embedding).to(x.device, x.dtype)
@@ -458,6 +490,7 @@ class TextDecoder(nn.Module):
         self.rotary = Rotary(dim=dims, learned_freq=True)
         
         self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, cross_attention=cross_attention) for _ in range(layer)]) if layer > 0 else None)
+
         mask = torch.triu(torch.ones(ctx, ctx), diagonal=1)
         self.register_buffer("mask", mask, persistent=False)
 
@@ -568,37 +601,98 @@ class Echo(nn.Module):
     @property
     def device(self):
         return next(self.parameters()).device
+       
+    def _init_weights(self, module):
+        std = 0.02
+        self.init_counts = {"Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0,
+            "Conv2d": 0, "SEBlock": 0, "TextDecoder": 0, "AudioEncoder": 0, "Residual": 0,
+                            "Multihead": 0, "MultiheadA": 0, "MultiheadB": 0, "MultiheadC": 0}
 
+        for name, module in self.named_modules():
+            if isinstance(module, Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                self.init_counts["Linear"] += 1
+            elif isinstance(module, Conv1d):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                self.init_counts["Conv1d"] += 1
+            elif isinstance(module, LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+                self.init_counts["LayerNorm"] += 1
+            elif isinstance(module, RMSNorm):
+                nn.init.ones_(module.weight)
+                self.init_counts["RMSNorm"] += 1
+            elif isinstance(module, Multihead):
+                self.init_counts["Multihead"] += 1
+            elif isinstance(module, Conv2d):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                self.init_counts["Conv2d"] += 1
+            elif isinstance(module, SEBlock):
+                nn.init.ones_(module.fc[0].weight)
+                nn.init.zeros_(module.fc[0].bias)
+                nn.init.ones_(module.fc[2].weight)
+                nn.init.zeros_(module.fc[2].bias)
+                self.init_counts["SEBlock"] += 1
+            elif isinstance(module, TextDecoder):
+                self.init_counts["TextDecoder"] += 1
+            elif isinstance(module, AudioEncoder):
+                nn.init.xavier_uniform_(module.se[0].weight)
+                nn.init.zeros_(module.se[0].bias)
+                nn.init.xavier_uniform_(module.se[2].weight)
+                nn.init.zeros_(module.se[2].bias)
+                nn.init.xavier_uniform_(module.se[4].weight)
+                nn.init.zeros_(module.se[4].bias)
+                self.init_counts["AudioEncoder"] += 1
+            elif isinstance(module, Residual):
+                self.init_counts["Residual"] += 1    
+                                                 
+    def init_weights(self):
+        print("Initializing all weights")
+        self.apply(self._init_weights)
+        print("Initialization summary:")
+        for module_type, count in self.init_counts.items():
+            print(f"{module_type}: {count}")
 
 metric = evaluate.load(path="wer")
 
 @dataclass
 class DataCollator:
-    extractor: Any
-    tokenizer: Any
-    decoder_start_token_id: Any
 
     def __call__(self, features: List[Dict[str, Union[List[int], Tensor]]]) -> Dict[str, Tensor]:
+        global extractor, tokenizer
+        decoder_start_token_id = tokenizer.bos_token_id
+        if decoder_start_token_id is None:
+            raise ValueError("The tokenizer does not have a bos_token_id. Please set it manually.")        
         batch = {}
-        self.debug = False
 
         if "input_features" in features[0]:
             batch["input_features"] = torch.stack([f["input_features"] for f in features])
         if "waveform" in features[0]:
             batch["waveform"] = torch.stack([f["waveform"] for f in features])
+
         label_features = [{"input_ids": f["labels"]} for f in features]
-        labels_batch = self.tokenizer.pad(label_features, return_tensors="pt")
+        labels_batch = tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), 0)
-        if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
+        if (labels[:, 0] == decoder_start_token_id).all().cpu().item():
             labels = labels[:, 1:]
         batch["labels"] = labels
         batch["input_ids"] = shift_with_zeros(labels)
+
         return batch
     
 def prepare_dataset(batch, input_features=True, waveform=True):
+    global extractor, tokenizer
+
     audio = batch["audio"]
     len = 1500 * 160
     wav = torch.tensor(audio["array"]).float()
+    
     if wav.shape[-1] < len:
         wav = F.pad(wav, (0, len - wav.shape[-1]))
     else:
@@ -619,6 +713,8 @@ def prepare_dataset(batch, input_features=True, waveform=True):
     return batch
 
 def compute_metrics(eval_pred, compute_result: bool = True):
+    global extractor, tokenizer
+    
     pred_logits = eval_pred.predictions
     label_ids = eval_pred.label_ids
 
@@ -657,24 +753,24 @@ def compute_metrics(eval_pred, compute_result: bool = True):
 
     pred_flat = list(chain.from_iterable(pred_ids))
     labels_flat = list(chain.from_iterable(label_ids))
-    mask = [l != tokenizer.pad_token_id for l in labels_flat]
+    mask = [i != tokenizer.pad_token_id for i in labels_flat]
 
     acc = accuracy_score(
-        [l for l, m in zip(labels_flat, mask) if m],
+        [i for i, m in zip(labels_flat, mask) if m],
         [p for p, m in zip(pred_flat, mask) if m]
     )
     pre = precision_score(
-        [l for l, m in zip(labels_flat, mask) if m],
+        [i for i, m in zip(labels_flat, mask) if m],
         [p for p, m in zip(pred_flat, mask) if m],
         average='weighted', zero_division=0
     )
     rec = recall_score(
-        [l for l, m in zip(labels_flat, mask) if m],
+        [i for i, m in zip(labels_flat, mask) if m],
         [p for p, m in zip(pred_flat, mask) if m],
         average='weighted', zero_division=0
     )
     f1 = f1_score(
-        [l for l, m in zip(labels_flat, mask) if m],
+        [i for i, m in zip(labels_flat, mask) if m],
         [p for p, m in zip(pred_flat, mask) if m],
         average='weighted', zero_division=0
     )
@@ -688,65 +784,68 @@ def compute_metrics(eval_pred, compute_result: bool = True):
         "f1": f1,
     }
 
-if __name__ == "__main__":
+def create_model(params):
+    model = Echo(params).to('cuda')
+    model.init_weights()
+    print("Trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
+    print("Total parameters:", sum(p.numel() for p in model.parameters()))
+    return model
 
-    param = Dimensions(
-        mels=128,
-        audio_ctx=1500,
-        audio_head=4,
-        encoder_idx=4,
-        audio_dims=512,
-        vocab=51865,
-        text_ctx=512,
-        text_head=4,
-        decoder_idx=4,
-        text_dims=512,
-        decoder_start_token_id = 0,
-        pad_token_id = 0,
-        eos_token_id = 0,
-        act = "gelu",
-        )
-
-    model = Echo(param).to('cuda')
-
-    token=""
+def setup_tokenizers(token):
+    global extractor, tokenizer
+    
     extractor = WhisperFeatureExtractor.from_pretrained(
-        "openai/whisper-small", token=token, feature_size=128, sampling_rate=16000, do_normalize=True, return_tensors="pt", chunk_length=15, padding_value=0.0)
+        "openai/whisper-small", 
+        token=token, 
+        feature_size=128,
+        sampling_rate=16000, 
+        do_normalize=True, 
+        return_tensors="pt", 
+        chunk_length=15, 
+        padding_value=0.0
+    )
     
     tokenizer = WhisperTokenizer.from_pretrained(
         "./tokenizer", 
-        pad_token="0", bos_token="0", eos_token="0", unk_token="0",
-        token=token, local_files_only=True, pad_token_id=0
+        pad_token="0", 
+        bos_token="0", 
+        eos_token="0", 
+        unk_token="0",
+        token=token, 
+        local_files_only=True, 
+        pad_token_id=0
     )
-
+    
     tokenizer.pad_token_id = 0
     tokenizer.bos_token_id = 0
     tokenizer.eos_token_id = 0
     tokenizer.decoder_start_token_id = 0
 
-    data_collator = DataCollator(extractor=extractor,
-        tokenizer=tokenizer, decoder_start_token_id=tokenizer.decoder_start_token_id)
-
-    log_dir = os.path.join('./output/logs', datetime.now().strftime(format='%m-%d_%H'))
-    os.makedirs(name=log_dir, exist_ok=True)
-
-    dataset = DatasetDict()
+def prepare_datasets(token):
     dataset = load_dataset("google/fleurs", "en_us", token=token, trust_remote_code=True, streaming=False)
-
     dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000))
-    dataset = dataset.filter(lambda x: len(x["transcription"]) < 512)
-    dataset = dataset.filter(lambda x: len(x["transcription"]) > 0)
-    dataset = dataset.filter(lambda x: len(x["audio"]["array"]) > 0)
-    dataset = dataset.filter(lambda x: len(x["audio"]["array"]) < 1500 * 160)
-    print("Dataset size:", dataset["train"].num_rows, dataset["test"].num_rows)
-
-    dataset = dataset.map(function=prepare_dataset,
-        remove_columns=list(next(iter(dataset.values())).features)).with_format(type="torch")
     
-    train_dataset = dataset["train"]
-    test_dataset = dataset["test"].select(range(100))
+    def filter_func(x):
+        return (0 < len(x["transcription"]) < 512 and
+                len(x["audio"]["array"]) > 0 and
+                len(x["audio"]["array"]) < 1500 * 160)
+    
+    dataset = dataset.filter(filter_func).shuffle(seed=42)
+    print("Dataset size:", dataset["train"].num_rows, dataset["test"].num_rows)
+    
+    prepare_fn = partial(prepare_dataset, input_features=True, waveform=True)
+    dataset = dataset.map(
+        function=prepare_fn,
+        remove_columns=list(next(iter(dataset.values())).features)
+    ).with_format(type="torch")
+    
+    train_dataset = dataset["train"].shuffle(seed=42).flatten_indices()
+    test_dataset = dataset["test"].shuffle(seed=42).take(200).flatten_indices()
+    
+    return train_dataset, test_dataset
 
-    training_args = Seq2SeqTrainingArguments(
+def get_training_args(log_dir):
+    return Seq2SeqTrainingArguments(
         output_dir=log_dir,
         per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
@@ -758,7 +857,7 @@ if __name__ == "__main__":
         save_strategy="steps",
         max_steps=100000,
         save_steps=10000,
-        eval_steps=1000,
+        eval_steps=5000,
         warmup_steps=1000,
         num_train_epochs=1,
         logging_steps=1,
@@ -781,19 +880,47 @@ if __name__ == "__main__":
         remove_unused_columns=False,
     )
 
+if __name__ == "__main__":
+    
+    param = Dimensions(
+        mels=128,
+        audio_ctx=1500,
+        audio_head=4,
+        encoder_idx=4,
+        audio_dims=512,
+        vocab=51865,
+        text_ctx=512,
+        text_head=4,
+        decoder_idx=4,
+        text_dims=512,
+        decoder_start_token_id=0,
+        pad_token_id=0,
+        eos_token_id=0,
+        act="gelu",
+    )
+    
+    token = ""
+    log_dir = os.path.join('./output/logs', datetime.now().strftime(format='%m-%d_%H'))
+    os.makedirs(name=log_dir, exist_ok=True)
+    
+    setup_tokenizers(token)
+    model = create_model(param)
+    train_dataset, test_dataset = prepare_datasets(token)
+    training_args = get_training_args(log_dir)
+    
     trainer = Seq2SeqTrainer(
         args=training_args,
         model=model,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
-        data_collator=data_collator,
+        data_collator=DataCollator(),
         compute_metrics=compute_metrics,
     )
-
-    print("Trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
-    print("Total parameters:", sum(p.numel() for p in model.parameters()))
-
+    
     trainer.train()
+
+
+
     
 
 
