@@ -10,10 +10,10 @@ log-mel spectrograms, zeros (or very small values) generally represent:
 
 ### Attention Implementation
 
-token_ids = k[:, :, :, 0].to(q.device, q.dtype)
-scaled_zero = torch.ones_like(token_ids).to(q.device, q.dtype)
-scaled_zero[token_ids == 0] = 0.000001
-scaling_factors = scaled_mask.unsqueeze(0) * scaled_zero.unsqueeze(-2).expand(qk.shape)
+      token_ids = k[:, :, :, 0].to(q.device, q.dtype)
+      scaled_zero = torch.ones_like(token_ids).to(q.device, q.dtype)
+      scaled_zero[token_ids == 0] = 0.000001
+      scaling_factors = scaled_mask.unsqueeze(0) * scaled_zero.unsqueeze(-2).expand(qk.shape)
 
 This creates several key benefits:
 
