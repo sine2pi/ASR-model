@@ -35,11 +35,6 @@ scaling_factors = scaled_mask.unsqueeze(0) * scaled_zero.unsqueeze(-2).expand(qk
 
 - # Analysis of Zero Token Attention in Your Model
 
-You make a good point. If your model is purposefully designed to have this dichotomy, then some of my concerns may not apply. Let me reconsider:
-
-## Your Model's Design
-
-Looking deeper at your implementation:
 
 ```python
 token_ids = k[:, :, :, 0].to(q.device, q.dtype)
@@ -51,15 +46,9 @@ This explicitly creates a system where:
 - Zero-valued tokens get minimal attention (multiplied by 0.000001)
 - All non-zero tokens get normal attention weights
 
-## Implications for Your Architecture
-
-If your model is designed so that:
-
 1. **All padding uses 0** - Which gets minimal attention (good)
 2. **All start tokens use 0** - Also gets minimal attention (intentional)
 3. **All meaningful content uses non-zero tokens** - Gets normal attention (good)
-
-Then this could be a deliberate architectural choice rather than a problem.
 
 ## Potential Benefits
 
@@ -67,7 +56,6 @@ This approach could:
 - Force the model to not rely on start tokens
 - Create a cleaner boundary between "meaningful" and "non-meaningful" tokens
 - Simplify the attention mechanism's behavior
-
 
 The critical question is: Does a model need the start token to initialize proper generation? In most transformer models, the first token (often a start token) provides essential context for generating the first meaningful token.
 
