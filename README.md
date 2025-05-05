@@ -31,15 +31,6 @@ scaling_factors = scaled_mask.unsqueeze(0) * scaled_zero.unsqueeze(-2).expand(qk
 - Create a cleaner boundary between "meaningful" and "non-meaningful" tokens
 - Simplify the attention mechanism's behavior
 
-- # Analysis of Zero Token Attention in Your Model
-
-
-```python
-token_ids = k[:, :, :, 0].to(q.device, q.dtype)
-scaled_zero = torch.ones_like(token_ids).to(q.device, q.dtype)
-scaled_zero[token_ids == 0] = 0.000001
-```
-
 This explicitly creates a system where:
 - Zero-valued tokens get minimal attention (multiplied by 0.000001)
 - All non-zero tokens get normal attention weights
