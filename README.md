@@ -7,6 +7,7 @@ In log-mel spectrograms, zero or near-zero values represent critical information
 - Low-amplitude acoustic events
 - Sub-threshold background environments
 
+
 ### Multiplicative Soft Masking: Technical Implementation
 
 ```python
@@ -27,6 +28,10 @@ scaling_factors = scaled_mask.unsqueeze(0) * scaled_zero.unsqueeze(-2).expand(qk
 4. **Training Stability**: This multiplicative masking approach maintains gradient flow through all positions, potentially improving convergence stability.
 
 5. **Natural Boundary Learning**: By processing silence regions with reduced but non-zero attention, the model learns natural speech boundaries without requiring explicit BOS/EOS tokens.
+
+- Force the model to not rely on start tokens
+- Create a cleaner boundary between "meaningful" and "non-meaningful" tokens
+- Simplify the attention mechanism's behavior
 
 ## Adaptive Audio Feature Fusion
 
