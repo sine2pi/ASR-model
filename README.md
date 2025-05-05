@@ -171,168 +171,7 @@ class Dimensions:
     pad_token_id: int
     eos_token_id: int
     decoder_start_token_id: int
-    act: str 
-
-class rotary2(nn.Module):
-    def __init__(self, dims, heads, freq=10000, max_ctx=4096, cache=False, tlearnable=False, rlearnable=False, mlearnable=False, flearnable=False, rscale=None, tscale=None, device=None, ):
-        super().__init__()
-        self.dims = dims
-        self.heads = heads
-        self.freq = freq
-        self.device = device if device is not None else torch.device('cpu')
-        self.dtype = torch.float32
-        self.head_dim = self.dims // self.heads
-        self.rot = self.head_dim // 2
-
-        def custom_fn(maxctx, dims):
-            return torch.linspace(1., maxctx, dims // 2) ** 2
-        def y(x):
-            return x is not None
-     
-        self.thetas = nn.Parameter(torch.zeros(self.rot, device=self.device))
-        self.pairs = nn.Parameter(torch.rand(self.rot, 2, device=self.device) * self.head_dim)
-        if tscale is not None:
-            self.tscale = nn.Parameter(tscale.to(self.device), requires_grad=tlearnable)
-        else:
-            self.tscale = nn.Parameter(torch.ones(1, device=self.device), requires_grad=tlearnable)
-        if rscale is not None:
-            self.rscale = nn.Parameter(rscale.to(self.device), requires_grad=rlearnable)
-        else:
-            self.rscale = nn.Parameter(torch.ones(1, device=self.device), requires_grad=rlearnable)
-        self.matrix = nn.Parameter(torch.eye(self.head_dim, device=self.device), requires_grad=mlearnable)
-        findices = torch.arange(0, self.head_dim, 2, device=self.device).float()
-        fdata = 1.0 / (self.freq ** (findices / self.head_dim))
-        self.invf = nn.Parameter(data=fdata, requires_grad=flearnable)
-
-        self.register_buffer('cached_freqs', torch.zeros(cache, self.dim), persistent = False)
-        self.max_ctx = 0
-
-        self.reset_parameters()
-        
-    def reset_parameters(self):
-        nn.init.orthogonal_(tensor=self.matrix)
-        nn.init.zeros_(tensor=self.thetas)
-
-    def q_rotation(self, x, theta, u, v):
-        x = x.to(self.device, self.dtype)
-        theta = theta.to(self.device, self.dtype) if not isinstance(theta, (int, float)) else theta
-        u = u.to(self.device)
-        v = v.to(self.device)
-        u = u / torch.norm(u)
-        v = v / torch.norm(v)
-        half_theta = theta / 2
-        cos_ht = torch.cos(half_theta)
-        sin_ht = torch.sin(half_theta)
-        q = torch.cat([cos_ht.unsqueeze(0), sin_ht * u])
-        q_ = torch.cat([cos_ht.unsqueeze(0), -sin_ht * u])
-        x_shape = x.shape
-        x = x.view(-1, 3)
-        uv_cross = torch.cross(u.unsqueeze(0), x)
-        uuv_cross = torch.cross(u.unsqueeze(0), uv_cross)
-        x_rot = x + 2 * (q[0] * uv_cross + uuv_cross)
-
-        x_rot = x_rot.view(*x_shape)
-        return x_rot
-
-    def rotation_matrix(self, dims, i, j, theta):
-        G = torch.eye(dims, device=theta.device)
-        c, s = torch.cos(theta), torch.sin(theta)
-        G[i, i], G[j, j] = c, c
-        G[i, j], G[j, i] = -s, s
-        if dims == 3:
-            u = torch.eye(dims, device=theta.device)[i]
-            v = torch.eye(dims, device=theta.device)[j]
-            if theta < 0: 
-                Q = self.q_rotation(torch.eye(dims, device=theta.device), theta=abs(theta), u=u, v=v)
-            else:
-                Q = self.q_rotation(torch.eye(dims, device=theta.device), theta=theta, u=u, v=v)
-            G = (G + Q) / 2
-        return G
-
-    def rotate(self, x):
-        rotate = int(torch.round(self.rscale * self.rot))
-        for k in range(rotate):
-            i, j = self.r_pairs[k].long()
-            theta = self.thetas[k] * self.tscale
-            G = self.rotation_matrix(dims=self.head_dim, i=i.item(), j=j.item(), theta=theta)
-            x = x @ G
-        return x
-
-    def forward(self, x):
-        x = x.to(self.device)
-        batch, ctx, *rest = x.size()
-
-        if len(rest) == 1:
-            dims = rest[0]
-            if dims != self.heads * self.head_dim:
-                raise ValueError(
-                    f"Needed {self.heads * self.head_dim}, but got too many {dims}"
-                )
-        elif len(rest) == 2:
-            heads, head_dim = rest
-            if heads != self.heads or head_dim != self.head_dim:
-                raise ValueError(
-                    f"This many heads {self.heads} and head_dims {self.head_dim} we need, got this many heads {heads} and head_dims {head_dim} we did."
-)
-        else:
-            raise ValueError(f"Expected the thingy to be 3D or 4D, but got {x.dim()}D")
-
-        x = rearrange(x, 'b s (h d) -> (b s) d', h=self.heads)
-        x = self.rotate(x)
-        x = x @ self.matrix
-        x = rearrange(x, '(b s) d -> b s (h d)', b=batch, h=self.heads)
-        position = torch.arange(end=ctx, device=self.device, dtype=self.dtype)
-        position = rearrange(tensor=position, pattern='s -> s 1')
-        div_term = rearrange(tensor=self.invf, pattern='d -> 1 d')
-        sinusoid = position * div_term
-        sin = rearrange(tensor=torch.sin(input=sinusoid), pattern='s d -> 1 s 1 d')
-        cos = rearrange(tensor=torch.cos(input=sinusoid), pattern='s d -> 1 s 1 d')
-        x = rearrange(tensor=x, pattern='b s (h d) -> b s h d', h=heads)
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        x_out = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
-        x_out = rearrange(x_out, 'b s h d -> b s (h d)')
-        x_out = x_out * math.sqrt(dims)
-        return x_out
-
-def visualize_attention_weights(attn_weights):
-    import seaborn as sns
-    batch, heads, ctx, _ = attn_weights.shape
-    plt.figure(figsize=(12, 4))
-    for h in range(min(4, heads)):
-        plt.subplot(1, min(4, heads), h+1)
-        sns.heatmap(attn_weights[0, h].detach().cpu().numpy())
-        plt.title(f'Head {h}')
-    plt.suptitle("Attention Weights")
-    plt.show()
-
-def visualize_rotary_angles(rotary, ctx):
-    freqs = rotary.inv_freq.detach().cpu().numpy()
-    t = np.arange(ctx)
-    angles = np.outer(t, freqs)
-    plt.figure(figsize=(10, 6))
-    for i in range(min(4, angles.shape[1])):
-        plt.plot(angles[:, i], label=f'Freq {i}')
-    plt.title("Rotary Angles per Position")
-    plt.xlabel("Position")
-    plt.ylabel("Angle (radians)")
-    plt.legend()
-    plt.show()
-
-def visualize_rotary_effects(x, rotary):
-    ctx = x.shape[1]
-    freqs = rotary(ctx)
-    x_rot = rotary.apply_rotary(x, freqs)
-    idx = 0
-    dims_to_plot = [0, 1, 2, 3]
-    plt.figure(figsize=(10, 6))
-    for d in dims_to_plot:
-        plt.plot(x[idx, :, d].detach().cpu().numpy(), label=f'Orig dim {d}')
-        plt.plot(x_rot[idx, :, d].detach().cpu().numpy(), '--', label=f'Rotary dim {d}')
-    plt.title("Effect of Rotary on Embedding Dimensions")
-    plt.xlabel("Sequence Position")
-    plt.ylabel("Embedding Value")
-    plt.legend()
-    plt.show()
+    act: str
 
 def plot_waveform_and_spectrogram(waveform, spectrogram, sample_idx=0, sr=16000, title="Waveform and Spectrogram"):
     wf = waveform[sample_idx].detach().cpu().numpy()
@@ -355,70 +194,6 @@ def plot_waveform_and_spectrogram(waveform, spectrogram, sample_idx=0, sr=16000,
     axs[1].set_ylabel("Mel Bin")
     plt.tight_layout()
     plt.show()
-
-class BetweennessModule(nn.Module):
-    def __init__(self, dim, adjustment_scale=1.0, window_size=10):
-        super().__init__()
-        self.dim = dim
-        self.adjustment_scale = adjustment_scale
-        self.content_proj = nn.Linear(dim, dim)
-        self.betweenness_gate = nn.Parameter(torch.ones(1) * 0.5)
-        self.window_size = window_size
-        self.norm = nn.LayerNorm(dim)
-        self.dropout = nn.Dropout(0.1)
-
-    def compute_betweenness(self, x):
-        batch, ctx, dim = x.shape
-        content = self.norm(self.content_proj(self.dropout(x)))
-        device = x.device
-        window = self.window_size
-
-        betweenness = torch.zeros(batch, ctx, device=device)
-
-        for offset in range(1, window + 1):
-            n_indices = ctx - 2 * offset
-            if n_indices <= 0:
-                continue
-            i = torch.arange(n_indices, device=device)
-            j = i + offset
-            k = i + 2 * offset
-
-            c_i = content[:, i, :]
-            c_j = content[:, j, :]
-            c_k = content[:, k, :]
-
-            def cos_dist(a, b):
-                a = F.normalize(a, dim=-1)
-                b = F.normalize(b, dim=-1)
-                return 1 - (a * b).sum(dim=-1)
-
-            direct = cos_dist(c_i, c_k)
-            path = cos_dist(c_i, c_j) + cos_dist(c_j, c_k)
-            safe_direct = torch.clamp(direct, min=1e-3)
-            between_score = 1.0 - (path - direct) / safe_direct
-            betweenness[:, j] += between_score
-
-        betweenness = betweenness / max(window, 1)
-        betweenness = betweenness - betweenness.mean(dim=1, keepdim=True)
-        std = betweenness.std(dim=1, keepdim=True) + 1e-6
-        betweenness = betweenness / std
-
-        betweenness = self.betweenness_gate * self.adjustment_scale * betweenness
-        betweenness = torch.clamp(betweenness, -2.0, 2.0)
-
-        return betweenness
-
-def apply_to_rope(rope_func, x, positions, betweenness_module):
-    adjustments = betweenness_module.get_position_adjustments(x)
-    adjusted_positions = positions + adjustments
-    return rope_func(x, adjusted_positions)
-
-def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
-    shifted_input_ids = input_ids.new_zeros(input_ids.shape)
-    shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()
-    shifted_input_ids[:, 0] = decoder_start_token_id
-    shifted_input_ids.masked_fill_(shifted_input_ids == -100, pad_token_id)
-    return shifted_input_ids
 
 def shift_with_zeros(input_ids: torch.Tensor) -> torch.Tensor:
     shifted_input_ids = input_ids.new_zeros(input_ids.shape)
@@ -459,25 +234,6 @@ class Conv2d(nn.Conv2d):
         self, x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> Tensor:
         return super()._conv_forward(
             x, weight.to(x.device, x.dtype), None if bias is None else bias.to(x.device, x.dtype))
-
-class ParameterCycler:
-    def __init__(self, parameters):
-        self.parameters = parameters
-        self.current_idx = 0
-
-    def toggle_requires_grad(self):
-        for i, param in enumerate(self.parameters):
-            param.requires_grad = i == self.current_idx
-        self.current_idx = (self.current_idx + 1) % len(self.parameters)
-
-def _shape(self, tensor: torch.Tensor, ctx: int, batch: int):
-    return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
-
-def exists(val):
-    return val is not None
-
-def default(val, d):
-    return val if exists(val) else d
 
 def sinusoids(length, channels, max_timescale=10000):
     """Returns sinusoids for positional embedding"""
@@ -628,79 +384,6 @@ class SEBlock(nn.Module):
         y = self.fc(y).view(b, c, 1)
         return x * y
     
-class Bridge:
-    _instance = None
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(Bridge, cls).__new__(cls)
-            cls._instance.encoder_features = None
-        return cls._instance
-    def store_encoder_features(self, features):
-        self.encoder_features = features
-    def get_encoder_features(self):
-        return self.encoder_features
-
-class FeedforwardBridge(nn.Module):
-    def __init__(self, dims, is_encoder=False, dropout=0.1):
-        super(FeedforwardBridge, self).__init__()
-        self.is_encoder = is_encoder
-        self.dims = dims
-        self.store = Bridge()
-        self.feedforward = nn.Linear(dims, dims)
-        self.activation = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-        self.cross_gate = nn.Parameter(torch.ones(1) * 0.5)
-        
-    def forward(self, x):
-        transformed = self.feedforward(x)
-        transformed = self.activation(transformed)
-        transformed = self.dropout(transformed)
-        if self.is_encoder:
-            self.store.store_encoder_features(transformed)
-            return transformed
-        else:
-            encoder_features = self.store.get_encoder_features()
-            if encoder_features is not None:
-                if encoder_features.shape[1:] != x.shape[1:]:
-                    encoder_features = encoder_features.mean(dim=1, keepdim=True).expand(-1, x.shape[1], -1)
-                gate = torch.sigmoid(self.cross_gate)
-                return gate * transformed + (1 - gate) * encoder_features
-            return transformed
-        
-class EncoderBottleneck(nn.Module):
-    def __init__(self, dims, latent_dim, iterations=2):
-        super().__init__()
-        self.to_latent = nn.Linear(dims, latent_dim, **tox)
-        self.to_decoder = nn.Linear(latent_dim, dims, **tox)
-        self.to_latent_dec = nn.Linear(dims, latent_dim, **tox)
-        self.to_encoder = nn.Linear(latent_dim, dims, **tox)
-        self.iterations = iterations
-
-    def forward(self, enc_x=None, dec_x=None):
-        if enc_x is not None:
-            if enc_x.dim() == 3:
-                enc_latent = self.to_latent(enc_x.mean(dim=1))
-            else:
-                enc_latent = self.to_latent(enc_x)
-        else:
-            assert dec_x is not None, "You have to provide either enc_x or dec_x"
-            enc_latent = self.to_latent(dec_x)
-    
-        if dec_x is not None:
-            if dec_x.dim() == 3:
-                dec_latent = self.to_latent_dec(dec_x.mean(dim=1))
-            else:
-                dec_latent = self.to_latent_dec(dec_x)
-        else:
-            dec_latent = torch.zeros_like(enc_latent, **tox)
-
-        for _ in range(self.iterations):
-            enc_latent = enc_latent + 0.5 * dec_latent
-            dec_latent = dec_latent + 0.5 * enc_latent
-        enc_to_dec = self.to_decoder(enc_latent)
-        dec_to_enc = self.to_encoder(dec_latent)
-        return enc_to_dec, dec_to_enc
-
 class AudioEncoder(nn.Module):
     def __init__(self, mels: int, ctx: int, dims: int, head: int, layer, act, cross_attention = False):
         super().__init__()
@@ -708,8 +391,7 @@ class AudioEncoder(nn.Module):
         self.debug = False
         self._counter = 0
         self.dropout = 0.1
-
-        self.bottleneck = EncoderBottleneck(dims, latent_dim=128)  
+ 
         act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(),
                    "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
         self.act = act_map.get(act, nn.GELU())
@@ -780,9 +462,6 @@ class TextDecoder(nn.Module):
         self.rotary = Rotary(dim=dims, learned_freq=True)
         
         self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, cross_attention=cross_attention) for _ in range(layer)]) if layer > 0 else None)
-
-        self.bottleneck = EncoderBottleneck(dims, latent_dim=128)  
-
         mask = torch.triu(torch.ones(ctx, ctx), diagonal=1)
         self.register_buffer("mask", mask, persistent=False)
 
@@ -894,94 +573,6 @@ class Echo(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    def install_kv_cache_hooks(self, cache: Optional[dict] = None):
-        cache = {**cache} if cache is not None else {}
-        hooks = []
-        def save_to_cache(module, _, output):
-            if module not in cache or output.shape[1] > self.param.text_ctx:
-                cache[module] = output
-            else:
-                cache[module] = torch.cat([cache[module], output], dim=1).detach()
-            return cache[module]
-
-        def save_adaptive_output(module, _, output):
-            if isinstance(output, tuple) and len(output) == 2:
-                tensor_output, cache_updates = output
-                module_k = f"{module}_k"
-                module_v = f"{module}_v"
-                if module_k not in cache or tensor_output.shape[1] > self.param.text_ctx:
-                    cache[module_k] = cache_updates["k_cache"]
-                    cache[module_v] = cache_updates["v_cache"]
-                else:
-                    cache[module_k] = torch.cat([cache[module_k], cache_updates["k_cache"]], dim=1).detach()
-                    cache[module_v] = torch.cat([cache[module_v], cache_updates["v_cache"]], dim=1).detach()
-                return tensor_output
-            return output
-        
-        def install_hooks(layer: nn.Module):
-            if isinstance(layer, Multihead):
-                hooks.append(layer.k.register_forward_hook(save_to_cache))
-                hooks.append(layer.v.register_forward_hook(save_to_cache))
-            self.encoder.apply(install_hooks)
-        self.decoder.apply(install_hooks)
-        return cache, hooks
-        
-    def _init_weights(self, module):
-        std = 0.02
-        self.init_counts = {"Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0,
-            "Conv2d": 0, "SEBlock": 0, "TextDecoder": 0, "AudioEncoder": 0, "Residual": 0,
-                            "Multihead": 0, "MultiheadA": 0, "MultiheadB": 0, "MultiheadC": 0}
-
-        for name, module in self.named_modules():
-            if isinstance(module, Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-                self.init_counts["Linear"] += 1
-            elif isinstance(module, Conv1d):
-                nn.init.normal_(module.weight, mean=0.0, std=std)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-                self.init_counts["Conv1d"] += 1
-            elif isinstance(module, LayerNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-                self.init_counts["LayerNorm"] += 1
-            elif isinstance(module, RMSNorm):
-                nn.init.ones_(module.weight)
-                self.init_counts["RMSNorm"] += 1
-            elif isinstance(module, Multihead):
-                self.init_counts["Multihead"] += 1
-            elif isinstance(module, Conv2d):
-                nn.init.normal_(module.weight, mean=0.0, std=std)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-                self.init_counts["Conv2d"] += 1
-            elif isinstance(module, SEBlock):
-                nn.init.ones_(module.fc[0].weight)
-                nn.init.zeros_(module.fc[0].bias)
-                nn.init.ones_(module.fc[2].weight)
-                nn.init.zeros_(module.fc[2].bias)
-                self.init_counts["SEBlock"] += 1
-            elif isinstance(module, TextDecoder):
-                self.init_counts["TextDecoder"] += 1
-            elif isinstance(module, AudioEncoder):
-                nn.init.xavier_uniform_(module.se[0].weight)
-                nn.init.zeros_(module.se[0].bias)
-                nn.init.xavier_uniform_(module.se[2].weight)
-                nn.init.zeros_(module.se[2].bias)
-                nn.init.xavier_uniform_(module.se[4].weight)
-                nn.init.zeros_(module.se[4].bias)
-                self.init_counts["AudioEncoder"] += 1
-            elif isinstance(module, Residual):
-                self.init_counts["Residual"] += 1    
-                                                 
-    def init_weights(self):
-        print("Initializing all weights")
-        self.apply(self._init_weights)
-        print("Initialization summary:")
-        for module_type, count in self.init_counts.items():
-            print(f"{module_type}: {count}")
 
 metric = evaluate.load(path="wer")
 
@@ -1006,28 +597,6 @@ class DataCollator:
             labels = labels[:, 1:]
         batch["labels"] = labels
         batch["input_ids"] = shift_with_zeros(labels)
-
-        if self.debug:
-            print(f"Batch input_ids shape: {batch['input_ids'].shape}")
-            print(f"Batch labels shape: {batch['labels'].shape}")
-            print(f"Batch labels: {batch['labels']}")
-            print(f"Batch input_ids: {batch['input_ids']}")
-
-            if "input_features" in batch:
-                print(f"Batch input_features shape: {batch['input_features'].shape}")
-                print(f"Batch input_features: {batch['input_features'][0]}")
-                print(f"Batch input_features: {batch['input_features']}")
-                print("Sum of input_features:", batch["input_features"].sum().item())
-                print("Max of input_features:", batch["input_features"].max().item())
-                print(batch["input_features"][0, :, 0:20])
-                print(batch["input_features"][0, :, 700:720])
-                print(f"Batch input_features: {len(batch['input_features'][0])}")
-
-            if "waveform" in batch:
-                print(f"Batch waveform shape: {batch['waveform'].shape}")
-                print(f"Batch waveform: {batch['waveform']}")
-            print(f"Batch decoder_start_token_id: {self.decoder_start_token_id}")
-
         return batch
     
 def prepare_dataset(batch, input_features=True, waveform=True):
@@ -1225,32 +794,11 @@ if __name__ == "__main__":
         compute_metrics=compute_metrics,
     )
 
-    model.init_weights()
     print("Trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
     print("Total parameters:", sum(p.numel() for p in model.parameters()))
 
-    sanity_check = False
-    if sanity_check:
-        print("Sanity check")
-        print(dataset["test"]["labels"][0], dataset["test"]["input_features"][0].shape, dataset["test"]["waveform"][0].shape)
-        print(dataset["train"]["labels"][0], dataset["train"]["input_features"][0].shape, dataset["train"]["waveform"][0].shape)
-
-        trainer.evaluate(eval_dataset=dataset["test"].take(10), metric_key_prefix="test")
-        trainer.save_model(os.path.join(log_dir, "Sanity_model"))
-
-        print("Training complete")
-        print("Model saved to:", log_dir)
-
     trainer.train()
     
-# from tensorboard import program
-# log_dir = "./output/logs" 
-# tb = program.TensorBoard()
-# tb.configure(argv=[None, '--logdir', log_dir])
-# url = tb.launch()
-# print(f"TensorBoard started at {url}")
-
-
 
 
 
