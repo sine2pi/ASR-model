@@ -1,11 +1,3 @@
-ASR encoder-decoder model with optional blending of spectrogram and waveform input. Full script with tranining loop compatable with hugging face. For testing.
-
-This model's learnable blend (with a sigmoid-mixed parameter) between waveform and spectrogram encodings is a novel and practical way to let the model decide the optimal mix. This form of adaptive fusion is less common in open-source ASR codebases.
-
-Blending waveform and spectrogram features has been explored in some research, but is not standard in ASR pipelines.
-This learnable blend is a modern, under-explored approach addressing the waveform spectrogram debate. Initial findings of the pilot run suggest that the blending of the two significantly decreases WER compared to standalone waveform and spectrogram without significantly increasing overhead. Further testing is currently underway.
-
-This model uses 0 for padding masking and silence and no special tokens, as such the attention mechanism uses multiplicative masking instead of additive. 
 
 ## Understanding Zero-Value Handling in Speech Attention
 
@@ -39,11 +31,25 @@ This approach might be particularly valuable for speech recognition where silenc
 
 This elegant design choice creates a more natural handling of the audio-text connection.
 
+ASR encoder-decoder model with optional blending of spectrogram and waveform input. Full script with tranining loop compatable with hugging face. For testing.
+
+This model's learnable blend (with a sigmoid-mixed parameter) between waveform and spectrogram encodings is a novel and practical way to let the model decide the optimal mix. This form of adaptive fusion is less common in open-source ASR codebases.
+
+Blending waveform and spectrogram features has been explored in some research, but is not standard in ASR pipelines.
+This learnable blend is a modern, under-explored approach addressing the waveform spectrogram debate. Initial findings of the pilot run suggest that the blending of the two significantly decreases WER compared to standalone waveform and spectrogram without significantly increasing overhead. Further testing is currently underway.
+
+This model uses 0 for padding masking and silence and no special tokens, as such the attention mechanism uses multiplicative masking instead of additive. 
+
+
+
 - Silence/pauses in speech carry rhythmic and semantic information.
 - The zero factor means silence is "whispered" to the model rather than "shouted". Can be set to 0.0 if you are worried about leakage.
 - This method allows "0's" to have different weights if one were so inclined.
 - The model can learn timing patterns where pauses are meaningful.
 - By learning to ignore silence the model learns the natural boundries of speech making tokens such as BOS EOS SOT unnecessary.
+
+
+
 
 ```python
 import warnings
