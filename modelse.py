@@ -1,6 +1,3 @@
-
-
-import os
 import warnings
 import logging
 import torch
@@ -8,16 +5,9 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torch import Tensor
 import numpy as np
-from typing import Optional, Dict, Union, List
-from functools import partial
+from typing import Optional, Dict
 import gzip
 import base64
-import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score, precision_score, f1_score, recall_score
-from datetime import datetime
-from datasets import load_dataset, Audio
-from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperFeatureExtractor, WhisperTokenizer
-import evaluate
 import transformers
 from dataclasses import dataclass
 from itertools import chain
@@ -33,14 +23,6 @@ torch.set_default_dtype(dtype)
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 tox = {"device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"), "dtype": torch.float32}
-
-extractor = None
-tokenizer = None
-
-def set_extractor_and_tokenizer(extractor_, tokenizer_):
-    global extractor, tokenizer
-    extractor = extractor_
-    tokenizer = tokenizer_
 
 @dataclass
 class Dimensions:
@@ -59,65 +41,10 @@ class Dimensions:
     decoder_start_token_id: int
     act: str 
 
-
-def plot_waveform_and_spectrogram(x=None, w=None, sample_idx=0, sr=16000, title="Waveform and Spectrogram"):
-    """Plot waveform and/or spectrogram based on available inputs."""
-    if x is not None and w is not None:
-        x_np = x[sample_idx].detach().cpu().numpy()
-        if x_np.shape[0] < x_np.shape[1]:
-            x_np = x_np.T
-    
-        w_np = w[sample_idx].detach().cpu().numpy()
-        if w_np.ndim > 1:
-            w_np = w_np.squeeze()
-        t = np.arange(len(w_np)) / sr
-
-        fig, axs = plt.subplots(2, 1, figsize=(14, 6), sharex=False)
-        axs[0].plot(t, w_np, color="tab:blue")
-        axs[0].set_title("Waveform")
-        axs[0].set_xlabel("Time (s)")
-        axs[0].set_ylabel("Amplitude")
-
-        axs[1].imshow(x_np.T, aspect="auto", origin="lower", cmap="magma")
-        axs[1].set_title("Spectrogram")
-        axs[1].set_xlabel("Frame")
-        axs[1].set_ylabel("Mel Bin")
-        plt.tight_layout()
-        plt.show()
-
-    elif x is not None:
-        x_np = x[sample_idx].detach().cpu().numpy()
-        if x_np.shape[0] < x_np.shape[1]:
-            x_np = x_np.T
-        fig, ax = plt.subplots(1, 1, figsize=(14, 6))
-        ax.imshow(x_np.T, aspect="auto", origin="lower", cmap="magma")
-        ax.set_title("Spectrogram")
-        ax.set_xlabel("Frame")
-        ax.set_ylabel("Mel Bin")
-        plt.tight_layout()
-        plt.show()     
-
-    elif w is not None:
-        w_np = w[sample_idx].detach().cpu().numpy()
-        if w_np.ndim > 1:
-            w_np = w_np.squeeze()
-        t = np.arange(len(w_np)) / sr
-        
-        fig, ax = plt.subplots(1, 1, figsize=(14, 6))
-        ax.plot(t, w_np, color="tab:blue")
-        ax.set_title("Waveform")
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Amplitude")
-        plt.tight_layout()
-        plt.show()
-    else:
-        raise ValueError("No data to plot. Please provide at least one input tensor.")
-
-def shift_with_zeros(input_ids: torch.Tensor) -> torch.Tensor:
+def shift_with_zeros(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
     shifted_input_ids = input_ids.new_zeros(input_ids.shape)
     shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()   
     return shifted_input_ids
-
 
 class LayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
@@ -204,14 +131,10 @@ class Multihead(nn.Module):
         self.rotary = Rotary(dim=head_dim, learned_freq=True)
 
     def forward(self, x: Tensor, xa: Optional[Tensor] = None,  mask: Optional[Tensor] = None, kv_cache: Optional[dict] = None):
-        q = self.query(x).to(x.device, x.dtype)
 
-        if kv_cache is None or xa is None or self.key not in kv_cache:
-            k = self.key(x if xa is None else xa)
-            v = self.value(x if xa is None else xa)
-        else:
-            k = kv_cache[self.key]
-            v = kv_cache[self.value]
+        q = self.query(x).to(x.device, x.dtype)
+        k = self.key(x if xa is None else xa)
+        v = self.value(x if xa is None else xa)
 
         wv, qk = self._attention(q, k, v, mask)
         return self.out(wv), qk
@@ -252,10 +175,9 @@ class Residual(nn.Module):
         self.dropout = 0.1
 
         self.blend_xa = nn.Parameter(torch.tensor(0.5), requires_grad=True) 
-        self.blend = torch.sigmoid(self.blend_xa)
 
-        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(),
-            "tanh": nn.Tanh(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
+        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
+
         self.act = act_map.get(act, nn.GELU())
 
         self.attna = Multihead(dims=dims, head=head)
@@ -268,17 +190,19 @@ class Residual(nn.Module):
         self.lnc = RMSNorm(normalized_shape=dims) 
 
     def forward(self, x, xa=None, mask=None, kv_cache=None):
+
         r = x
         x = x + self.attna(self.lna(x), mask=mask, kv_cache=kv_cache)[0]
         if self.attnb and xa is not None:
             cross_out = self.attnb(self.lnb(x), xa, kv_cache=kv_cache)[0]
-            x = self.blend * x + (1 - self.blend) * cross_out
+            blend = torch.sigmoid(self.blend_xa)
+            x = blend * x + (1 - blend) * cross_out
         x = x + self.mlp(self.lnc(x))
         x = x + r
         return x
 
 class SEBlock(nn.Module):
-    def __init__(self, channels, reduction=16):
+    def __init__(self, channels, reduction=8):
         super().__init__()
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Sequential(
@@ -297,16 +221,14 @@ class AudioEncoder(nn.Module):
     def __init__(self, mels: int, ctx: int, dims: int, head: int, layer, act, cross_attention = False):
         super().__init__()
 
-        self.debug = False
-        self._counter = 0
         self.dropout = 0.1
 
-        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(),
-                   "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
+        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
+        
         self.act = act_map.get(act, nn.GELU())
 
-        self.blend_sw = nn.Parameter(torch.tensor(0.5, device=tox["device"], dtype=tox["dtype"]), requires_grad=False)
-        self.blend = torch.sigmoid(self.blend_sw)
+        self.blend_sw = nn.Parameter(torch.tensor(0.5), quires_grad=True)
+
         self.ln_enc = RMSNorm(normalized_shape=dims, **tox)
         self.register_buffer("positional_embedding", sinusoids(ctx, dims))
 
@@ -329,15 +251,14 @@ class AudioEncoder(nn.Module):
                     for _ in range(layer)]) if layer > 0 else None)
         
     def forward(self, x, w) -> Tensor:
-        if self._counter < 1:
-            plot_waveform_and_spectrogram(x=x, w=w)
-            
+        blend = torch.sigmoid(self.blend_sw)
         if x is not None:
             if w is not None:
                 x = self.se(x).permute(0, 2, 1)
                 w = self.we(w).permute(0, 2, 1)
                 x = (x + self.positional_embedding).to(x.device, x.dtype)
-                x = self.blend * x + (1 - self.blend) * w
+                w = (w + self.positional_embedding).to(w.device, w.dtype) 
+                x = blend * x + (1 - blend) * w
             else:
                 x = self.se(x)
                 x = x.permute(0, 2, 1)
@@ -351,16 +272,12 @@ class AudioEncoder(nn.Module):
 
         for block in chain(self.blockA or []):
             x = block(x)
-        self._counter += 1
-        if self.debug:
-            print(f"Encoder output shape: {x.shape}, x shape: {x.shape}, w shape: {w.shape}")
-       
+
         return self.ln_enc(x)
         
 class TextDecoder(nn.Module):
     def __init__(self, vocab: int, ctx: int, dims: int, head: int, layer, cross_attention = False):
-        super().__init__()
-        self.debug = False
+        super().__init__()     
         self.dropout = 0.1
 
         self.token_embedding = nn.Embedding(num_embeddings=vocab, embedding_dim=dims)
@@ -389,6 +306,7 @@ class TextDecoder(nn.Module):
 
         for block in chain(self.blockA or []):
             x = block(x, xa=xa, mask=self.mask, kv_cache=kv_cache)
+            
         x = self.ln_dec(x)
         logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
         return logits
@@ -541,264 +459,22 @@ class Echo(nn.Module):
         for module_type, count in self.init_counts.items():
             print(f"{module_type}: {count}")
 
-metric = evaluate.load(path="wer")
+param = Dimensions(
+    mels=128,
+    audio_ctx=1500,
+    audio_head=8,
+    encoder_idx=6,
+    audio_dims=768,
+    vocab=51865,
+    text_ctx=512,
+    text_head=4,
+    decoder_idx=4,
+    text_dims=512,
+    decoder_start_token_id=0,
+    pad_token_id=0,
+    eos_token_id=0,
+    act="swish",
+)
 
-@dataclass
-class DataCollator:
-
-    def __call__(self, features: List[Dict[str, Union[List[int], Tensor]]]) -> Dict[str, Tensor]:
-        global extractor, tokenizer
-        decoder_start_token_id = tokenizer.bos_token_id
-        if decoder_start_token_id is None:
-            raise ValueError("The tokenizer does not have a bos_token_id. Please set it manually.")        
-        batch = {}
-
-        if "input_features" in features[0]:
-            batch["input_features"] = torch.stack([f["input_features"] for f in features])
-        if "waveform" in features[0]:
-            batch["waveform"] = torch.stack([f["waveform"] for f in features])
-
-        label_features = [{"input_ids": f["labels"]} for f in features]
-        labels_batch = tokenizer.pad(label_features, return_tensors="pt")
-        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), 0)
-        if (labels[:, 0] == decoder_start_token_id).all().cpu().item():
-            labels = labels[:, 1:]
-        batch["labels"] = labels
-        batch["input_ids"] = shift_with_zeros(labels)
-
-        return batch
-    
-def prepare_dataset(batch, input_features=True, waveform=True):
-    global extractor, tokenizer
-
-    audio = batch["audio"]
-    len = 1500 * 160
-    wav = torch.tensor(audio["array"]).float()
-    
-    if wav.shape[-1] < len:
-        wav = F.pad(wav, (0, len - wav.shape[-1]))
-    else:
-        wav = wav[..., :len]
-    if waveform:
-        batch["waveform"] = wav.unsqueeze(0)
-
-    if input_features:
-        features = extractor(wav.numpy(), sampling_rate=audio["sampling_rate"]).input_features[0]
-        features = torch.tensor(features)
-        pad_val = features.min().item() 
-        features = torch.where(features == pad_val, torch.tensor(0.0, dtype=features.dtype), features)
-        target_shape = (128, 1500)
-        padded = torch.zeros(target_shape, dtype=features.dtype)
-        padded[:, :features.shape[1]] = features[:, :target_shape[1]]
-        batch["input_features"] = padded
-    batch["labels"] = tokenizer(batch["transcription"], add_special_tokens=False).input_ids
-    return batch
-
-def compute_metrics(eval_pred, compute_result: bool = True):
-    global extractor, tokenizer
-    
-    pred_logits = eval_pred.predictions
-    label_ids = eval_pred.label_ids
-
-    if hasattr(pred_logits, "cpu"):
-        pred_logits = pred_logits.cpu()
-    if hasattr(label_ids, "cpu"):
-        label_ids = label_ids.cpu()
-
-    if isinstance(pred_logits, tuple):
-        pred_ids = pred_logits[0]
-    else:
-        pred_ids = pred_logits
-
-    if hasattr(pred_ids, "ndim") and pred_ids.ndim == 3:
-        if not isinstance(pred_ids, torch.Tensor):
-            pred_ids = torch.tensor(pred_ids)
-        pred_ids = pred_ids.argmax(dim=-1)
-        pred_ids = pred_ids.tolist()
-    elif hasattr(pred_ids, "tolist"):
-        pred_ids = pred_ids.tolist()
-
-    if hasattr(label_ids, "tolist"):
-        label_ids = label_ids.tolist()
-
-    label_ids = [
-        [tokenizer.pad_token_id if token == -100 else token for token in seq]
-        for seq in label_ids
-    ]
-
-    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-    
-    print("--------------------------------")
-    print(f"Prediction: {pred_str[0]}")
-    print(f"Label: {label_str[0]}")
-
-    pred_flat = list(chain.from_iterable(pred_ids))
-    labels_flat = list(chain.from_iterable(label_ids))
-    mask = [i != tokenizer.pad_token_id for i in labels_flat]
-
-    acc = accuracy_score(
-        [i for i, m in zip(labels_flat, mask) if m],
-        [p for p, m in zip(pred_flat, mask) if m]
-    )
-    pre = precision_score(
-        [i for i, m in zip(labels_flat, mask) if m],
-        [p for p, m in zip(pred_flat, mask) if m],
-        average='weighted', zero_division=0
-    )
-    rec = recall_score(
-        [i for i, m in zip(labels_flat, mask) if m],
-        [p for p, m in zip(pred_flat, mask) if m],
-        average='weighted', zero_division=0
-    )
-    f1 = f1_score(
-        [i for i, m in zip(labels_flat, mask) if m],
-        [p for p, m in zip(pred_flat, mask) if m],
-        average='weighted', zero_division=0
-    )
-    wer = 100 * metric.compute(predictions=pred_str, references=label_str)
-
-    return {
-        "wer": wer,
-        "accuracy": acc,
-        "precision": pre,
-        "recall": rec,
-        "f1": f1,
-    }
-
-def create_model(params):
-    model = Echo(params).to('cuda')
-    model.init_weights()
-    print("Trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
-    print("Total parameters:", sum(p.numel() for p in model.parameters()))
-    return model
-
-def setup_tokenizers(token):
-    global extractor, tokenizer
-    
-    extractor = WhisperFeatureExtractor.from_pretrained(
-        "openai/whisper-small", 
-        token=token, 
-        feature_size=128,
-        sampling_rate=16000, 
-        do_normalize=True, 
-        return_tensors="pt", 
-        chunk_length=15, 
-        padding_value=0.0
-    )
-    
-    tokenizer = WhisperTokenizer.from_pretrained(
-        "./tokenizer", 
-        pad_token="0", 
-        bos_token="0", 
-        eos_token="0", 
-        unk_token="0",
-        token=token, 
-        local_files_only=True, 
-        pad_token_id=0
-    )
-    
-    tokenizer.pad_token_id = 0
-    tokenizer.bos_token_id = 0
-    tokenizer.eos_token_id = 0
-    tokenizer.decoder_start_token_id = 0
-
-def prepare_datasets(token):
-    dataset = load_dataset("google/fleurs", "en_us", token=token, trust_remote_code=True, streaming=False)
-    dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000))
-    
-    def filter_func(x):
-        return (0 < len(x["transcription"]) < 512 and
-                len(x["audio"]["array"]) > 0 and
-                len(x["audio"]["array"]) < 1500 * 160)
-    
-    dataset = dataset.filter(filter_func).shuffle(seed=42)
-    print("Dataset size:", dataset["train"].num_rows, dataset["test"].num_rows)
-    
-    prepare_fn = partial(prepare_dataset, input_features=True, waveform=True)
-    dataset = dataset.map(
-        function=prepare_fn,
-        remove_columns=list(next(iter(dataset.values())).features)
-    ).with_format(type="torch")
-    
-    train_dataset = dataset["train"].shuffle(seed=42).flatten_indices()
-    test_dataset = dataset["test"].shuffle(seed=42).take(200).flatten_indices()
-    
-    return train_dataset, test_dataset
-
-def get_training_args(log_dir):
-    return Seq2SeqTrainingArguments(
-        output_dir=log_dir,
-        per_device_train_batch_size=1,
-        per_device_eval_batch_size=1,
-        gradient_accumulation_steps=1,
-        eval_accumulation_steps=1,
-        tf32=True,
-        bf16=True,
-        eval_strategy="steps",
-        save_strategy="steps",
-        max_steps=100000,
-        save_steps=10000,
-        eval_steps=5000,
-        warmup_steps=1000,
-        num_train_epochs=1,
-        logging_steps=1,
-        logging_dir=log_dir,
-        report_to=["tensorboard"],
-        push_to_hub=False,
-        disable_tqdm=False,
-        save_total_limit=1,
-        label_names=["labels"],
-        optim="adafactor",
-        lr_scheduler_type="cosine",
-        learning_rate=0.0025,
-        weight_decay=0.25,
-        save_safetensors=True,
-        eval_on_start=False,
-        include_num_input_tokens_seen=False,
-        include_tokens_per_second=False,
-        batch_eval_metrics=False,
-        group_by_length=False,
-        remove_unused_columns=False,
-    )
-
-if __name__ == "__main__":
-    
-    param = Dimensions(
-        mels=128,
-        audio_ctx=1500,
-        audio_head=4,
-        encoder_idx=4,
-        audio_dims=512,
-        vocab=51865,
-        text_ctx=512,
-        text_head=4,
-        decoder_idx=4,
-        text_dims=512,
-        decoder_start_token_id=0,
-        pad_token_id=0,
-        eos_token_id=0,
-        act="gelu",
-    )
-    
-    token = ""
-    log_dir = os.path.join('./output/logs', datetime.now().strftime(format='%m-%d_%H'))
-    os.makedirs(name=log_dir, exist_ok=True)
-    
-    setup_tokenizers(token)
-    model = create_model(param)
-    train_dataset, test_dataset = prepare_datasets(token)
-    training_args = get_training_args(log_dir)
-    
-    trainer = Seq2SeqTrainer(
-        args=training_args,
-        model=model,
-        train_dataset=train_dataset,
-        eval_dataset=test_dataset,
-        data_collator=DataCollator(),
-        compute_metrics=compute_metrics,
-    )
-    
-    trainer.train()
-
-
+model = Echo(param).to('cuda')
+model.init_weights()
