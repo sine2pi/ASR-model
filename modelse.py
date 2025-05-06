@@ -227,7 +227,7 @@ class AudioEncoder(nn.Module):
         
         self.act = act_map.get(act, nn.GELU())
 
-        self.blend_sw = nn.Parameter(torch.tensor(0.5), quires_grad=True)
+        self.blend_sw = nn.Parameter(torch.tensor(0.5), requires_grad=True)
 
         self.ln_enc = RMSNorm(normalized_shape=dims, **tox)
         self.register_buffer("positional_embedding", sinusoids(ctx, dims))
