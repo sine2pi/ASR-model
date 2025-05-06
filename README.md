@@ -235,10 +235,9 @@ class Residual(nn.Module):
         self.dropout = 0.1
 
         self.blend_xa = nn.Parameter(torch.tensor(0.5), requires_grad=True) 
-        self.blend = torch.sigmoid(self.blend_xa)
 
-        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(),
-            "tanh": nn.Tanh(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
+        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
+
         self.act = act_map.get(act, nn.GELU())
 
         self.attna = Multihead(dims=dims, head=head)
@@ -251,17 +250,19 @@ class Residual(nn.Module):
         self.lnc = RMSNorm(normalized_shape=dims) 
 
     def forward(self, x, xa=None, mask=None, kv_cache=None):
+
         r = x
         x = x + self.attna(self.lna(x), mask=mask, kv_cache=kv_cache)[0]
         if self.attnb and xa is not None:
             cross_out = self.attnb(self.lnb(x), xa, kv_cache=kv_cache)[0]
-            x = self.blend * x + (1 - self.blend) * cross_out
+            blend = torch.sigmoid(self.blend_xa)
+            x = blend * x + (1 - blend) * cross_out
         x = x + self.mlp(self.lnc(x))
         x = x + r
         return x
 
 class SEBlock(nn.Module):
-    def __init__(self, channels, reduction=16):
+    def __init__(self, channels, reduction=8):
         super().__init__()
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Sequential(
@@ -282,12 +283,12 @@ class AudioEncoder(nn.Module):
 
         self.dropout = 0.1
 
-        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(),
-                   "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
+        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
+        
         self.act = act_map.get(act, nn.GELU())
 
-        self.blend_sw = nn.Parameter(torch.tensor(0.5, device=tox["device"], dtype=tox["dtype"]), requires_grad=False)
-        self.blend = torch.sigmoid(self.blend_sw)
+        self.blend_sw = nn.Parameter(torch.tensor(0.5), quires_grad=True)
+
         self.ln_enc = RMSNorm(normalized_shape=dims, **tox)
         self.register_buffer("positional_embedding", sinusoids(ctx, dims))
 
@@ -310,13 +311,14 @@ class AudioEncoder(nn.Module):
                     for _ in range(layer)]) if layer > 0 else None)
         
     def forward(self, x, w) -> Tensor:
-            
+        blend = torch.sigmoid(self.blend_sw)
         if x is not None:
             if w is not None:
                 x = self.se(x).permute(0, 2, 1)
                 w = self.we(w).permute(0, 2, 1)
                 x = (x + self.positional_embedding).to(x.device, x.dtype)
-                x = self.blend * x + (1 - self.blend) * w
+                w = (w + self.positional_embedding).to(w.device, w.dtype) 
+                x = blend * x + (1 - blend) * w
             else:
                 x = self.se(x)
                 x = x.permute(0, 2, 1)
@@ -520,9 +522,9 @@ class Echo(nn.Module):
 param = Dimensions(
     mels=128,
     audio_ctx=1500,
-    audio_head=4,
-    encoder_idx=4,
-    audio_dims=512,
+    audio_head=8,
+    encoder_idx=6,
+    audio_dims=768,
     vocab=51865,
     text_ctx=512,
     text_head=4,
@@ -531,16 +533,11 @@ param = Dimensions(
     decoder_start_token_id=0,
     pad_token_id=0,
     eos_token_id=0,
-    act="gelu",
+    act="swish",
 )
 
 model = Echo(param).to('cuda')
 model.init_weights()
-
-
-    
-
-
 
 
 
