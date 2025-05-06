@@ -202,7 +202,7 @@ class Residual(nn.Module):
         return x
 
 class SEBlock(nn.Module):
-    def __init__(self, channels, reduction=8):
+    def __init__(self, channels, reduction=16):
         super().__init__()
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Sequential(
@@ -462,9 +462,9 @@ class Echo(nn.Module):
 param = Dimensions(
     mels=128,
     audio_ctx=1500,
-    audio_head=8,
-    encoder_idx=6,
-    audio_dims=768,
+    audio_head=4,
+    encoder_idx=4,
+    audio_dims=512,
     vocab=51865,
     text_ctx=512,
     text_head=4,
