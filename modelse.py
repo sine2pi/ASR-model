@@ -602,6 +602,8 @@ class DataCollator:
             labels = labels[:, 1:]
         batch["labels"] = labels
         batch["input_ids"] = shift_with_zeros(labels, pad_token_id, decoder_start_token_id)
+
+        return batch
     
 def prepare_dataset(batch, input_features=True, waveform=True):
     global extractor, tokenizer
@@ -705,6 +707,7 @@ def compute_metrics(eval_pred, compute_result: bool = True):
     metrics.update(tracked_params)
     return metrics
 
+
 def create_model(param):
     model = Echo(param).to('cuda')
     model.init_weights()
@@ -776,7 +779,7 @@ def get_training_args(log_dir):
         eval_strategy="steps",
         save_strategy="steps",
         max_steps=10000,
-        save_steps=10000,
+        save_steps=1000,
         eval_steps=1000,
         warmup_steps=1000,
         num_train_epochs=1,
@@ -792,13 +795,14 @@ def get_training_args(log_dir):
         learning_rate=0.0025,
         weight_decay=0.25,
         save_safetensors=True,
-        eval_on_start=True,
+        eval_on_start=False,
         include_num_input_tokens_seen=False,
         include_tokens_per_second=False,
         batch_eval_metrics=False,
         group_by_length=False,
         remove_unused_columns=False,
     )
+
 
 if __name__ == "__main__":
     
