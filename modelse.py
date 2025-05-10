@@ -1,3 +1,4 @@
+
 import os
 import warnings
 import logging
@@ -133,15 +134,10 @@ def custom_excepthook(exc_type, exc_value, exc_traceback):
     func_name = frame.f_code.co_name
     print(f"Error occurred in file '{filename}', line {lineno}, in function '{func_name}'")
 
-
-
-def _shape(self, tensor: torch.Tensor, ctx: int, batch: int):
-    return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
-
 def get_tracked_parameters(model, param_paths=None):
     if param_paths is None:
         param_paths = {
-            "blend_sw": "encoder.blend_sw",
+            "sw": "encoder.sw",
         }
     result = {}
     for name, path in param_paths.items():
@@ -277,7 +273,6 @@ def rotate_half(x):
     x = torch.stack((-x2, x1), dim = -1)
     return rearrange(x, '... d r -> ... (d r)')
 
-
 class Rotary(nn.Module):
     def __init__(self, dims, ctx=1500, learned_freq=False, variable_radius=False, learned_radius=False, use_xpos=False, xpos_scale_base=1.0, debug=False):
         super().__init__()
@@ -311,7 +306,7 @@ class Rotary(nn.Module):
         self.bias = nn.Parameter(torch.zeros(max_ctx, dims // 2))
         
     def get_seq_pos(self, ctx, device, dtype, offset=0):
-        return (torch.arange(ctx, device=device, dtype=dtype) + offset) / self.interpolate_factor
+        return (torch.arange(ctx, device=device, dtype=dtype) + offset) / self.interpolate_Factor
     
     def get_scale(self, t, ctx=None, offset=0):
         from einops import repeat
@@ -392,7 +387,7 @@ class Rotary(nn.Module):
             return torch.cat([x1.type_as(x), x2], dim=-1)
 
 class MultiheadA(nn.Module):
-    def __init__(self, dims: int, head: int, rotary=None, debug=False):
+    def __init__(self, dims: int, head: int, debug):
         super().__init__()
         self._counter = 0
         self.debug = debug
@@ -404,18 +399,18 @@ class MultiheadA(nn.Module):
         self.v = Linear(dims, dims)
         self.out = Linear(dims, dims)
 
-        self.rotary = Rotary(dims=self.head_dim, learned_freq=True)
-        self.factor = nn.Parameter(torch.tensor(0.0005))
+        self.Rotary = Rotary(dims=self.head_dim, learned_freq=True)
+        self.Factor = nn.Parameter(torch.tensor(0.00005))
 
     def forward(self, x: Tensor, xa: Optional[Tensor] = None,  mask: Optional[Tensor] = None, kv_cache: Optional[dict] = None, decoder: bool = False):
 
         batch, ctx, dims = x.size()
         if xa is not None:
-            Batch, Ctx, Dims = xa.size()
+            Batch, Ctx, D = xa.size()
         
         head_dim = self.head_dim
         head = self.head
-        freq = self.rotary(ctx)
+        freq = self.Rotary(ctx)
         scale = (dims // head) ** -0.25
 
         q = self.q(x)
@@ -430,19 +425,19 @@ class MultiheadA(nn.Module):
             k = kv_cache[self.k]
             v = kv_cache[self.v]
 
-        q = self.rotary.apply_rotary(q, freq)
-        k = self.rotary.apply_rotary(k, freq)
+        q = self.Rotary.apply_rotary(q, freq)
+        k = self.Rotary.apply_rotary(k, freq)
 
-        q = q.view(batch, ctx, head, head_dim).transpose(1, 2).contiguous()
-        k = k.view(batch, ctx, head, head_dim).transpose(1, 2).contiguous()
-        v = v.view(batch, ctx, head, head_dim).transpose(1, 2).contiguous()
+        q = q.view(batch, ctx, head, head_dim).transpose(1, 2).contiguous() 
+        k = k.view(batch, ctx, head, head_dim).transpose(1, 2).contiguous()  
+        v = v.view(batch, ctx, head, head_dim).transpose(1, 2).contiguous() 
 
         qk = (q * scale) @ (k * scale).transpose(-1, -2)
 
         token_ids = k[:, :, :, 0]
         scaled_zero = torch.ones_like(token_ids)
-        zero_factor = torch.clamp(F.softplus(self.factor), min=0.00001, max=0.1)
-        scaled_zero[token_ids.float() == 0] = zero_factor.to(q.device, q.dtype)
+        zero_Factor = torch.clamp(F.softplus(self.Factor), min=0.0, max=0.001)
+        scaled_zero[token_ids.float() == 0] = zero_Factor.to(q.device, q.dtype)
         
         if mask is not None:
             qk = qk * mask.unsqueeze(0).unsqueeze(0)
@@ -452,32 +447,41 @@ class MultiheadA(nn.Module):
         w = F.softmax(qk, dim=-1)
         wv = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
 
-        if self.debug:
-            if self._counter < 1:
-                print(f"Multihead -- q: {q.shape}, k: {k.shape}, v: {v.shape}, w: {w.shape}, wv: {wv.shape}, qk: {qk.shape}")
-                print(f"Input x shape: {x.shape}")
-                print(f"Input xa shape: {xa.shape if xa is not None else None}")
-                print(f"Mask: {mask.shape if mask is not None else None}")
-                if mask is not None:
-                    print(f"scaled_mask: {mask.shape if mask is not None else None}")
+        if self._counter < 1 and self.debug: 
+            print("---------")
+            print("MULTIHEAD (First Call)")
+            print(f"q: {q.shape}, k: {k.shape}, v: {v.shape}, w: {w.shape}, wv: {wv.shape}, qk: {qk.shape}")
+            print(f"Input x shape (first call): {x.shape}")
+            print(f"Input xa shape (first call): {xa.shape if xa is not None else None}")
+            print(f"Mask shape (first call): {mask.shape if mask is not None else None}")
+
+        if self._counter % 100 == 0 and self.debug and mask is not None: 
+            print(f"Counter: {self._counter} (Periodic Log)")
+            print(f"Input x shape (periodic): {x.shape}")
+            print(f"Input xa shape (periodic): {xa.shape if xa is not None else None}")
+            print(f"Mask shape (periodic): {mask.shape}")
+
         self._counter += 1
         return self.out(wv), qk.detach()
 
 class Residual(nn.Module):
-    def __init__(self, dims: int, head: int, cross_attention = False, act = "relu", rotary=None, debug=False):
+    def __init__(self, dims: int, head: int, act: str = "gelu", cross_attention: bool = False, debug: bool = False):
         super().__init__()
+        
         self._counter = 0
         self.dropout = 0.1
-        self._rotary = rotary
+        self.dims = dims
+        self.head = head
+        self.head_dim = dims // head
         self.cross_attention = cross_attention
         self.debug = debug
-        
+
         self.blend_xa = nn.Parameter(torch.tensor(0.5))
         act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
         self.act = act_map.get(act, nn.GELU())
 
-        self.attna = MultiheadA(dims, head)
-        self.attnb = (MultiheadA(dims, head) if cross_attention else None)
+        self.attna = MultiheadA(dims, head, debug)
+        self.attnb = (MultiheadA(dims, head, debug) if cross_attention else None)
             
         mlp = dims * 4
         self.mlp = nn.Sequential(Linear(dims, mlp), self.act, Linear(mlp, dims))
@@ -486,18 +490,6 @@ class Residual(nn.Module):
         self.lnc = RMSNorm(dims) 
 
     def forward(self, x, xa=None, mask=None, kv_cache=None, decoder=False):
-        
-        if self.debug:
-            if self._counter < 1:
-                print(f"Residual -- Decoder: {decoder}")
-                print(f"kv_cache: {kv_cache is not None}")
-                print(f"Input x shape: {x.shape}")
-                print(f"Input xa shape: {xa.shape if xa is not None else None}")
-                print(f"Input x: {x}")
-                print(f"Input xa: {xa if xa is not None else None}")
-                print(f"Mask: {mask.shape if mask is not None else None}")
-
-        self._counter += 1
 
         r = x
         x = x + self.attna(self.lna(x), mask=mask, kv_cache=kv_cache, decoder=decoder)[0]
@@ -507,6 +499,17 @@ class Residual(nn.Module):
             x = blend * x + (1 - blend) * cross_out
         x = x + self.mlp(self.lnc(x))
         x = x + r
+
+        if self._counter < 1 and self.debug: 
+            print("--------")
+            print("RESIDUAL")
+            print(f"Is decoder: {decoder}")
+            print(f"kv_cache: {kv_cache is not None}")
+            print(f"Input x shape: {x.shape}")
+            print(f"Input xa shape: {xa.shape if xa is not None else None}")
+            print(f"Mask: {mask.shape if mask is not None else None}")
+                
+        self._counter += 1
         return x
 
 class SEBlock(nn.Module):
@@ -526,21 +529,20 @@ class SEBlock(nn.Module):
         return x * y
     
 class AudioEncoder(nn.Module):
-    def __init__(self, mels, ctx, dims, head, layer, act, rotary=None, rotary_config=None, debug=False, **tox):
+    def __init__(self, mels: int, layer: int, dims: int, head: int, ctx: int, act: str = "gelu", debug: bool = False):
         super().__init__()
         self._counter = 0
         self.debug = debug
         self.dims = dims
         self.head = head
+        self.ctx = ctx
         self.head_dim = dims // head
         self.dropout = 0.1
-
-        self.rotary = Rotary(dims=self.head_dim, ctx=ctx, learned_freq=False, variable_radius=False, learned_radius=False)    
 
         act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
         self.act = act_map.get(act, nn.GELU())
 
-        self.blend_sw = nn.Parameter(torch.tensor(0.5))
+        self.sw = nn.Parameter(torch.tensor(0.5))
         self.ln_enc = RMSNorm(dims, **tox)
         self.positional_embedding = lambda length: sinusoids(length, dims)
 
@@ -552,58 +554,70 @@ class AudioEncoder(nn.Module):
             nn.Dropout(p=self.dropout), Conv1d(dims, dims, kernel_size=3, stride=1, padding=1))
         
         self.we = nn.Sequential(
-            nn.Conv1d(1, dims, kernel_size=11, stride=5, padding=5),
-            nn.GELU(), nn.Conv1d(dims, dims, kernel_size=5, stride=2, padding=2),
-            nn.GELU(), nn.AdaptiveAvgPool1d(1))
+            nn.Conv1d(1, dims, kernel_size=11, stride=5, padding=5), # Allows variable length output
+            nn.GELU(), nn.Conv1d(dims, dims, kernel_size=5, stride=2, padding=2), # Allows variable length output
+            nn.GELU())
 
         self.blockA = (nn.ModuleList([
-            Residual(dims=dims, head=head, act=act, rotary=rotary, debug=debug) 
-            for _ in range(layer)]) if layer > 0 else None)
+            Residual(dims=dims, head=head, act=act, cross_attention=False, debug=debug) for _ in range(layer)]) if layer > 0 else None)
             
     def forward(self, x, w, decoder=False) -> Tensor:
-        x = x.to(device=device) 
-        blend = torch.sigmoid(self.blend_sw) 
+        """
+        batch, ctx, dims = B, L, D 
+        x is spectrogram (B, Mels, L)
+        w is waveform (B, 1, L)
+        """
+        x = x.to(device=device) if x is not None else None
+        w = w.to(device=device) if w is not None else None
+        
+        blend = torch.sigmoid(self.sw) 
 
-        if self._counter < 1:
+        if self._counter < 1 and self.debug:
             plot_waveform_and_spectrogram(x=x, w=w)
-            print(f"Spectrogram tensor shape: {x.shape if x is not None else None}, Waveform tensor shape: {w.shape if w is not None else None}")
+            print(f"Initial Spectrogram tensor shape: {x.shape if x is not None else None}, Initial Waveform tensor shape: {w.shape if w is not None else None}")
+
+        if x is not None:
+            x = self.se(x).permute(0, 2, 1) # (B, L, D)
+            x = x + self.positional_embedding(x.shape[1]).to(x.device, x.dtype)
+
+        if w is not None: # self.we output shape: (B, D, L)           
+            w = self.we(w).permute(0, 2, 1) # (B, L, D)
 
         if x is not None:
             if w is not None:
-                x = self.se(x).permute(0, 2, 1)
-                x = x + self.positional_embedding(x.shape[1]).to(x.device, x.dtype)
-                w = self.we(w).permute(0, 2, 1).to(x.device, x.dtype)
+                if w.shape[1] != x.shape[1]:
+                    w = w.permute(0, 2, 1) # (B, L, D) -> (B, D, L)
+                    w = F.interpolate(w, size=x.shape[1], mode='linear', align_corners=False) #  w_L to x_L 
+                    w = w.permute(0, 2, 1) # (B, D, L) -> (B, L, D)
+                else:
+                    w = w
                 w = w + self.positional_embedding(w.shape[1]).to(w.device, w.dtype)
                 x = blend * x + (1 - blend) * w
             else:
-                x = self.se(x).permute(0, 2, 1)
-                x = x + self.positional_embedding(x.shape[1]).to(x.device, x.dtype)
-        else:
-            assert w is not None, "You have to provide either x or w"
-            w = self.we(w).permute(0, 2, 1)
+                x = x
+        elif w is not None:
             w = w + self.positional_embedding(w.shape[1]).to(w.device, w.dtype)
             x = w
+        else:
+            raise ValueError("You have to provide either x (spectrogram) or w (waveform)")
 
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
         for block in chain(self.blockA or []):
-            x = block(x, decoder=decoder)
+            x = block(x, decoder=decoder) 
 
-        if self.debug:
-            if self._counter < 1:
-                print("ENCODER -- ")
-                print(f"Input x: {x if x is not None else None}")
-                print(f"Input w: {w if w is not None else None}")
-                print(f"Input x shape: {x.shape if x is not None else None}")
-                print(f"Input w shape: {w.shape if w is not None else None}")
-                print(f"Positional embedding shape: {self.positional_embedding(x.shape[1]).shape}")
-                print(f"Positional embedding shape: {self.positional_embedding.shape}")
+        if self._counter < 1 and self.debug: 
+            print("-------")
+            print("ENCODER")
+            print(f"Features to Residual Blocks shape: {x.shape}")     
+            print(f"Original input x shape: {x.shape if x is not None else None}")
+            print(f"Original input w shape: {w.shape if w is not None else None}")
+            print(f"Positional embedding for a length of {x.shape[1]} would be: {self.positional_embedding(x.shape[1]).shape}")
+            
         self._counter += 1
-
         return self.ln_enc(x)
-        
 
 class TextDecoder(nn.Module):
-    def __init__(self, vocab: int, ctx: int, dims: int, head: int, layer: int, cross_attention, rotary=None, debug=False):
+    def __init__(self, vocab, ctx, dims, head, layer, cross_attention=False, rotary=False, debug=False):
         super().__init__()
         self._counter = 0
         self.dims = dims
@@ -612,7 +626,7 @@ class TextDecoder(nn.Module):
         self.debug = debug
         self.dropout = 0.1
         
-        self.rotary = Rotary(dims=dims, ctx=ctx, learned_freq=False, variable_radius=False, learned_radius=False)    
+        self.Rotary = Rotary(dims=dims, ctx=ctx, learned_freq=False, variable_radius=False, learned_radius=False)    
         self.token_embedding = nn.Embedding(num_embeddings=vocab, embedding_dim=dims)
         with torch.no_grad():
             self.token_embedding.weight[0].zero_()
@@ -621,42 +635,53 @@ class TextDecoder(nn.Module):
         self.ln_dec = RMSNorm(dims=dims)
     
         self.blockA = (nn.ModuleList([
-            Residual(dims=dims, head=head, cross_attention=cross_attention, rotary=rotary, debug=debug) for _ in range(layer)]) if layer > 0 else None)
+            Residual(dims=dims, head=head, act="gelu", cross_attention=cross_attention, debug=debug) for _ in range(layer)]) if layer > 0 else None)
 
-    def forward(self, x, xa, kv_cache=None, decoder=False) -> Tensor:
+    def forward(self, x, xa, kv_cache=None, decoder=True) -> Tensor:
+
+        """
+        input:
+        x : torch.LongTensor, shape = (batch, ctx)  the text tokens
+        xa : torch.Tensor, shape = (batch, audio_ctx, audio_dims) the encoded audio features to be attended on
+        output:
+        logits : torch.FloatTensor, shape = (batch, ctx, vocab) the logits for each token in the vocabulary
+        x : torch.FloatTensor, shape = (batch, ctx, dims) the text features
+        xa : torch.FloatTensor, shape = (batch, audio_ctx, dims) the encoded audio features to be attended on
+        """
+
         x = x.to(device=device)
         if xa is not None:
             xa = xa.to(device=device)
 
         offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
-        x = (self.token_embedding(x) + self.positional_embedding[offset: offset + x.shape[-1]])
+        x = (self.token_embedding(x) + self.positional_embedding[offset: offset + x.shape[-1]]) # positional_embedding = (ctx, dims)
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
         
         ctx = x.shape[1]
-        freqs = self.rotary(ctx)
-        x = self.rotary.apply_rotary(x, freqs)
+        freqs = self.Rotary(ctx)
+        x = self.Rotary.apply_rotary(x, freqs)
 
         mask = torch.where((torch.triu(torch.ones(ctx, ctx), diagonal=1)) == 1, torch.tensor(0.0), torch.tensor(1.0)).to(x.device, x.dtype)
-
-        if self.debug:
-            if self._counter < 1:
-                print("DECODER -- ")
-                print(f"Token embedding shape: {self.token_embedding.weight.shape}")
-                print(f"Positional embedding shape: {self.positional_embedding.shape}")
-                print(f"Rotary frequency shape: {freqs.shape}")
-                print(f"Input x shape: {x.shape}")
-                print(f"Input xa shape: {xa.shape if xa is not None else None}")
-                print(f"Input x: {x}")
-                print(f"Input xa {xa if xa is not None else None}")
-                print(f"Mask: {mask.shape if mask is not None else None}")
-                print(f"CTX: {ctx}, Offset: {offset}")
-        self._counter += 1
 
         for block in chain(self.blockA or []):
             x = block(x, xa=xa, mask=mask, kv_cache=kv_cache, decoder=decoder)
         
         x = self.ln_dec(x)
         logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
+
+        if self._counter < 1 and self.debug: 
+            print("-------")
+            print("DECODER")
+            print(f"Token embedding shape: {self.token_embedding.weight.shape}")
+            print(f"Positional embedding shape: {self.positional_embedding.shape}")
+            print(f"Rotary frequency shape: {freqs.shape}")
+            print(f"Input x shape: {x.shape}")
+            print(f"Input xa shape: {xa.shape if xa is not None else None}")
+            print(f"Mask: {mask.shape if mask is not None else None}")
+            print(f"CTX: {ctx}, Offset: {offset}")
+            print(f"Logits shape: {logits.shape}")
+
+        self._counter += 1
         return logits
 
 class Echo(nn.Module):
@@ -672,6 +697,9 @@ class Echo(nn.Module):
         })
 
         self.param_tracking_paths = {
+            "RotationA": "encoder.blockA.0.attna.Rotary.inv_freq",
+            "RotationB": "decoder.Rotary.inv_freq",
+            "Silence": "encoder.blockA.0.attna.Factor",
         }
         
         self.encoder = AudioEncoder(
@@ -692,11 +720,16 @@ class Echo(nn.Module):
             head=param.text_head,
             layer=param.decoder_idx,
             cross_attention=param.cross_attention,
+
+            # rotary=param.rotary,
+            # Factor=param.Factor,
+            # rotary_config=param.rotary_config,
         )
 
         all_head = torch.zeros(self.param.decoder_idx, self.param.text_head, dtype=torch.bool)
         all_head[self.param.decoder_idx // 2 :] = True
         self.register_buffer("alignment_head", all_head.to_sparse(), persistent=False)
+
     def set_alignment_head(self, dump: bytes):
         array = np.frombuffer(
             gzip.decompress(base64.b85decode(dump)), dtype=bool).copy()
@@ -827,47 +860,67 @@ class DataCollator:
         global extractor, tokenizer
         decoder_start_token_id = tokenizer.bos_token_id
         pad_token_id = tokenizer.pad_token_id
+        input_feature_pad_value = 0.0
+        waveform_pad_value = 0.0
 
         if decoder_start_token_id is None:
             raise ValueError("The tokenizer does not have a bos_token_id. Please set it manually.")        
         batch = {}
 
-        if "input_features" in features[0]:
-            batch["input_features"] = torch.stack([f["input_features"] for f in features])
-        if "waveform" in features[0]:
-            batch["waveform"] = torch.stack([f["waveform"] for f in features])
+        if "input_features" in features[0] and features[0]["input_features"] is not None:
+            input_features_list = [f["input_features"] for f in features]
+            max_len_feat = max(f.shape[1] for f in input_features_list)
+            
+            padded_input_features = []
+            for feat in input_features_list:
+                num_mels, current_len = feat.shape
+                padding_needed = max_len_feat - current_len
+                if padding_needed > 0:
+                    padded_feat = F.pad(feat, (0, padding_needed), mode='constant', value=input_feature_pad_value)
+                else:
+                    padded_feat = feat
+                padded_input_features.append(padded_feat)
+            batch["input_features"] = torch.stack(padded_input_features)
+
+        if "waveform" in features[0] and features[0]["waveform"] is not None:
+            waveform_list = [f["waveform"] for f in features]
+            max_len_wav = max(w.shape[1] for w in waveform_list)
+
+            padded_waveforms = []
+            for wav in waveform_list:
+                _, current_len = wav.shape
+                padding_needed = max_len_wav - current_len
+                if padding_needed > 0:
+                    padded_wav = F.pad(wav, (0, padding_needed), mode='constant', value=waveform_pad_value)
+                else:
+                    padded_wav = wav
+                padded_waveforms.append(padded_wav)
+            batch["waveform"] = torch.stack(padded_waveforms)
 
         label_features = [{"input_ids": f["labels"]} for f in features]
-        labels_batch = tokenizer.pad(label_features, return_tensors="pt")
+        labels_batch = tokenizer.pad(label_features, return_tensors="pt", padding="longest", pad_to_multiple_of=None)
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), 0)
+        if (labels[:, 0] == decoder_start_token_id).all().cpu().item():
+            labels = labels[:, 1:]
         batch["labels"] = labels
         batch["input_ids"] = shift_with_zeros(labels, pad_token_id, decoder_start_token_id)
-
         return batch
-    
+
 def prepare_dataset(batch, input_features=True, waveform=True):
     global extractor, tokenizer
-
     audio = batch["audio"]
-    len = 1500 * 160
-    wav = torch.tensor(audio["array"]).float()
-    
-    if wav.shape[-1] < len:
-        wav = F.pad(wav, (0, len - wav.shape[-1]))
-    else:
-        wav = wav[..., :len]
+    wav = torch.tensor(audio["array"]).float() 
+
     if waveform:
         batch["waveform"] = wav.unsqueeze(0)
 
     if input_features:
-        features = extractor(wav.numpy(), sampling_rate=audio["sampling_rate"]).input_features[0]
-        features = torch.tensor(features)
-        pad_val = features.min().item() 
-        features = torch.where(features == pad_val, torch.tensor(0.0, dtype=features.dtype), features)
-        target_shape = (128, 1500)
-        padded = torch.zeros(target_shape, dtype=features.dtype)
-        padded[:, :features.shape[1]] = features[:, :target_shape[1]]
-        batch["input_features"] = padded
+        features_np = extractor(wav.numpy(), sampling_rate=audio["sampling_rate"], padding="longest").input_features[0]
+        current_features = torch.tensor(features_np)
+        pad_val = current_features.min().item() 
+        current_features = torch.where(current_features == pad_val, torch.tensor(0.0, dtype=current_features.dtype), current_features)
+        batch["input_features"] = current_features
+        
     batch["labels"] = tokenizer(batch["transcription"], add_special_tokens=False).input_ids
     return batch
 
@@ -906,6 +959,10 @@ def compute_metrics(eval_pred, compute_result: bool = True):
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
     
+    print("--------------------------------")
+    print(f"Prediction: {pred_str[0]}")
+    print(f"Label: {label_str[0]}")
+
     pred_flat = list(chain.from_iterable(pred_ids))
     labels_flat = list(chain.from_iterable(label_ids))
     mask = [i != tokenizer.pad_token_id for i in labels_flat]
@@ -930,13 +987,23 @@ def compute_metrics(eval_pred, compute_result: bool = True):
         average='weighted', zero_division=0
     )
     wer = 100 * metric.compute(predictions=pred_str, references=label_str)
+    tracked_params = get_tracked_parameters(model, model.param_tracking_paths)
+    
+    RotationA = tracked_params["RotationA"]
+    RotationB = tracked_params["RotationB"]
+    Silence = tracked_params["Silence"]
+          
     metrics = {
         "wer": wer,
         "accuracy": acc,
         "precision": pre,
         "recall": rec,
         "f1": f1,
+        "RotationA": RotationA,
+        "RotationB": RotationB,
+        "Silence": Silence,
     }
+        # metrics.update(tracked_params)
     return metrics
 
 def create_model(param):
@@ -957,9 +1024,10 @@ def setup_tokenizers(token):
         do_normalize=True, 
         return_tensors="pt", 
         chunk_length=15, 
-        padding_value=0.0
+        padding_value=0.0,
+        padding=False,
     )
-    
+
     tokenizer = WhisperTokenizer.from_pretrained(
         "./tokenizer", 
         pad_token="0", 
@@ -1005,10 +1073,10 @@ def get_training_args(log_dir):
         bf16=True,
         eval_strategy="steps",
         save_strategy="steps",
-        max_steps=10000,
-        save_steps=10000,
-        eval_steps=5000,
-        warmup_steps=1000,
+        max_steps=1000,
+        save_steps=1001,
+        eval_steps=100,
+        warmup_steps=0,
         num_train_epochs=1,
         logging_steps=100,
         logging_dir=log_dir,
@@ -1017,7 +1085,7 @@ def get_training_args(log_dir):
         disable_tqdm=False,
         save_total_limit=1,
         label_names=["labels"],
-        optim="adamw_hf",
+        optim="adamw_torch",
         lr_scheduler_type="cosine",
         learning_rate=0.0025,
         weight_decay=0.25,
@@ -1025,7 +1093,6 @@ def get_training_args(log_dir):
         eval_on_start=True,
         batch_eval_metrics=True,
     )
-
 
 if __name__ == "__main__":
     
@@ -1036,7 +1103,7 @@ if __name__ == "__main__":
         encoder_idx=4,
         audio_dims=512,
         vocab=51865,
-        text_ctx=512,
+        text_ctx=256,
         text_head=4,
         decoder_idx=4,
         text_dims=512,
@@ -1045,7 +1112,7 @@ if __name__ == "__main__":
         eos_token_id=0,
         act="swish",
         debug=False,
-        cross_attention=False,
+        cross_attention=True,
 
     )
     
@@ -1066,11 +1133,17 @@ if __name__ == "__main__":
         eval_dataset=test_dataset,
         data_collator=DataCollator(),
         compute_metrics=compute_metrics,
+        # processing_class=extractor,
     )
         
     trainer.train()
-
-
         
+
+# from tensorboard import program
+# log_dir = "./output/logs" 
+# tb = program.TensorBoard()
+# tb.configure(argv=[None, '--logdir', log_dir])
+# url = tb.launch()
+# print(f"TensorBoard started at {url}")
 
 
