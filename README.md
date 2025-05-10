@@ -193,8 +193,6 @@ def custom_excepthook(exc_type, exc_value, exc_traceback):
     func_name = frame.f_code.co_name
     print(f"Error occurred in file '{filename}', line {lineno}, in function '{func_name}'")
 
-
-
 def _shape(self, tensor: torch.Tensor, ctx: int, batch: int):
     return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
 
@@ -451,9 +449,6 @@ class Rotary(nn.Module):
 
             return torch.cat([x1.type_as(x), x2], dim=-1)
 
-
-
-
 class MultiheadA(nn.Module):
     def __init__(self, dims: int, head: int, rotary=None, debug=False):
         super().__init__()
@@ -526,17 +521,6 @@ class MultiheadA(nn.Module):
         self._counter += 1
         return self.out(wv), qk.detach()
 
-
-
-
-
-
-
-
-
-
-
-
 class Residual(nn.Module):
     def __init__(self, dims: int, head: int, cross_attention = False, act = "relu", rotary=None, debug=False):
         super().__init__()
@@ -545,7 +529,8 @@ class Residual(nn.Module):
         self._rotary = rotary
         self.cross_attention = cross_attention
         self.debug = debug
-        
+        self.blend_xa = nn.Parameter(torch.tensor(0.5))
+
         act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
         self.act = act_map.get(act, nn.GELU())
 
