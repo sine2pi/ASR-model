@@ -391,9 +391,6 @@ class Rotary(nn.Module):
 
             return torch.cat([x1.type_as(x), x2], dim=-1)
 
-
-
-
 class MultiheadA(nn.Module):
     def __init__(self, dims: int, head: int, rotary=None, debug=False):
         super().__init__()
@@ -466,17 +463,6 @@ class MultiheadA(nn.Module):
         self._counter += 1
         return self.out(wv), qk.detach()
 
-
-
-
-
-
-
-
-
-
-
-
 class Residual(nn.Module):
     def __init__(self, dims: int, head: int, cross_attention = False, act = "relu", rotary=None, debug=False):
         super().__init__()
@@ -486,6 +472,7 @@ class Residual(nn.Module):
         self.cross_attention = cross_attention
         self.debug = debug
         
+        self.blend_xa = nn.Parameter(torch.tensor(0.5))
         act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
         self.act = act_map.get(act, nn.GELU())
 
@@ -521,7 +508,6 @@ class Residual(nn.Module):
         x = x + self.mlp(self.lnc(x))
         x = x + r
         return x
-
 
 class SEBlock(nn.Module):
     def __init__(self, channels, reduction=16):
@@ -673,7 +659,6 @@ class TextDecoder(nn.Module):
         logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
         return logits
 
-
 class Echo(nn.Module):
     def __init__(self, param: Dimensions):
         super().__init__()
@@ -707,7 +692,6 @@ class Echo(nn.Module):
             head=param.text_head,
             layer=param.decoder_idx,
             cross_attention=param.cross_attention,
-
         )
 
         all_head = torch.zeros(self.param.decoder_idx, self.param.text_head, dtype=torch.bool)
@@ -834,7 +818,6 @@ class Echo(nn.Module):
         for module_type, count in self.init_counts.items():
             print(f"{module_type}: {count}")
  
-
 metric = evaluate.load(path="wer")
 
 @dataclass
