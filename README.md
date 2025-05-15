@@ -56,6 +56,37 @@ The model incorporates a learnable parameter with sigmoid activation to adaptive
 
 This adaptive fusion addresses the longstanding waveform-vs-spectrogram debate in ASR by allowing the model to determine the optimal representation mix for different acoustic contexts. While feature fusion has been explored in research settings, this learnable parameter approach provides an elegant solution that maintains computational efficiency.
 
+The model also extracts and incorporates f0 contour and energy contours:
+```python
+
+
+    if extract_prosody:
+        hop_length_prosody = 160
+        f0 = torchaudio.functional.detect_pitch_frequency(
+            torch.from_numpy(wav_numpy).unsqueeze(0),  # shape: (1, N)
+            sampling_rate,
+            frame_time=hop_length_prosody / sampling_rate
+        )[0]
+        f0 = torch.nan_to_num(f0, nan=0.0)
+        f0 = (f0 - f0.mean()) / (f0.std() + 1e-8)  # normalize
+        f0 = torch.nn.functional.pad(f0, (0, max(0, 1500 - f0.shape[0])))[:1500]
+
+        wav_tensor = torch.from_numpy(wav_numpy)
+        frame_count = (wav_tensor.shape[0] - 1) // hop_length_prosody + 1
+        energy = torch.zeros(frame_count)
+        for i in range(frame_count):
+            start = i * hop_length_prosody
+            end = min(start + hop_length_prosody, wav_tensor.shape[0])
+            energy[i] = torch.sqrt(torch.mean(wav_tensor[start:end] ** 2) + 1e-8)
+        energy = torch.nn.functional.pad(energy, (0, max(0, 1500 - energy.shape[0])))[:1500]
+
+        batch["f0_contour"] = f0.float()
+        batch["energy_contour"] = energy.float()
+```
+The F0 contour and the energy contour can be used together to analyze the prosody of speech, including intonation and loudness. The F0 contour follows the lowest frequency with the most energy, which is indicated by bright colors towards the bottom of the image. 
+In summary: F0 contour represents pitch variation over time, while energy contour represents sound intensity across frequencies over time. They both play a crucial role in understanding speech prosody and can be used together to analyze emotional expressions and grammatical structures within speech. 
+
+
 
 ```python
 
