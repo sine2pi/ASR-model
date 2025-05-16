@@ -92,28 +92,46 @@ This adaptive fusion addresses the longstanding waveform-vs-spectrogram debate i
 ```python
 
 
-    if extract_prosody:
-        hop_length_prosody = 160
-        f0 = torchaudio.functional.detect_pitch_frequency(
-            torch.from_numpy(wav_numpy).unsqueeze(0),  # shape: (1, N)
-            sampling_rate,
-            frame_time=hop_length_prosody / sampling_rate
-        )[0]
+    # --- Parosody ---
+    if extract_parosody:
+        hop_length = extractor.hop_length
+        win_length = 256
+        wav = wav.unsqueeze(0) if wav.ndim == 1 else wav  
+        device = wav.device if wav.is_cuda else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        wav = wav.to(device)
+        f0 = torchcrepe.predict(wav, sampling_rate, model="tiny")
+        # f0 = torchyin.estimate(wav, sample_rate=sampling_rate, frame_stride=hop_length / sampling_rate)
         f0 = torch.nan_to_num(f0, nan=0.0)
-        f0 = (f0 - f0.mean()) / (f0.std() + 1e-8)  # normalize
-        f0 = torch.nn.functional.pad(f0, (0, max(0, 1500 - f0.shape[0])))[:1500]
+        f0 = (f0 - f0.mean()) / (f0.std() + 1e-8)
+        num_frames = f0.shape[-1]
 
-        wav_tensor = torch.from_numpy(wav_numpy)
-        frame_count = (wav_tensor.shape[0] - 1) // hop_length_prosody + 1
-        energy = torch.zeros(frame_count)
-        for i in range(frame_count):
-            start = i * hop_length_prosody
-            end = min(start + hop_length_prosody, wav_tensor.shape[0])
-            energy[i] = torch.sqrt(torch.mean(wav_tensor[start:end] ** 2) + 1e-8)
-        energy = torch.nn.functional.pad(energy, (0, max(0, 1500 - energy.shape[0])))[:1500]
+        energies = []
+        for i in range(num_frames):
+            start = int(i * hop_length)
+            end = int(start + win_length)
+            frame = wav[0, start:end]
+            if frame.numel() == 0:
+                rms = 0.0
+                power = 0.0
+            else:
+                rms = torch.sqrt(torch.mean(frame ** 2) + 1e-8).item()
+                hann = torch.hann_window(frame.numel(), device=frame.device)
+                windowed = frame * hann
+                power = torch.sum(windowed ** 2).item()
+            energies.append([rms, power])
+        energy = torch.tensor(energies, dtype=torch.float32, device=f0.device).T  # shape: (2, num_frames)
 
-        batch["f0_contour"] = f0.float()
-        batch["energy_contour"] = energy.float()
+        max_len = max(f0.shape[-1], energy.shape[-1])
+        if f0.shape[-1] < max_len:
+            f0 = F.pad(f0, (0, max_len - f0.shape[-1]), value=0.0)
+        if energy.shape[-1] < max_len:
+            energy = F.pad(energy, (0, max_len - energy.shape[-1]), value=0.0)
+
+        blend = torch.sigmoid(torch.tensor(0.5, device=f0.device))
+        parosody = blend * f0 + (1 - blend) * energy
+        target_len = current_features.shape[-1]
+        parosody = match_length(parosody, target_len)
+        batch["parosody"] = parosody#.cpu()
 ```
 The F0 contour and the energy contour can be used together to analyze the prosody of speech, including intonation and loudness. The F0 contour follows the lowest frequency with the most energy, which is indicated by bright colors towards the bottom of the image. 
 In summary: F0 contour represents pitch variation over time, while energy contour represents sound intensity across frequencies over time. They both play a crucial role in understanding speech prosody and can be used together to analyze emotional expressions and grammatical structures within speech. 
