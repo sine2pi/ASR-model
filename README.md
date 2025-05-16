@@ -7,6 +7,8 @@ In log-mel spectrograms, zero or near-zero values represent critical information
 - Low-amplitude acoustic events
 - Sub-threshold background environments
 
+The model also extracts f0 contour and energy contours.
+We use to as a feature and we then inject the frequency into the rotary at the same time as the sample hits the multihead and encoder. Frerquency is a learnable parameter.
 
 ### Multiplicative Soft Masking: Technical Implementation
 
@@ -56,7 +58,37 @@ The model incorporates a learnable parameter with sigmoid activation to adaptive
 
 This adaptive fusion addresses the longstanding waveform-vs-spectrogram debate in ASR by allowing the model to determine the optimal representation mix for different acoustic contexts. While feature fusion has been explored in research settings, this learnable parameter approach provides an elegant solution that maintains computational efficiency.
 
-The model also extracts and incorporates f0 contour and energy contours:
+
+
+```python
+# class MultiheadB(nn.Module):
+#     ...
+#     def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, kv_cache: Optional[dict] = None, decoder: Optional[bool] = False, f0: Optional[Tensor] = None):
+#         ...
+#         # Instead of qf = self.rope(q.size(1)), use f0 if provided
+#         if f0 is not None:
+#             # f0 should be shape (batch, seq_len)
+#             qf = self.rope(f0)
+#             kf = self.rope(f0)
+#         else:
+#             qf = self.rope(q.size(1))
+#             kf = self.rope(k.size(1))
+#         ...
+#         q = self.rope.apply_rotary(q, qf)
+#         k = self.rope.apply_rotary(k, kf)
+
+# class Echo(nn.Module):
+#     ...
+#     def forward(self, ..., parosody=None, ...):
+#         ...
+#         if parosody is not None:
+#             to_encoderA["f0"] = parosody  # or batch["f0_contour"]
+#         encoder_output = self.encoderA(**to_encoderA)
+#         ...
+
+```
+
+
 ```python
 
 
