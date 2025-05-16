@@ -8,7 +8,7 @@ In log-mel spectrograms, zero or near-zero values represent critical information
 - Sub-threshold background environments
 
 The model also extracts f0 contour and energy contours.
-We use to as a feature and we then inject the frequency into the rotary at the same time as the sample hits the multihead and encoder. Frerquency is a learnable parameter.
+We use them as features and we then inject the frequency into the rotary at the same time as the sample hits the multihead and encoder. Frerquency is a learnable parameter.
 
 ### Multiplicative Soft Masking: Technical Implementation
 
