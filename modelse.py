@@ -1,6 +1,9 @@
+
+
 import os
 import warnings
 import logging
+
 import torch, torchaudio
 import torchcrepe
 import torch.nn.functional as F
@@ -21,6 +24,7 @@ from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperTokeni
 import evaluate
 import transformers
 from dataclasses import dataclass
+
 from torch import nn, Tensor
 
 torch.backends.cudnn.allow_tf32 = True
@@ -94,20 +98,25 @@ def plot_waveform_and_spectrogram(x=None, w=None, p=None, per=None, sample_idx=0
         if per_np.ndim > 1:
             per_np = per_np.squeeze()
         time_spans.append(len(per_np) * hop_length / sr)
+    
     max_time = max(time_spans) if time_spans else 0
+    
     fig, axs = plt.subplots(num_plots, 1, figsize=(14, 4*num_plots), sharex=True)
     if num_plots == 1:
         axs = [axs]
+    
     if show_voiced_regions and per is not None:
         per_np = per[sample_idx].detach().cpu().numpy()
         if per_np.ndim > 1:
             per_np = per_np.squeeze()
         t_per = np.arange(len(per_np)) * hop_length / sr
+        
         threshold = 0.5
         for ax in axs:
             for i in range(len(per_np)-1):
                 if per_np[i] > threshold:
                     ax.axvspan(t_per[i], t_per[i+1], color='lightblue', alpha=0.2, zorder=0)
+    
     current_ax = 0
     
     if w is not None:
@@ -174,8 +183,9 @@ def plot_waveform_and_spectrogram(x=None, w=None, p=None, per=None, sample_idx=0
         axs[current_ax].set_xlim([0, max_time])
         axs[current_ax].grid(True, axis='both', linestyle='--', alpha=0.3)
         axs[current_ax].set_ylim([-0.05, 1.05])
+        
         axs[current_ax].axhline(y=0.5, color='k', linestyle='--', alpha=0.3)
-
+    
     if markers is not None:
         for i, t in enumerate(markers):
             label = marker_labels[i] if marker_labels and i < len(marker_labels) else None
@@ -184,11 +194,23 @@ def plot_waveform_and_spectrogram(x=None, w=None, p=None, per=None, sample_idx=0
         
         if marker_labels:
             axs[0].legend(loc='upper right', fontsize='small')
+    
     axs[-1].set_xlabel("Time (s)")
+    
     fig.suptitle(title, fontsize=16)
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     plt.show()
+
     return fig
+
+def shift_with_zeros(input_ids: torch.Tensor, pad_token_id=0, decoder_start_token_id=0):
+    shifted_input_ids = input_ids.new_zeros(input_ids.shape)
+    shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()
+    shifted_input_ids[:, 0] = decoder_start_token_id
+    if pad_token_id is None:
+        raise ValueError("self.model.config.pad_token_id has to be defined.")
+    shifted_input_ids.masked_fill_(shifted_input_ids == 0, pad_token_id)
+    return shifted_input_ids 
 
 class LayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
@@ -257,7 +279,7 @@ class rotary(nn.Module):
     def __init__(self, dims, max_ctx=1500, theta=10000, learned_freq=False, variable_radius=False,
                  learned_radius=False, debug=False):
         super().__init__()
-        self.debug = True
+        self.debug = False
         self.interpolate_factor = 10.0
         self._counter = 0
         self.dims = dims
@@ -270,7 +292,6 @@ class rotary(nn.Module):
                 requires_grad=learned_radius)
             
         self.theta = nn.Parameter(torch.tensor(float(theta)), requires_grad=False)
-        #self.bias = nn.Parameter(torch.zeros(max_ctx, dims // 2))
 
     def forward(self, x = None, f0=None) -> Tensor:
         if isinstance(x, int):
@@ -292,7 +313,7 @@ class rotary(nn.Module):
             inv_freq = self.inv_freq
 
         freqs = torch.einsum('i,j->ij', t, inv_freq)
-        #freqs = freqs + self.bias[:freqs.shape[0]]
+
         freqs = freqs.float()
         if self.variable_radius:
             radius = F.softplus(self.radius)
@@ -302,12 +323,10 @@ class rotary(nn.Module):
 
         freqs = freqs.unsqueeze(0)
         if self.debug:
-            # if self._counter == 1:
-            #     print(f'ROTA -- freqs: {freqs.shape}, x: {x},  {t.shape if x is not None else None}', freqs.shape, t.shape)
+            if self._counter == 1:
+                print(f'ROTA -- freqs: {freqs.shape}, x: {x},  {t.shape if x is not None else None}', freqs.shape, t.shape)
             if f0 is not None and self._counter % 100 == 0:
                 print(f"Step {self._counter}: Using raw F0 as theta: {f0_theta:.2f} Hz")
-
-    
             self._counter += 1
         return freqs
 
@@ -334,6 +353,7 @@ class rotary(nn.Module):
 class MultiheadA(nn.Module):
     def __init__(self, dims: int, head: int, debug=False):
         super().__init__()
+
         self.count = 0
         self.debug = debug
         self.pad_token = 0
@@ -427,7 +447,6 @@ class MultiheadB(nn.Module):
         v = self.v(z)
 
         if f0 is not None:
-            # f0 = f0.squeeze(0) if f0.ndim == 3 else f0
             qf = self.rope(q.size(1), f0=f0)
             kf = self.rope(k.size(1), f0=f0)
         else:
@@ -458,7 +477,6 @@ class MultiheadB(nn.Module):
             print(f"Step {self.count}: x: {x.shape}, xa: {xa.shape if xa is not None else None}, mask: {mask.shape if mask is not None else None}")
         self.count += 1
         return self.o(wv), qk.detach()
-
 
 class Residual(nn.Module):
     def __init__(self, dims: int, head: int, ctx, act, cross_attn=False, debug=False):
@@ -495,11 +513,9 @@ class Residual(nn.Module):
             x = blend * x + (1 - blend) * cross_out
         x = x + self.mlp(self.lnc(x))
         x = x + r
-
         if self.debug and self._counter % 10 == 0:
             print(f"Step {self._counter}: Blend factor: {self.blend_xa.item():.2f}, xa: {xa is not None}, mask: {mask is not None}, x: {x.shape}")
         self._counter += 1
-
         return x
 
 class PitchEncoder(nn.Module):
@@ -578,35 +594,33 @@ class AudioEncoder(nn.Module):
             [Residual(dims=dims, head=head, ctx=ctx, act=act, cross_attn=cross_attn, debug=debug) for _ in range(layer)] if "pitch" in features else None
         )
 
-        self.period = nn.ModuleList(
-            [featureEncoder(input_dims=1, dims=dims, head=head, layer=layer, kernel_size=5, act=nn.ReLU())] + 
-            [Residual(dims=dims, head=head, ctx=ctx, act=act, cross_attn=cross_attn, debug=debug) for _ in range(layer)] if "periodocity" in features else None
-        )
-
     def forward(self, encoder_inputs):
         if self._counter < 1 and self.debug:
             x = encoder_inputs.get("spectrogram")
             w = encoder_inputs.get("waveform")
             p = encoder_inputs.get("pitch")
-            pe = encoder_inputs.get("periodocity")
-            plot_waveform_and_spectrogram(x=x, w=w, p=p, per=pe, hop_length=128)
+            plot_waveform_and_spectrogram(x=x, w=w, p=p, hop_length=128)
 
-        f0 = encoder_inputs.get("pitch", None) 
+        if "f0" in self.features:
+            f0 = encoder_inputs.get("pitch") 
+        else:
+            f0 = None
+            
         feature_outputs = {}
 
-        if "spectrogram" in encoder_inputs:# and self.spec is not None:
+        if "spectrogram" in encoder_inputs:
             x = encoder_inputs["spectrogram"]
             for block in self.spec:
                 x = block(x, f0=f0)
             feature_outputs["spectrogram"] = x
 
-        if "waveform" in encoder_inputs:# and self.wave is not None:
+        if "waveform" in encoder_inputs:
             w = encoder_inputs["waveform"]
             for block in chain(self.wave or []):
                 w = block(w, f0=f0)
             feature_outputs["waveform"] = w
 
-        if "pitch" in encoder_inputs:# and self.pitch is not None:
+        if "pitch" in encoder_inputs:
             p = encoder_inputs["pitch"]
             for block in chain(self.pitch or []):
                 p = block(p, f0=f0)
@@ -622,8 +636,7 @@ class AudioEncoder(nn.Module):
         return feature_outputs
 
 class featureEncoder(nn.Module):
-    def __init__(self, input_dims, dims, head, layer, 
-                 kernel_size, act, stride=1, name=None):
+    def __init__(self, input_dims, dims, head, layer, kernel_size, act, stride=1, name=None):
         super().__init__()
         self.head_dim = dims // head  
         self.dropout = 0.1 
@@ -697,7 +710,6 @@ class TextDecoder(nn.Module):
             "spectrogram": nn.Parameter(torch.tensor(0.5)),
             "waveform": nn.Parameter(torch.tensor(0.5)),
             "pitch": nn.Parameter(torch.tensor(0.5)),
-            # "periodocity": nn.Parameter(torch.tensor(0.5))
             })
         
         self.ln_dec = RMSNorm(dims, **tox)
@@ -791,7 +803,7 @@ class Echo(nn.Module):
         input_ids=None,
         spectrogram: torch.Tensor=None,
         pitch: Optional[torch.Tensor]=None,
-        f0=None,
+        # f0=None,
     ) -> Dict[str, torch.Tensor]:
 
         decoder_input_ids = input_ids
@@ -802,8 +814,6 @@ class Echo(nn.Module):
             encoder_inputs["waveform"] = waveform
         if pitch is not None:
             encoder_inputs["pitch"] = pitch
-        if  f0 is not None:
-            encoder_inputs["f0"] = pitch
 
         encoder_outputs = self.encoder(encoder_inputs)
         logits = self.decoder(input_ids, encoder_outputs)
@@ -880,9 +890,7 @@ class Echo(nn.Module):
             elif isinstance(module, PitchEncoder):
                 self.init_counts["PitchEncoder"] += 1
 
-
     def init_weights(self):
-   
         print("Initializing all weights")
         self.apply(self._init_weights)
         print("Initialization summary:")
@@ -967,7 +975,6 @@ class DataCollator:
                     pad_pitch_item = pitch
                 pad_pitch.append(pad_pitch_item)
             batch["pitch"] = torch.stack(pad_pitch)
-
         return batch
 
 def match_length(tensor, target_len):
@@ -990,7 +997,6 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
                      norm=None, normalized=False, debug=False):
     
     global model, extractor
-
 
     dtype = torch.float32
     device = torch.device("cuda:0")
@@ -1037,9 +1043,6 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
 
     wav = wav.unsqueeze(0)
 
-        # "fmin": 150,
-        # "fmax": 600,
-
     if pitch:
         pit = torchcrepe.predict(
             wav, 
@@ -1054,40 +1057,12 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
             pad=False
         )
         
-    if periodocity:
-        pit, period = torchcrepe.predict(
-            wav, 
-            sampling_rate, 
-            hop_length,
-            fmin=150,
-            fmax=600,
-            model="tiny",
-            decoder=torchcrepe.decode.viterbi,
-            return_periodicity=True, 
-            device=device, 
-            pad=False
-        )
-        
-        silence_threshold = torchcrepe.threshold.Silence(value=-100)
-        period = silence_threshold(
-            period, 
-            wav, 
-            sample_rate=sampling_rate, 
-            hop_length=hop_length, 
-            pad=False
-        )
-     
-        energy = torch.mean(torch.abs(wav), dim=0)
-        energy = energy.unsqueeze(0)
-        target_length = spec.shape[-1]
-        
     if waveforms:
         batch["waveform"] = wav
     if pitch:
         batch["pitch"] = pit
     if spectrogram:
         batch["spectrogram"] = spec
-
     batch["labels"] = tokenizer.encode(batch["transcription"], add_special_tokens=False)
     return batch
 
@@ -1364,7 +1339,7 @@ def main():
         "spectrogram", # uncomment to use spectrogram
         "waveform", # uncomment to use waveform
         "pitch", # uncomment to use pitch
-        "f0", # uncomment with pitch to use frequency as theta in rotary
+        #"f0", # uncomment to use frequency in rotary
         },
         )
     
@@ -1375,7 +1350,6 @@ def main():
         "spectrogram": True,
         "waveforms": True,
         "pitch": True,
-        "f0": True,
         "hop_length": 128,
         "fmin": 150,
         "fmax": 2000,
@@ -1392,7 +1366,6 @@ def main():
         "normalized": False,
         "debug": True,
         }
-    
     
     metrics_fn = partial(compute_metrics, print_pred=True, num_samples=1, tokenizer=tokenizer)
     print(f"{'Sanity check' if sanity_check else 'Training'} mode")
@@ -1415,4 +1388,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
