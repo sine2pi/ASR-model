@@ -70,7 +70,7 @@ optionally map audio frequency to theta in the rotary embedding during training.
         #"f0", # uncomment with pitch to use frequency as theta in rotary
         },
 
-
+For periodocity, set pitch and periodocity to true in the config.
 
 ```python
 import os
