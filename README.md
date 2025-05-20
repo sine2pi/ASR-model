@@ -1,5 +1,7 @@
 ## Zero-Value Processing in Speech Attention
 
+This model learns each audio feature in seperate layers in sequence each feature building on the other. Like human reinforcment learning. You can change the order of feature learned. Waveform spectrogram and pitch.
+
 ### The Significance of Zeros in Audio Processing
 
 In log-mel spectrograms, zero or near-zero values represent critical information:
@@ -50,9 +52,11 @@ This design intentionally minimizes the start token's influence.. if the model p
 Pitch/frequency/waveform/spectrogram are options.
 
 The F0 contour and the energy contour can be used together to analyze the prosody of speech, including intonation and loudness. The F0 contour follows the lowest frequency with the most energy, which is indicated by bright colors towards the bottom of the image. 
-F0 contour represents pitch variation over time, while energy contour represents sound intensity across frequencies over time. They both play a crucial role in understanding speech prosody and can be used together to analyze emotional expressions and grammatical structures within speech. I've compined these as pitch and f0 can be optionally mapped to the rotary embedding theta value / per step.
+F0 contour represents pitch variation over time, while energy contour represents sound intensity across frequencies over time. They both play a crucial role in understanding speech prosody and can be used together to analyze emotional expressions and grammatical structures within speech. 
 
-Pptionally map audio frequency to theta in the rotary embedding during training. This model learns each audio feature in seperate layers in sequence each feature building on the other. Like human reinforcment learning. You can change the order of feature learned. 
+I've combined these (and periodicity) as an optional pitch feature while f0 can be optionally mapped to the rotary embedding theta value / per step during training.
+
+This model learns each audio feature in seperate layers in sequence each feature building on the other. Like human reinforcment learning. You can change the order of feature learned. 
 
     feature_order = ["pitch", "spectrogram", "waveform"]
     
