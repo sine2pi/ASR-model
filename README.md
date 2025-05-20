@@ -73,6 +73,7 @@ This model learns each audio feature in seperate layers in sequence each feature
 import os
 import warnings
 import logging
+
 import torch, torchaudio
 import torchcrepe
 import torch.nn.functional as F
@@ -93,6 +94,7 @@ from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperTokeni
 import evaluate
 import transformers
 from dataclasses import dataclass
+
 from torch import nn, Tensor
 
 torch.backends.cudnn.allow_tf32 = True
@@ -106,11 +108,6 @@ torch.set_default_dtype(dtype)
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 tox = {"device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"), "dtype": torch.float32}
-
-# %xmode Minimal
-# %xmode Plain
-# %xmode Context
-# %xmode Verbose
 
 extractor = None
 tokenizer = None
@@ -273,7 +270,6 @@ def plot_waveform_and_spectrogram(x=None, w=None, p=None, per=None, sample_idx=0
     fig.suptitle(title, fontsize=16)
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     plt.show()
-
     return fig
 
 def shift_with_zeros(input_ids: torch.Tensor, pad_token_id=0, decoder_start_token_id=0):
@@ -352,7 +348,7 @@ class rotary(nn.Module):
     def __init__(self, dims, max_ctx=1500, theta=10000, learned_freq=False, variable_radius=False,
                  learned_radius=False, debug=False):
         super().__init__()
-        self.debug = False
+        self.debug = True
         self.interpolate_factor = 10.0
         self._counter = 0
         self.dims = dims
@@ -397,12 +393,12 @@ class rotary(nn.Module):
 
         freqs = freqs.unsqueeze(0)
         if self.debug:
-            if self._counter == 1:
-                print(f'ROTA -- freqs: {freqs.shape}, x: {x},  {t.shape if x is not None else None}', freqs.shape, t.shape)
-            if f0 is not None and self._counter % 10 == 0:
+            # if self._counter == 1:
+            #     print(f'ROTA -- freqs: {freqs.shape}, x: {x},  {t.shape if x is not None else None}', freqs.shape, t.shape)
+            if f0 is not None and self._counter % 100 == 0:
                 print(f"Step {self._counter}: Using raw F0 as theta: {f0_theta:.2f} Hz")
-    
-            self._counter += 1
+
+                self._counter += 1
         return freqs
 
     @staticmethod
@@ -425,10 +421,10 @@ class rotary(nn.Module):
             x1 = torch.view_as_real(x1).flatten(-2)
             return torch.cat([x1.type_as(x), x2], dim=-1)
 
+
 class MultiheadA(nn.Module):
     def __init__(self, dims: int, head: int, debug=False):
         super().__init__()
-
         self.count = 0
         self.debug = debug
         self.pad_token = 0
@@ -593,7 +589,6 @@ class Residual(nn.Module):
         if self.debug and self._counter % 10 == 0:
             print(f"Step {self._counter}: Blend factor: {self.blend_xa.item():.2f}, xa: {xa is not None}, mask: {mask is not None}, x: {x.shape}")
         self._counter += 1
-
         return x
 
 class PitchEncoder(nn.Module):
@@ -643,6 +638,7 @@ class WavefeatureEncoder(nn.Module):
         x = x + self.positional_embedding(x.shape[1]).to(x.device, x.dtype)
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
         return self.norm(x)
+
 
 class AudioEncoder(nn.Module):
     def __init__(self, mels, dims, head, ctx, layer, act, debug, features, cross_attn=False):
@@ -1058,34 +1054,6 @@ class DataCollator:
             batch["input_ids"] = torch.tensor(all_input_ids, dtype=torch.long)
             batch["labels"] = torch.tensor(all_labels, dtype=torch.long)
 
-        if "f0_contour" in features[0] and features[0]["f0_contour"] is not None:
-            f0_list = [f["f0_contour"] for f in features]
-            max_len_f0 = max(f.shape[-1] for f in f0_list)
-            pad_f0 = []
-            for f0 in f0_list:
-                current_len = f0.shape[-1]
-                padding = max_len_f0 - current_len
-                if padding > 0:
-                    pad_f0_item = F.pad(f0, (0, padding), mode='constant', value=spec_pad)
-                else:
-                    pad_f0_item = f0
-                pad_f0.append(pad_f0_item)
-            batch["f0_contour"] = torch.stack(pad_f0)
-
-        if "energy_contour" in features[0] and features[0]["energy_contour"] is not None:
-            energy_list = [f["energy_contour"] for f in features]
-            max_len_energy = max(e.shape[-1] for e in energy_list)
-            pad_energy = []
-            for energy in energy_list:
-                current_len = energy.shape[-1]
-                padding = max_len_energy - current_len
-                if padding > 0:
-                    pad_energy_item = F.pad(energy, (0, padding), mode='constant', value=spec_pad)
-                else:
-                    pad_energy_item = energy
-                pad_energy.append(pad_energy_item)
-            batch["energy_contour"] = torch.stack(pad_energy)
-
         if "pitch" in features[0] and features[0]["pitch"] is not None:
             pitch_list = [f["pitch"] for f in features]
             max_len_pitch = max(e.shape[-1] for e in pitch_list)
@@ -1136,6 +1104,7 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
     
     global model, extractor
 
+
     dtype = torch.float32
     device = torch.device("cuda:0")
     audio = batch["audio"]
@@ -1181,25 +1150,36 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
 
     wav = wav.unsqueeze(0)
 
-        # "fmin": 150,
-        # "fmax": 600,
 
-    if pitch or f0_contour:
+    if pitch:
+        pit = torchcrepe.predict(
+            wav, 
+            sampling_rate, 
+            hop_length,
+            fmin=150,
+            fmax=600,
+            model="tiny",
+            decoder=torchcrepe.decode.viterbi,
+            return_periodicity=False, 
+            device=device, 
+            pad=False
+        )
+        
+    if periodocity:
         pit, period = torchcrepe.predict(
             wav, 
             sampling_rate, 
             hop_length,
             fmin=150,
             fmax=600,
-            model="full",
+            model="tiny",
             decoder=torchcrepe.decode.viterbi,
             return_periodicity=True, 
             device=device, 
             pad=False
         )
+        
         silence_threshold = torchcrepe.threshold.Silence(value=-100)
-
-    if periodocity:
         period = silence_threshold(
             period, 
             wav, 
@@ -1216,10 +1196,6 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
         batch["waveform"] = wav
     if pitch:
         batch["pitch"] = pit
-    if f0_contour:
-        batch["f0_contour"] = pit
-    if energy_contour:
-        batch["energy_contour"] = energy
     if periodocity:
         batch["periodocity"] = period
     if spectrogram:
@@ -1227,6 +1203,7 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
 
     batch["labels"] = tokenizer.encode(batch["transcription"], add_special_tokens=False)
     return batch
+
 
 def compute_metrics(eval_pred, compute_result: bool = True, print_pred: bool = False, num_samples: int = 0, tokenizer=None):
     global extractor, model, optimizer, scheduler
@@ -1349,8 +1326,6 @@ def prepare_datasets(
             "spectrogram": True,
             "waveforms": True,
             "pitch": True,
-            "f0_contour": False if sanity_check else True,
-            "energy_contour": False if sanity_check else True,
             "periodocity": True,
             "hop_length": 128,
             "fmin": 50,
@@ -1500,8 +1475,8 @@ def main():
         cross_attn=False,
         features = {
         "spectrogram", # uncomment to use spectrogram
-        #"waveform", # uncomment to use waveform
-        #"pitch", # uncomment to use pitch
+        "waveform", # uncomment to use waveform
+        "pitch", # uncomment to use pitch
         #"periodocity", # uncomment to use periodocity
         #"f0", # uncomment with pitch to use frequency as theta in rotary
         },
@@ -1512,10 +1487,8 @@ def main():
 
     dataset_config = {
         "spectrogram": True,
-        "waveforms": False,
-        "pitch": False,
-        "f0_contour": False,
-        "energy_contour": False,
+        "waveforms": True,
+        "pitch": True,
         "periodocity": False,
         "hop_length": 128,
         "fmin": 150,
@@ -1533,7 +1506,8 @@ def main():
         "normalized": False,
         "debug": True,
         }
-        
+    
+    
     metrics_fn = partial(compute_metrics, print_pred=True, num_samples=1, tokenizer=tokenizer)
     print(f"{'Sanity check' if sanity_check else 'Training'} mode")
     train_dataset, test_dataset = prepare_datasets(
@@ -1555,8 +1529,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
 
 
