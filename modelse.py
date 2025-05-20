@@ -1,7 +1,6 @@
 import os
 import warnings
 import logging
-
 import torch, torchaudio
 import torchcrepe
 import torch.nn.functional as F
@@ -22,7 +21,6 @@ from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperTokeni
 import evaluate
 import transformers
 from dataclasses import dataclass
-
 from torch import nn, Tensor
 
 torch.backends.cudnn.allow_tf32 = True
@@ -96,25 +94,20 @@ def plot_waveform_and_spectrogram(x=None, w=None, p=None, per=None, sample_idx=0
         if per_np.ndim > 1:
             per_np = per_np.squeeze()
         time_spans.append(len(per_np) * hop_length / sr)
-    
     max_time = max(time_spans) if time_spans else 0
-    
     fig, axs = plt.subplots(num_plots, 1, figsize=(14, 4*num_plots), sharex=True)
     if num_plots == 1:
         axs = [axs]
-    
     if show_voiced_regions and per is not None:
         per_np = per[sample_idx].detach().cpu().numpy()
         if per_np.ndim > 1:
             per_np = per_np.squeeze()
         t_per = np.arange(len(per_np)) * hop_length / sr
-        
         threshold = 0.5
         for ax in axs:
             for i in range(len(per_np)-1):
                 if per_np[i] > threshold:
                     ax.axvspan(t_per[i], t_per[i+1], color='lightblue', alpha=0.2, zorder=0)
-    
     current_ax = 0
     
     if w is not None:
@@ -181,9 +174,8 @@ def plot_waveform_and_spectrogram(x=None, w=None, p=None, per=None, sample_idx=0
         axs[current_ax].set_xlim([0, max_time])
         axs[current_ax].grid(True, axis='both', linestyle='--', alpha=0.3)
         axs[current_ax].set_ylim([-0.05, 1.05])
-        
         axs[current_ax].axhline(y=0.5, color='k', linestyle='--', alpha=0.3)
-    
+
     if markers is not None:
         for i, t in enumerate(markers):
             label = marker_labels[i] if marker_labels and i < len(marker_labels) else None
@@ -192,22 +184,11 @@ def plot_waveform_and_spectrogram(x=None, w=None, p=None, per=None, sample_idx=0
         
         if marker_labels:
             axs[0].legend(loc='upper right', fontsize='small')
-    
     axs[-1].set_xlabel("Time (s)")
-    
     fig.suptitle(title, fontsize=16)
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     plt.show()
     return fig
-
-def shift_with_zeros(input_ids: torch.Tensor, pad_token_id=0, decoder_start_token_id=0):
-    shifted_input_ids = input_ids.new_zeros(input_ids.shape)
-    shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()
-    shifted_input_ids[:, 0] = decoder_start_token_id
-    if pad_token_id is None:
-        raise ValueError("self.model.config.pad_token_id has to be defined.")
-    shifted_input_ids.masked_fill_(shifted_input_ids == 0, pad_token_id)
-    return shifted_input_ids 
 
 class LayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
@@ -326,7 +307,8 @@ class rotary(nn.Module):
             if f0 is not None and self._counter % 100 == 0:
                 print(f"Step {self._counter}: Using raw F0 as theta: {f0_theta:.2f} Hz")
 
-                self._counter += 1
+    
+            self._counter += 1
         return freqs
 
     @staticmethod
@@ -348,7 +330,6 @@ class rotary(nn.Module):
             x1 = x1 * freqs
             x1 = torch.view_as_real(x1).flatten(-2)
             return torch.cat([x1.type_as(x), x2], dim=-1)
-
 
 class MultiheadA(nn.Module):
     def __init__(self, dims: int, head: int, debug=False):
@@ -478,6 +459,7 @@ class MultiheadB(nn.Module):
         self.count += 1
         return self.o(wv), qk.detach()
 
+
 class Residual(nn.Module):
     def __init__(self, dims: int, head: int, ctx, act, cross_attn=False, debug=False):
         super().__init__()
@@ -517,6 +499,7 @@ class Residual(nn.Module):
         if self.debug and self._counter % 10 == 0:
             print(f"Step {self._counter}: Blend factor: {self.blend_xa.item():.2f}, xa: {xa is not None}, mask: {mask is not None}, x: {x.shape}")
         self._counter += 1
+
         return x
 
 class PitchEncoder(nn.Module):
@@ -567,7 +550,6 @@ class WavefeatureEncoder(nn.Module):
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
         return self.norm(x)
 
-
 class AudioEncoder(nn.Module):
     def __init__(self, mels, dims, head, ctx, layer, act, debug, features, cross_attn=False):
         super().__init__()
@@ -608,8 +590,8 @@ class AudioEncoder(nn.Module):
             p = encoder_inputs.get("pitch")
             pe = encoder_inputs.get("periodocity")
             plot_waveform_and_spectrogram(x=x, w=w, p=p, per=pe, hop_length=128)
-            
-        f0 = encoder_inputs.get("pitch", None) and "f0" in self.features
+
+        f0 = encoder_inputs.get("pitch", None) 
         feature_outputs = {}
 
         if "spectrogram" in encoder_inputs:# and self.spec is not None:
@@ -629,12 +611,6 @@ class AudioEncoder(nn.Module):
             for block in chain(self.pitch or []):
                 p = block(p, f0=f0)
             feature_outputs["pitch"] = p
-
-        if "periodocity" in encoder_inputs:# and self.period is not None:
-            pe = encoder_inputs["periodocity"]
-            for block in chain(self.period or []):
-                pe = block(pe, f0=f0)
-            feature_outputs["periodocity"] = pe
 
         if self._counter % 10 == 0 and self.debug:
             feature_names = list(feature_outputs.keys())
@@ -715,17 +691,13 @@ class TextDecoder(nn.Module):
             "pitch": nn.ModuleList([
                 Residual(dims=dims, head=head, ctx=ctx, act="gelu", cross_attn=cross_attn, debug=debug)
                 for _ in range(layer)] if "pitch" in features else None
-        ),
-            "periodocity": nn.ModuleList([
-                Residual(dims=dims, head=head, ctx=ctx, act="gelu", cross_attn=cross_attn, debug=debug)
-                for _ in range(layer)] if "periodocity" in features else None
         )})
         
         self.feature_blend = nn.ParameterDict({
             "spectrogram": nn.Parameter(torch.tensor(0.5)),
             "waveform": nn.Parameter(torch.tensor(0.5)),
             "pitch": nn.Parameter(torch.tensor(0.5)),
-            "periodocity": nn.Parameter(torch.tensor(0.5))
+            # "periodocity": nn.Parameter(torch.tensor(0.5))
             })
         
         self.ln_dec = RMSNorm(dims, **tox)
@@ -734,7 +706,7 @@ class TextDecoder(nn.Module):
      
     def forward(self, x, encoder_outputs, feature_order=None) -> Tensor:
         if feature_order is None:
-            feature_order = ["pitch", "periodocity", "spectrogram", "waveform"]
+            feature_order = ["pitch", "spectrogram", "waveform"]
         x = x.to(device=device)
         mask = self.mask[:x.shape[1], :x.shape[1]]
         x = (self.token_embedding(x) + self.positional_embedding[:x.shape[1]])
@@ -819,7 +791,7 @@ class Echo(nn.Module):
         input_ids=None,
         spectrogram: torch.Tensor=None,
         pitch: Optional[torch.Tensor]=None,
-        periodocity=None,
+        f0=None,
     ) -> Dict[str, torch.Tensor]:
 
         decoder_input_ids = input_ids
@@ -830,8 +802,8 @@ class Echo(nn.Module):
             encoder_inputs["waveform"] = waveform
         if pitch is not None:
             encoder_inputs["pitch"] = pitch
-        if  periodocity is not None:
-            encoder_inputs["periodocity"] = periodocity
+        if  f0 is not None:
+            encoder_inputs["f0"] = pitch
 
         encoder_outputs = self.encoder(encoder_inputs)
         logits = self.decoder(input_ids, encoder_outputs)
@@ -996,19 +968,6 @@ class DataCollator:
                 pad_pitch.append(pad_pitch_item)
             batch["pitch"] = torch.stack(pad_pitch)
 
-        if "periodocity" in features[0] and features[0]["periodocity"] is not None:
-            par_list = [f["periodocity"] for f in features]
-            max_len_par = max(e.shape[-1] for e in par_list)
-            pad_par = []
-            for par in par_list:
-                current_len = par.shape[-1]
-                padding = max_len_par - current_len
-                if padding > 0:
-                    pad_par_item = F.pad(par, (0, padding), mode='constant', value=spec_pad)
-                else:
-                    pad_par_item = par
-                pad_par.append(pad_par_item)
-            batch["periodocity"] = torch.stack(pad_par)
         return batch
 
 def match_length(tensor, target_len):
@@ -1025,7 +984,7 @@ def exact_div(x, y):
     assert x % y == 0
     return x // y
 
-def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=True, f0_contour=True, energy_contour=False, periodocity=False,
+def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=True, f0=True, energy_contour=False, periodocity=False,
                      hop_length=128, fmin=0, fmax=8000, n_mels=128, n_fft=1024, sampling_rate=16000, pad_value=0.0,
                      pad_mode="constant", center=True, power=2.0, window_fn=torch.hann_window, mel_scale="htk", 
                      norm=None, normalized=False, debug=False):
@@ -1078,6 +1037,8 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
 
     wav = wav.unsqueeze(0)
 
+        # "fmin": 150,
+        # "fmax": 600,
 
     if pitch:
         pit = torchcrepe.predict(
@@ -1124,8 +1085,6 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
         batch["waveform"] = wav
     if pitch:
         batch["pitch"] = pit
-    if periodocity:
-        batch["periodocity"] = period
     if spectrogram:
         batch["spectrogram"] = spec
 
@@ -1254,7 +1213,7 @@ def prepare_datasets(
             "spectrogram": True,
             "waveforms": True,
             "pitch": True,
-            "periodocity": True,
+            "f0": False if sanity_check else True,
             "hop_length": 128,
             "fmin": 50,
             "fmax": 2000,
@@ -1405,8 +1364,7 @@ def main():
         "spectrogram", # uncomment to use spectrogram
         "waveform", # uncomment to use waveform
         "pitch", # uncomment to use pitch
-        #"periodocity", # uncomment to use periodocity
-        #"f0", # uncomment with pitch to use frequency as theta in rotary
+        "f0", # uncomment with pitch to use frequency as theta in rotary
         },
         )
     
@@ -1417,7 +1375,7 @@ def main():
         "spectrogram": True,
         "waveforms": True,
         "pitch": True,
-        "periodocity": False,
+        "f0": True,
         "hop_length": 128,
         "fmin": 150,
         "fmax": 2000,
