@@ -12,13 +12,6 @@ We use them as features and we then inject the frequency into the rotary at the 
 
 ### Multiplicative Soft Masking: Technical Implementation
 
-```python
-token_ids = k[:, :, :, 0].to(q.device, q.dtype)
-scaled_zero = torch.ones_like(token_ids).to(q.device, q.dtype)
-scaled_zero[token_ids == 0] = 0.000001
-scaling_factors = scaled_mask.unsqueeze(0) * scaled_zero.unsqueeze(-2).expand(qk.shape)
-```
-
 1. **Semantic Preservation of Silence**: Unlike conventional `-inf` masking that eliminates attention, this approach maintains minimal attention flow (0.000001) for silence tokens, preserving their semantic value.
 
 2. **Prosodic Pattern Recognition**: By allowing minimal attention to silent regions, the model can learn timing, rhythm, and prosodic features critical for speech understanding.
