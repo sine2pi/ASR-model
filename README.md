@@ -45,32 +45,25 @@ The critical question is: Does a model need the start token to initialize proper
 
 This design intentionally minimizes the start token's influence.. if the model performs well, then this could be a novel and interesting approach to sequence generation.
 
-## Adaptive Audio Feature Fusion
+## Adaptive Audio Features
 
-The model incorporates a learnable parameter with sigmoid activation to adaptively blend waveform and spectrogram encodings. Initial findings demonstrate significant WER (Word Error Rate) reduction compared to single-representation approaches, with minimal computational overhead increase.
-Pitch/frequency/periodicity are options as well.
-
-This adaptive fusion addresses the longstanding waveform-vs-spectrogram debate in ASR by allowing the model to determine the optimal representation mix for different acoustic contexts. While feature fusion has been explored in research settings, this learnable parameter approach provides an elegant solution that maintains computational efficiency.
-
-Pitch/frequency/periodicity are options as well.
+Pitch/frequency/waveform/spectrogram are options.
 
 The F0 contour and the energy contour can be used together to analyze the prosody of speech, including intonation and loudness. The F0 contour follows the lowest frequency with the most energy, which is indicated by bright colors towards the bottom of the image. 
-In summary: F0 contour represents pitch variation over time, while energy contour represents sound intensity across frequencies over time. They both play a crucial role in understanding speech prosody and can be used together to analyze emotional expressions and grammatical structures within speech. 
+F0 contour represents pitch variation over time, while energy contour represents sound intensity across frequencies over time. They both play a crucial role in understanding speech prosody and can be used together to analyze emotional expressions and grammatical structures within speech. I've compined these as pitch and f0 can be optionally mapped to the rotary embedding theta value / per step.
 
-optionally map audio frequency to theta in the rotary embedding during training. This model learns each audio feature in seperate layers in sequence each feature building on the other. Like human reinforcment learning. You can change the order of feature learned. 
+Pptionally map audio frequency to theta in the rotary embedding during training. This model learns each audio feature in seperate layers in sequence each feature building on the other. Like human reinforcment learning. You can change the order of feature learned. 
 
-    feature_order = ["pitch", "periodocity", "spectrogram", "waveform"]
-
+    feature_order = ["pitch", "spectrogram", "waveform"]
     
         features = {
         #"spectrogram", # uncomment to use spectrogram
         #"waveform", # uncomment to use waveform
         #"pitch", # uncomment to use pitch
-        #"periodocity", # uncomment to use periodocity
         #"f0", # uncomment with pitch to use frequency as theta in rotary
         },
 
-For periodocity, set pitch and periodocity to true in the config.
+
 
 ```python
 import os
