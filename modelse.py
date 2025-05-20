@@ -654,12 +654,13 @@ class featureEncoder(nn.Module):
         return x
 
 class TextDecoder(nn.Module):
-    def __init__(self, vocab: int, layer: int, dims: int, head: int, ctx: int, cross_attn, features, debug=False):
+    def __init__(self, vocab: int, layer: int, dims: int, head: int, ctx: int, cross_attn, features, debug, sequential=False): 
         super().__init__()
         self._counter = 0
         self.dropout = 0.1
         self.debug = debug
-        
+        self.sequential = sequential
+
         self.token_embedding = nn.Embedding(num_embeddings=vocab, embedding_dim=dims)
         with torch.no_grad():
             self.token_embedding.weight[0].zero_()
@@ -693,7 +694,7 @@ class TextDecoder(nn.Module):
         self.ln_dec = RMSNorm(dims, **tox)
         mask = torch.tril(torch.ones(ctx, ctx), diagonal=0)        
         self.register_buffer("mask", mask, persistent=False)
-     
+
     def forward(self, x, encoder_outputs, feature_order=None) -> Tensor:
         if feature_order is None:
             feature_order = ["pitch", "spectrogram", "waveform"]
@@ -704,17 +705,18 @@ class TextDecoder(nn.Module):
         for layer in self.self_attn_layers:
             x = layer(x, mask=mask)
         text_only = x
+
         for feature in feature_order:
             if feature in encoder_outputs:
                 encoding = encoder_outputs[feature]
                 output = x
                 for layer in self.processors[feature]:
-                    output = layer(output, 
-                    xa=encoding, mask=mask)
-                alpha = torch.sigmoid(self.feature_blend[feature])
-                x = alpha * output + (1 - alpha) * x
-                if self.debug:
-                    print(f"Blend weight for {feature}: {alpha.item():.3f}")
+                    output = layer(output, xa=encoding, mask=mask)
+                if self.sequential:
+                    x = output
+                else:
+                    alpha = torch.sigmoid(self.feature_blend[feature])
+                    x = alpha * output + (1 - alpha) * x
         x = self.ln_dec(x)
         logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
         return logits
