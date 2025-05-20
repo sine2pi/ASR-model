@@ -3,7 +3,6 @@
 import os
 import warnings
 import logging
-
 import torch, torchaudio
 import torchcrepe
 import torch.nn.functional as F
@@ -68,11 +67,9 @@ class Dimensions:
 def plot_waveform_and_spectrogram(x=None, w=None, p=None, per=None, sample_idx=0, sr=16000, hop_length=160, 
                                  title="Waveform and Spectrogram", markers=None, marker_labels=None, 
                                  show_voiced_regions=True, show_energy=True):
-
     num_plots = sum([x is not None, w is not None, p is not None, per is not None])
     if num_plots == 0:
         raise ValueError("No data to plot. Please provide at least one input tensor.")
-    
     time_spans = []
     
     if w is not None:
@@ -80,45 +77,36 @@ def plot_waveform_and_spectrogram(x=None, w=None, p=None, per=None, sample_idx=0
         if w_np.ndim > 1:
             w_np = w_np.squeeze()
         time_spans.append(len(w_np) / sr)
-    
     if x is not None:
         x_np = x[sample_idx].detach().cpu().numpy()
         if x_np.shape[0] < x_np.shape[1]:
             x_np = x_np.T
         time_spans.append(x_np.shape[0] * hop_length / sr)
-    
     if p is not None:
         p_np = p[sample_idx].detach().cpu().numpy()
         if p_np.ndim > 1:
             p_np = p_np.squeeze()
         time_spans.append(len(p_np) * hop_length / sr)
-    
     if per is not None:
         per_np = per[sample_idx].detach().cpu().numpy()
         if per_np.ndim > 1:
             per_np = per_np.squeeze()
         time_spans.append(len(per_np) * hop_length / sr)
-    
     max_time = max(time_spans) if time_spans else 0
-    
     fig, axs = plt.subplots(num_plots, 1, figsize=(14, 4*num_plots), sharex=True)
     if num_plots == 1:
         axs = [axs]
-    
     if show_voiced_regions and per is not None:
         per_np = per[sample_idx].detach().cpu().numpy()
         if per_np.ndim > 1:
             per_np = per_np.squeeze()
         t_per = np.arange(len(per_np)) * hop_length / sr
-        
         threshold = 0.5
         for ax in axs:
             for i in range(len(per_np)-1):
                 if per_np[i] > threshold:
                     ax.axvspan(t_per[i], t_per[i+1], color='lightblue', alpha=0.2, zorder=0)
-    
     current_ax = 0
-    
     if w is not None:
         w_np = w[sample_idx].detach().cpu().numpy()
         if w_np.ndim > 1:
@@ -133,13 +121,11 @@ def plot_waveform_and_spectrogram(x=None, w=None, p=None, per=None, sample_idx=0
             for i in range(0, len(w_np)-frame_length, hop_length_energy):
                 frame = w_np[i:i+frame_length]
                 energy.append(np.sqrt(np.mean(frame**2)))
-                
             energy = np.array(energy)
             energy = energy / np.max(energy) * 0.8 * max(abs(w_np.min()), abs(w_np.max()))  
             t_energy = np.arange(len(energy)) * hop_length_energy / sr
             axs[current_ax].plot(t_energy, energy, color="red", alpha=0.7, label="Energy")
             axs[current_ax].legend(loc='upper right')
-            
         axs[current_ax].set_title("Waveform")
         axs[current_ax].set_ylabel("Amplitude")
         axs[current_ax].set_xlim([0, max_time])
@@ -183,7 +169,6 @@ def plot_waveform_and_spectrogram(x=None, w=None, p=None, per=None, sample_idx=0
         axs[current_ax].set_xlim([0, max_time])
         axs[current_ax].grid(True, axis='both', linestyle='--', alpha=0.3)
         axs[current_ax].set_ylim([-0.05, 1.05])
-        
         axs[current_ax].axhline(y=0.5, color='k', linestyle='--', alpha=0.3)
     
     if markers is not None:
@@ -191,16 +176,12 @@ def plot_waveform_and_spectrogram(x=None, w=None, p=None, per=None, sample_idx=0
             label = marker_labels[i] if marker_labels and i < len(marker_labels) else None
             for ax in axs:
                 ax.axvline(x=t, color='k', linestyle='-', alpha=0.7, label=label if i == 0 else None)
-        
         if marker_labels:
             axs[0].legend(loc='upper right', fontsize='small')
-    
     axs[-1].set_xlabel("Time (s)")
-    
     fig.suptitle(title, fontsize=16)
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     plt.show()
-
     return fig
 
 def shift_with_zeros(input_ids: torch.Tensor, pad_token_id=0, decoder_start_token_id=0):
@@ -220,7 +201,6 @@ class RMSNorm(nn.RMSNorm):
     def __init__(self, dims: Union[int, Tensor, List, Tuple], eps = 1e-8, elementwise_affine = True, device=torch.device(device="cuda:0"), dtype=torch.float32):
         tox = {"device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"), "dtype": torch.float32}
         if isinstance(dims, int):
-            
             self.normalized_shape = (dims,)
         else:
             self.normalized_shape = tuple(dims)
@@ -311,7 +291,6 @@ class rotary(nn.Module):
             inv_freq = 1.0 / (f0_theta ** (torch.arange(0, self.dims, 2, device=device) / self.dims))
         else:
             inv_freq = self.inv_freq
-
         freqs = torch.einsum('i,j->ij', t, inv_freq)
 
         freqs = freqs.float()
@@ -320,7 +299,6 @@ class rotary(nn.Module):
             freqs = torch.polar(radius.unsqueeze(0).expand_as(freqs), freqs)
         else:
             freqs = torch.polar(torch.ones_like(freqs), freqs)
-
         freqs = freqs.unsqueeze(0)
         if self.debug:
             if self._counter == 1:
@@ -803,7 +781,6 @@ class Echo(nn.Module):
         input_ids=None,
         spectrogram: torch.Tensor=None,
         pitch: Optional[torch.Tensor]=None,
-        # f0=None,
     ) -> Dict[str, torch.Tensor]:
 
         decoder_input_ids = input_ids
@@ -1066,7 +1043,6 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
     batch["labels"] = tokenizer.encode(batch["transcription"], add_special_tokens=False)
     return batch
 
-
 def compute_metrics(eval_pred, compute_result: bool = True, print_pred: bool = False, num_samples: int = 0, tokenizer=None):
     global extractor, model, optimizer, scheduler
     tokenizer.pad_token_id = 0
@@ -1144,8 +1120,6 @@ def compute_metrics(eval_pred, compute_result: bool = True, print_pred: bool = F
     }
     return metrics
 
-logger = logging.getLogger(__name__)
-
 def create_model(param: Dimensions) -> Echo:
     model = Echo(param).to('cuda')
     model.init_weights()
@@ -1168,7 +1142,6 @@ def setup_tokenizer(token: str, local_tokenizer_path: str = "./tokenizer") -> Wh
         token=token,
         local_files_only=True,
     )
-    
     tokenizer.pad_token_id = 0
     tokenizer.bos_token_id = 0
     tokenizer.eos_token_id = 0
