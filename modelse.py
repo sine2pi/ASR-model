@@ -878,7 +878,7 @@ class Echo(nn.Module):
                 print(f"{module_type}: {count}")
 
 metric = evaluate.load(path="wer")
-logger = logging.getLogger(__name__)
+
 @dataclass
 class DataCollator:
     tokenizer: WhisperTokenizer
@@ -1122,6 +1122,8 @@ def compute_metrics(eval_pred, compute_result: bool = True, print_pred: bool = F
     }
     return metrics
 
+logger = logging.getLogger(__name__)
+
 def create_model(param: Dimensions) -> Echo:
     model = Echo(param).to('cuda')
     model.init_weights()
@@ -1183,7 +1185,7 @@ def prepare_datasets(
     dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000))
     
     if sanity_check:
-        dataset = dataset["test"].take(100)
+        dataset = dataset["test"].take(10)
         dataset = dataset.select_columns(["audio", "transcription"])
         logger.info(f"Sanity dataset size: {dataset.num_rows}")
         
@@ -1274,9 +1276,9 @@ def main():
             training_args = get_training_args(
                 log_dir,
                 batch_eval_metrics=False,
-                max_steps=2,
+                max_steps=10,
                 save_steps=0,
-                eval_steps=100,
+                eval_steps=1,
                 warmup_steps=0,
                 learning_rate=1e-4,
                 weight_decay=0.01)
@@ -1318,7 +1320,7 @@ def main():
         },
         )
     
-    sanity_check = False
+    sanity_check = True
     training_args = sanity(sanity_check)
 
     dataset_config = {
