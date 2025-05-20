@@ -878,7 +878,7 @@ class Echo(nn.Module):
                 print(f"{module_type}: {count}")
 
 metric = evaluate.load(path="wer")
-
+logger = logging.getLogger(__name__)
 @dataclass
 class DataCollator:
     tokenizer: WhisperTokenizer
