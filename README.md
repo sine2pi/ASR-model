@@ -57,5 +57,5 @@ F0 contour represents pitch variation over time, while energy contour represents
 I've combined these (and periodicity) as an optional pitch feature while f0 can be optionally mapped to the rotary embedding theta value / per step during training.
 
 This model learns each audio feature in seperate layers in sequence each feature building on the other. Like human reinforcment learning. You can change the order of feature learned. 
-
+sequential=True or sequential=False for blending features
 
