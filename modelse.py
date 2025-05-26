@@ -62,7 +62,8 @@ class Dimensions:
     act: str
     debug: bool
     cross_attn: bool
-    features: dict
+    features: List[str]
+    f0_rotary: bool
 
 def plot_waveform_and_spectrogram(x=None, w=None, p=None, per=None, sample_idx=0, sr=16000, hop_length=160, 
                                  title="Waveform and Spectrogram", markers=None, marker_labels=None, 
@@ -255,9 +256,10 @@ def rotate_half(x):
     x = torch.stack((-x2, x1), dim = -1)
     return rearrange(x, '... d r -> ... (d r)')
 
+
 class rotary(nn.Module):
     def __init__(self, dims, max_ctx=1500, theta=10000, learned_freq=False, variable_radius=False,
-                 learned_radius=False, debug=False):
+                 learned_radius=False, learned_theta=False, debug=False):
         super().__init__()
         self.debug = False
         self.interpolate_factor = 10.0
@@ -265,13 +267,18 @@ class rotary(nn.Module):
         self.dims = dims
         self.max_ctx = max_ctx
         self.variable_radius = variable_radius
+        
         self.inv_freq = nn.Parameter(1.0 / (10000 ** (torch.arange(0, dims, 2, device=device, dtype=dtype) / dims)), requires_grad=learned_freq)
+        self.theta = nn.Parameter(torch.tensor(float(theta)), requires_grad=learned_theta)
+        self.min_theta = nn.Parameter(torch.tensor(800.0), requires_grad=learned_theta)
+        self.max_theta = nn.Parameter(torch.tensor(10000.0), requires_grad=learned_theta)
+        
         if variable_radius:
             self.radius = nn.Parameter(
                 torch.ones(dims // 2),
                 requires_grad=learned_radius)
             
-        self.theta = nn.Parameter(torch.tensor(float(theta)), requires_grad=False)
+
 
     def forward(self, x = None, f0=None) -> Tensor:
         if isinstance(x, int):
@@ -286,8 +293,9 @@ class rotary(nn.Module):
             f0_mean = f0_tensor.mean()
             f0_mean = torch.clamp(f0_mean, min=80.0, max=600.0)
             perceptual_factor = torch.log(1 + f0_mean / 700.0) / torch.log(torch.tensor(1 + 300.0 / 700.0))
-            min_theta, max_theta = 800.0, 10000.0
-            f0_theta = min_theta + perceptual_factor * (max_theta - min_theta)
+            # min_theta, max_theta = 800.0, 10000.0
+            # f0_theta = min_theta + perceptual_factor * (max_theta - min_theta)
+            f0_theta = self.min_theta + perceptual_factor * (self.max_theta - self.min_theta)
             inv_freq = 1.0 / (f0_theta ** (torch.arange(0, self.dims, 2, device=device) / self.dims))
         else:
             inv_freq = self.inv_freq
@@ -319,14 +327,26 @@ class rotary(nn.Module):
             x1 = x1 * freqs
             x1 = torch.view_as_real(x1).flatten(-2)
             return torch.cat([x1.type_as(x), x2], dim=-1)
+
         else:
             x1 = x[..., :freqs.shape[-1]*2]
             x2 = x[..., freqs.shape[-1]*2:]
-            x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
-            x1 = torch.view_as_complex(x1)
-            x1 = x1 * freqs
-            x1 = torch.view_as_real(x1).flatten(-2)
-            return torch.cat([x1.type_as(x), x2], dim=-1)
+            
+            if x.ndim == 2:  
+  
+                x1 = x1.unsqueeze(0)
+                x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
+                x1 = torch.view_as_complex(x1)
+                x1 = x1 * freqs
+                x1 = torch.view_as_real(x1).flatten(-2)
+                x1 = x1.squeeze(0)  
+                return torch.cat([x1.type_as(x), x2], dim=-1)
+            else:  
+                x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
+                x1 = torch.view_as_complex(x1)
+                x1 = x1 * freqs
+                x1 = torch.view_as_real(x1).flatten(-2)
+                return torch.cat([x1.type_as(x), x2], dim=-1)
 
 class MultiheadA(nn.Module):
     def __init__(self, dims: int, head: int, debug=False):
@@ -545,73 +565,51 @@ class WavefeatureEncoder(nn.Module):
         return self.norm(x)
 
 class AudioEncoder(nn.Module):
-    def __init__(self, mels, dims, head, ctx, layer, act, debug, features, cross_attn=False):
+    def __init__(self, mels, dims, head, ctx, layer, act, debug, features, f0_rotary):
+   
         super().__init__()
         self.debug = debug
         self.features = features
         self._counter = 0
         self.dropout = 0.1
-        cross_attn=False
+        self.f0_rotary = f0_rotary
+
         act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), 
                   "tanh": nn.Tanh(), "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), 
                   "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), 
                   "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
         act_fn = act_map.get(act, nn.GELU())
             
-        self.spec =  nn.ModuleList(
-            [featureEncoder(input_dims=mels, dims=dims, head=head, layer=layer, kernel_size=3, act=act_fn)] + 
-            [Residual(dims=dims, head=head, ctx=ctx, act=act, cross_attn=cross_attn, debug=debug) for _ in range(layer)]) if "spectrogram" in features else None
-        
-        self.wave = nn.ModuleList(
-            [WavefeatureEncoder(input_dims=1, dims=dims, head=head, layer=layer, kernel_size=11, act=act_fn)] +
-            [Residual(dims=dims, head=head, ctx=ctx, act=act, cross_attn=cross_attn, debug=debug) for _ in range(layer)] if "waveform" in features else None
-        )
-        
-        self.pitch = nn.ModuleList(
-            [featureEncoder(input_dims=1, dims=dims, head=head, layer=layer, kernel_size=9, act=nn.GELU(), stride=2)] +
-            [Residual(dims=dims, head=head, ctx=ctx, act=act, cross_attn=cross_attn, debug=debug) for _ in range(layer)] if "pitch" in features else None
-        )
+        self.processors = nn.ModuleDict({
+            "spectrogram": nn.ModuleList(
+            [FeatureEncoder(input_dims=mels, dims=dims, head=head, layer=layer, kernel_size=3, act=act_fn)] + 
+            [Residual(dims=dims, head=head, ctx=ctx, act=act, debug=debug) for _ in range(layer)] if "spectrogram" in features else None
+            ),
 
-    def forward(self, encoder_inputs):
-        if self._counter < 1 and self.debug:
-            x = encoder_inputs.get("spectrogram")
-            w = encoder_inputs.get("waveform")
-            p = encoder_inputs.get("pitch")
-            plot_waveform_and_spectrogram(x=x, w=w, p=p, hop_length=128)
+            "waveform": nn.ModuleList(
+            [WaveformEncoder(input_dims=1, dims=dims, head=head, layer=layer, kernel_size=11, act=act_fn)] +
+            [Residual(dims=dims, head=head, ctx=ctx, act=act, debug=debug) for _ in range(layer)] if "waveform" in features else None
+            ),
 
-        if "f0" in self.features:
-            f0 = encoder_inputs.get("pitch") 
+            "pitch": nn.ModuleList(
+            [FeatureEncoder(input_dims=1, dims=dims, head=head, layer=layer, kernel_size=9, act=act, stride=2)] +
+            [Residual(dims=dims, head=head, ctx=ctx, act=act, debug=debug) for _ in range(layer)] if "pitch" in features else None
+            
+            )})
+
+    def forward(self, x):
+        out = {}
+        if self.f0_rotary:
+            f0 = x.get("pitch")
         else:
             f0 = None
-            
-        feature_outputs = {}
-
-        if "spectrogram" in encoder_inputs:
-            x = encoder_inputs["spectrogram"]
-            for block in self.spec:
-                x = block(x, f0=f0)
-            feature_outputs["spectrogram"] = x
-
-        if "waveform" in encoder_inputs:
-            w = encoder_inputs["waveform"]
-            for block in chain(self.wave or []):
-                w = block(w, f0=f0)
-            feature_outputs["waveform"] = w
-
-        if "pitch" in encoder_inputs:
-            p = encoder_inputs["pitch"]
-            for block in chain(self.pitch or []):
-                p = block(p, f0=f0)
-            feature_outputs["pitch"] = p
-
-        if self._counter % 10 == 0 and self.debug:
-            feature_names = list(feature_outputs.keys())
-            feature_shapes = {k: v.shape for k, v in feature_outputs.items()}
-            print(f"Step {self._counter}: Processed modalities: {feature_names}")
-            print(f"Feature shapes: {feature_shapes}")
-            
-        self._counter += 1
-        return feature_outputs
+        for feature in self.features:
+            if feature in x:
+                feat = x[feature]
+                for blk in chain(self.processors[feature] or []):
+                    feat = blk(feat, f0=f0)
+                out[feature] = feat
+        return out
 
 class featureEncoder(nn.Module):
     def __init__(self, input_dims, dims, head, layer, kernel_size, act, stride=1, name=None):
@@ -660,6 +658,7 @@ class TextDecoder(nn.Module):
         self.dropout = 0.1
         self.debug = debug
         self.sequential = sequential
+        self.features = features
 
         self.token_embedding = nn.Embedding(num_embeddings=vocab, embedding_dim=dims)
         with torch.no_grad():
@@ -667,44 +666,31 @@ class TextDecoder(nn.Module):
         self.positional_embedding = nn.Parameter(data=torch.empty(ctx, dims), requires_grad=True)
         
         self.self_attn_layers = nn.ModuleList([
-            Residual(dims=dims, head=head, ctx=ctx, act="gelu", cross_attn=False, debug=debug)
+            Residual(dims=dims, head=head, ctx=ctx, act="gelu", cross_attn=cross_attn, debug=debug)
             for _ in range(layer)])
         
         self.processors = nn.ModuleDict({
-            
-            "spectrogram": nn.ModuleList([
-                Residual(dims=dims, head=head, ctx=ctx, act="gelu", cross_attn=cross_attn, debug=debug)
-                for _ in range(layer)] if "spectrogram" in features else None
-        ),
-            "waveform": nn.ModuleList([
-                Residual(dims=dims, head=head, ctx=ctx, act="gelu", cross_attn=cross_attn, debug=debug)
-                for _ in range(layer)] if "waveform" in features else None
-        ),
-            "pitch": nn.ModuleList([
-                Residual(dims=dims, head=head, ctx=ctx, act="gelu", cross_attn=cross_attn, debug=debug)
-                for _ in range(layer)] if "pitch" in features else None
-        )})
+        f: nn.ModuleList([Residual(dims=dims, head=head, ctx=ctx, act="gelu", cross_attn=cross_attn, debug=debug)
+            for _ in range(layer)]) for f in features})
         
-        self.feature_blend = nn.ParameterDict({
-            "spectrogram": nn.Parameter(torch.tensor(0.5)),
-            "waveform": nn.Parameter(torch.tensor(0.5)),
-            "pitch": nn.Parameter(torch.tensor(0.5)),
-            })
+        self.feature_blend = nn.ParameterDict({f: nn.Parameter(torch.tensor(0.5)) for f in features})
         
         self.ln_dec = RMSNorm(dims, **tox)
         mask = torch.tril(torch.ones(ctx, ctx), diagonal=0)        
         self.register_buffer("mask", mask, persistent=False)
 
     def forward(self, x, encoder_outputs, feature_order=None) -> Tensor:
+        
         if feature_order is None:
-            feature_order = ["pitch", "spectrogram", "waveform"]
+            feature_order = self.features
+            
         x = x.to(device=device)
         mask = self.mask[:x.shape[1], :x.shape[1]]
         x = (self.token_embedding(x) + self.positional_embedding[:x.shape[1]])
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
+        
         for layer in self.self_attn_layers:
             x = layer(x, mask=mask)
-        text_only = x
 
         for feature in feature_order:
             if feature in encoder_outputs:
@@ -717,9 +703,11 @@ class TextDecoder(nn.Module):
                 else:
                     alpha = torch.sigmoid(self.feature_blend[feature])
                     x = alpha * output + (1 - alpha) * x
+                    
         x = self.ln_dec(x)
         logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
         return logits
+
 
 class Echo(nn.Module):
     def __init__(self, param: Dimensions):
@@ -1294,7 +1282,7 @@ def main():
                 weight_decay=0.01)
 
         return training_args
-        
+
     param = Dimensions(
         mels=128,
         audio_ctx=1500,
@@ -1311,13 +1299,9 @@ def main():
         eos_token_id=0,
         act="gelu",
         debug=False,
-        cross_attn=False,
-        features = {
-        "spectrogram", # uncomment to use spectrogram
-        "waveform", # uncomment to use waveform
-        "pitch", # uncomment to use pitch
-        #"f0", # uncomment to use frequency in rotary
-        },
+        cross_attn=True,
+        f0_rotary=False, # if True pitch must be in features
+        features = ["spectrogram"], # ["spectrogram", "waveform", "pitch"]
         )
     
     sanity_check = True
