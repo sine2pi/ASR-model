@@ -477,7 +477,7 @@ class MultiheadB(nn.Module):
         return self.o(wv), qk.detach()
 
 class Residual(nn.Module):
-    def __init__(self, dims: int, head: int, ctx, act, cross_attn=False, debug=False):
+    def __init__(self, dims: int, head: int, ctx, act, cross_attn=True, debug=False):
         super().__init__()
         self.ctx = ctx
         self._counter = 0
@@ -487,33 +487,37 @@ class Residual(nn.Module):
         self.head_dim = dims // head
         self.cross_attn = cross_attn
         self.debug = debug
-
         self.blend_xa = nn.Parameter(torch.tensor(0.5))
-        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(),
-                   "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
-        self.act = act_map.get(act, nn.GELU())
+        
+        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), 
+                  "tanh": nn.Tanh(), "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), 
+                  "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), 
+                  "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
+        act_fn = act_map.get(act, nn.GELU())
 
         self.attna = MultiheadA(dims, head)
-        self.attnb = (MultiheadB(dims, head) if cross_attn else None)
+        self.attnb = (MultiheadA(dims, head) if cross_attn else None)
+        
         mlp = dims * 4
-        self.mlp = nn.Sequential(Linear(dims, mlp), self.act, Linear(mlp, dims))
+        self.mlp_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
+        self.mlp = nn.Sequential(Linear(dims, mlp), act_fn, Linear(mlp, dims))
+        
         self.lna = RMSNorm(dims)
         self.lnb = RMSNorm(dims) if cross_attn else None
         self.lnc = RMSNorm(dims)
 
     def forward(self, x, xa=None, mask=None, f0=None):
-        r = x
         x = x + self.attna(self.lna(x), mask=mask, f0=f0)[0]
         if self.attnb and xa is not None:
-            mask = None
-            cross_out = self.attnb(self.lnb(x), xa, mask=mask, f0=f0)[0]
+            cross = self.attnb(self.lnb(x), xa, f0=f0)[0]
             blend = torch.sigmoid(self.blend_xa)
-            x = blend * x + (1 - blend) * cross_out
-        x = x + self.mlp(self.lnc(x))
-        x = x + r
-        if self.debug and self._counter % 10 == 0:
-            print(f"Step {self._counter}: Blend factor: {self.blend_xa.item():.2f}, xa: {xa is not None}, mask: {mask is not None}, x: {x.shape}")
-        self._counter += 1
+            x = blend * x + (1 - blend) * cross
+        mlp_out = self.mlp(self.lnc(x))
+        if hasattr(self, 'mlp_gate'):
+            mlp_gate = self.mlp_gate(self.lnc(x)) 
+            x = x + mlp_gate * mlp_out
+        else:
+            x = x + mlp_out
         return x
 
 class PitchEncoder(nn.Module):
