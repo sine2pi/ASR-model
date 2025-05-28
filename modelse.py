@@ -582,7 +582,6 @@ class Echo(nn.Module):
 
 
 def analyze_gate_behavior(gate_stats):
-    """Analyze gate activation patterns during training"""
     print("\nGate Activation Analysis:")
     
     all_means = []
@@ -617,7 +616,6 @@ def analyze_gate_behavior(gate_stats):
         print(f"  Average std deviation: {sum(all_stds)/len(all_stds):.4f}")
 
 class SelfCriticalTraining(nn.Module):
-    """Trains model using its own predictions rather than teacher forcing"""
     
     def __init__(self, model, tokenizer, max_length=256, pad_token_id=0, 
                  eos_token_id=50256, temperature=1.0, top_k=0, top_p=0.9,
@@ -661,7 +659,7 @@ class SelfCriticalTraining(nn.Module):
         return next_token
     
     def _collect_gate_stats(self, layer, batch_idx):
-        """Collect statistics about gate activations for analysis"""
+
         if hasattr(layer, 'mlp_gate') and self.monitor_gates:
             x = layer.lnc(layer.attna(layer.lna(layer._last_input))[0])
             gate_values = layer.mlp_gate(x)
@@ -680,16 +678,39 @@ class SelfCriticalTraining(nn.Module):
                 self.gate_stats[layer_name] = []
             
             self.gate_stats[layer_name].append(stats)
-    
-    def forward(self, encoder_inputs, labels=None, use_teacher_forcing=None):
-        """
-        Train with generated outputs instead of teacher forcing
+                
+    def forward(self,
+        decoder_input_ids=None,
+        labels=None,
+        waveform: Optional[torch.Tensor]=None,
+        input_ids=None,
+        spectrogram: torch.Tensor=None,
+        pitch: Optional[torch.Tensor]=None,
+        use_teacher_forcing=None,
+        **kwargs
+    ) -> Dict[str, torch.Tensor]:
+
+        encoder_inputs = {}
+        if spectrogram is not None:
+            encoder_inputs["spectrogram"] = spectrogram
+        if waveform is not None:
+            encoder_inputs["waveform"] = waveform
+        if pitch is not None:
+            encoder_inputs["pitch"] = pitch
+            
+        for key in kwargs:
+            if key in ['spectrogram', 'waveform', 'pitch'] and kwargs[key] is not None:
+                encoder_inputs[key] = kwargs[key]
         
-        Args:
-            encoder_inputs: Dict with audio features (spectrogram, waveform, pitch)
-            labels: Ground truth token ids for supervision (optional)
-            use_teacher_forcing: Override the scheduled sampling (optional)
-        """
+        if not encoder_inputs:
+            print(f"WARNING: No encoder inputs found. Using base model forward.")
+            return self.model(
+                decoder_input_ids=decoder_input_ids,
+                labels=labels,
+                input_ids=input_ids,
+                **kwargs
+            )
+        
         batch_size = next(iter(encoder_inputs.values())).size(0)
         device = next(iter(encoder_inputs.values())).device
         
@@ -701,21 +722,27 @@ class SelfCriticalTraining(nn.Module):
         )
         
         encoder_outputs = self.model.encoder(encoder_inputs)
-        
+              
+        hooks = []
         all_logits = []
         generated_tokens = []
         
         if self.monitor_gates:
             for i, layer in enumerate(self.model.decoder.self_attn_layers):
                 layer._last_input = None
-                def hook_fn(layer, input, output):
-                    layer._last_input = input[0].detach()
-                layer.register_forward_hook(hook_fn)
+                def get_hook_fn(target_layer):
+                    def hook_fn(layer, input, output):
+                        target_layer._last_input = input[0].detach()
+                    return hook_fn
+                
+                hook = layer.register_forward_hook(get_hook_fn(layer))
+                hooks.append(hook)
                 
                 for feature_layers in self.model.decoder.processors.values():
                     for j, cross_layer in enumerate(feature_layers):
                         cross_layer._last_input = None
-                        cross_layer.register_forward_hook(hook_fn)
+                        hook = cross_layer.register_forward_hook(get_hook_fn(cross_layer))
+                        hooks.append(hook)
         
         for i in range(self.max_length - 1):
             logits = self.model.decoder(decoder_input, encoder_outputs)
@@ -739,7 +766,7 @@ class SelfCriticalTraining(nn.Module):
                 for feature_layers in self.model.decoder.processors.values():
                     for j, cross_layer in enumerate(feature_layers):
                         self._collect_gate_stats(cross_layer, i)
-            
+                pass
             generated_tokens.append(next_token)
             
             decoder_input = torch.cat([decoder_input, next_token], dim=1)
@@ -762,13 +789,15 @@ class SelfCriticalTraining(nn.Module):
             loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.pad_token_id)
             loss = loss_fn(loss_input, loss_target)
         
-        return {
+        for hook in hooks:
+            hook.remove()
+        
+        return_dict = {
             "loss": loss,
-            "logits": all_logits,
-            "generated_tokens": generated_tokens,
-            "gate_stats": self.gate_stats if self.monitor_gates else None,
-            "encoder_outputs": encoder_outputs
+            "logits": all_logits
         }
+        
+        return return_dict
 
 metric = evaluate.load(path="wer")
 
@@ -1153,6 +1182,36 @@ def get_training_args(
         batch_eval_metrics=batch_eval_metrics,
     )
 
+class AudioSeq2SeqTrainer(Seq2SeqTrainer):
+    """Custom trainer that correctly handles audio-to-text models with self-critical training"""
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """Ensure all inputs are correctly passed to the model"""
+        
+        batch = {}
+        for key in inputs.keys():
+            batch[key] = inputs[key]
+            
+        if hasattr(self, '_debug_counter'):
+            self._debug_counter += 1
+        else:
+            self._debug_counter = 0
+            
+        if self._debug_counter < 3:
+            print(f"Batch keys available: {list(batch.keys())}")
+            
+        outputs = model(**batch)
+        
+        if isinstance(outputs, dict):
+            loss = outputs.get("loss")
+        else:
+            loss = outputs[0] if isinstance(outputs, tuple) else outputs
+            
+        return (loss, outputs) if return_outputs else loss
+
 def main():
     
     token = ""
@@ -1250,6 +1309,8 @@ def main():
     
     model = create_model(param)
     
+    
+    
     wrapped_model = SelfCriticalTraining(
         model=model,
         tokenizer=tokenizer,
@@ -1260,20 +1321,23 @@ def main():
         eos_token_id=param.eos_token_id
     )
     
-    trainer = Seq2SeqTrainer(
+    trainer = AudioSeq2SeqTrainer(
         args=training_args,
-        model=model,# wrapped_model,
+        model=wrapped_model,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         data_collator=DataCollator(tokenizer=tokenizer),
         compute_metrics=metrics_fn)
     
+    example_batch = next(iter(trainer.get_train_dataloader()))
+    print("Example batch keys:", list(example_batch.keys()))
+    
+    
     trainer.train()
     
-    # gate_stats = wrapped_model.gate_stats
-    # if gate_stats:
-    #     analyze_gate_behavior(gate_stats)
+    gate_stats = wrapped_model.gate_stats
+    if gate_stats:
+        analyze_gate_behavior(gate_stats)
 
-
-if __name__ == "__main__":
-    main()
+    
+    
