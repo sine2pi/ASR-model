@@ -581,224 +581,6 @@ class Echo(nn.Module):
                 print(f"{module_type}: {count}")
 
 
-def analyze_gate_behavior(gate_stats):
-    print("\nGate Activation Analysis:")
-    
-    all_means = []
-    all_stds = []
-    
-    for layer_name, stats_list in gate_stats.items():
-        if not stats_list:
-            continue
-            
-        means = [s['mean'] for s in stats_list]
-        stds = [s['std'] for s in stats_list]
-        mins = [s['min'] for s in stats_list]
-        maxs = [s['max'] for s in stats_list]
-        
-        all_means.extend(means)
-        all_stds.extend(stds)
-        
-        print(f"\nLayer {layer_name}:")
-        print(f"  Mean gate value: {sum(means)/len(means):.4f}")
-        print(f"  Mean std deviation: {sum(stds)/len(stds):.4f}")
-        print(f"  Range: {min(mins):.4f} to {max(maxs):.4f}")
-        
-        if len(means) > 10:
-            early_mean = sum(means[:10])/10
-            late_mean = sum(means[-10:])/10
-            print(f"  Trend: {'Increasing' if late_mean > early_mean else 'Decreasing'} gate activation")
-            print(f"  Early mean: {early_mean:.4f}, Late mean: {late_mean:.4f}")
-    
-    if all_means:
-        print("\nOverall Gate Statistics:")
-        print(f"  Average gate value: {sum(all_means)/len(all_means):.4f}")
-        print(f"  Average std deviation: {sum(all_stds)/len(all_stds):.4f}")
-
-class SelfCriticalTraining(nn.Module):
-    
-    def __init__(self, model, tokenizer, max_length=256, pad_token_id=0, 
-                 eos_token_id=50256, temperature=1.0, top_k=0, top_p=0.9,
-                 scheduled_sampling_ratio=0.5, monitor_gates=True):
-        super().__init__()
-        self.model = model
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.pad_token_id = pad_token_id
-        self.eos_token_id = eos_token_id
-        self.temperature = temperature
-        self.top_k = top_k
-        self.top_p = top_p
-        self.scheduled_sampling_ratio = scheduled_sampling_ratio
-        self.monitor_gates = monitor_gates
-        self.gate_stats = {}
-        
-    def _sample_from_logits(self, logits):
-        logits = logits / max(self.temperature, 1e-5)
-        
-        if self.top_k > 0:
-            indices_to_remove = logits < torch.topk(logits, self.top_k)[0][..., -1, None]
-            logits[indices_to_remove] = float('-inf')
-            
-        if self.top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            
-            sorted_indices_to_remove = cumulative_probs > self.top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-            
-            indices_to_remove = sorted_indices_to_remove.scatter(
-                -1, sorted_indices, sorted_indices_to_remove
-            )
-            logits[indices_to_remove] = float('-inf')
-        
-        probs = F.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        
-        return next_token
-    
-    def _collect_gate_stats(self, layer, batch_idx):
-
-        if hasattr(layer, 'mlp_gate') and self.monitor_gates:
-            x = layer.lnc(layer.attna(layer.lna(layer._last_input))[0])
-            gate_values = layer.mlp_gate(x)
-            
-            stats = {
-                'mean': gate_values.mean().item(),
-                'std': gate_values.std().item(),
-                'min': gate_values.min().item(),
-                'max': gate_values.max().item(),
-                'zeros': (gate_values < 0.01).float().mean().item(),
-                'ones': (gate_values > 0.99).float().mean().item()
-            }
-            
-            layer_name = f"layer_{id(layer)}"
-            if layer_name not in self.gate_stats:
-                self.gate_stats[layer_name] = []
-            
-            self.gate_stats[layer_name].append(stats)
-                
-    def forward(self,
-        decoder_input_ids=None,
-        labels=None,
-        waveform: Optional[torch.Tensor]=None,
-        input_ids=None,
-        spectrogram: torch.Tensor=None,
-        pitch: Optional[torch.Tensor]=None,
-        use_teacher_forcing=None,
-        **kwargs
-    ) -> Dict[str, torch.Tensor]:
-
-        encoder_inputs = {}
-        if spectrogram is not None:
-            encoder_inputs["spectrogram"] = spectrogram
-        if waveform is not None:
-            encoder_inputs["waveform"] = waveform
-        if pitch is not None:
-            encoder_inputs["pitch"] = pitch
-            
-        for key in kwargs:
-            if key in ['spectrogram', 'waveform', 'pitch'] and kwargs[key] is not None:
-                encoder_inputs[key] = kwargs[key]
-        
-        if not encoder_inputs:
-            print(f"WARNING: No encoder inputs found. Using base model forward.")
-            return self.model(
-                decoder_input_ids=decoder_input_ids,
-                labels=labels,
-                input_ids=input_ids,
-                **kwargs
-            )
-        
-        batch_size = next(iter(encoder_inputs.values())).size(0)
-        device = next(iter(encoder_inputs.values())).device
-        
-        decoder_input = torch.full(
-            (batch_size, 1), 
-            50258,
-            dtype=torch.long, 
-            device=device
-        )
-        
-        encoder_outputs = self.model.encoder(encoder_inputs)
-              
-        hooks = []
-        all_logits = []
-        generated_tokens = []
-        
-        if self.monitor_gates:
-            for i, layer in enumerate(self.model.decoder.self_attn_layers):
-                layer._last_input = None
-                def get_hook_fn(target_layer):
-                    def hook_fn(layer, input, output):
-                        target_layer._last_input = input[0].detach()
-                    return hook_fn
-                
-                hook = layer.register_forward_hook(get_hook_fn(layer))
-                hooks.append(hook)
-                
-                for feature_layers in self.model.decoder.processors.values():
-                    for j, cross_layer in enumerate(feature_layers):
-                        cross_layer._last_input = None
-                        hook = cross_layer.register_forward_hook(get_hook_fn(cross_layer))
-                        hooks.append(hook)
-        
-        for i in range(self.max_length - 1):
-            logits = self.model.decoder(decoder_input, encoder_outputs)
-            
-            all_logits.append(logits[:, -1:, :])
-            
-            use_tf = use_teacher_forcing
-            if use_tf is None:
-                use_tf = (torch.rand(1).item() < self.scheduled_sampling_ratio)
-            
-            if labels is not None and i < labels.size(1) - 1 and use_tf:
-                next_token = labels[:, i+1:i+2]
-            else:
-                next_token = self._sample_from_logits(logits[:, -1, :])
-                next_token = next_token.unsqueeze(-1)
-            
-            if self.monitor_gates:
-                for j, layer in enumerate(self.model.decoder.self_attn_layers):
-                    self._collect_gate_stats(layer, i)
-                
-                for feature_layers in self.model.decoder.processors.values():
-                    for j, cross_layer in enumerate(feature_layers):
-                        self._collect_gate_stats(cross_layer, i)
-                pass
-            generated_tokens.append(next_token)
-            
-            decoder_input = torch.cat([decoder_input, next_token], dim=1)
-            
-            if (next_token == self.eos_token_id).all():
-                break
-        
-        all_logits = torch.cat(all_logits, dim=1)
-        generated_tokens = torch.cat(generated_tokens, dim=1)
-        
-        loss = None
-        if labels is not None:
-            shifted_labels = labels[:, 1:].contiguous()
-            
-            seq_length = min(all_logits.size(1), shifted_labels.size(1))
-            
-            loss_input = all_logits[:, :seq_length, :].reshape(-1, all_logits.size(-1))
-            loss_target = shifted_labels[:, :seq_length].reshape(-1)
-            
-            loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.pad_token_id)
-            loss = loss_fn(loss_input, loss_target)
-        
-        for hook in hooks:
-            hook.remove()
-        
-        return_dict = {
-            "loss": loss,
-            "logits": all_logits
-        }
-        
-        return return_dict
-
 metric = evaluate.load(path="wer")
 
 @dataclass
@@ -1182,35 +964,7 @@ def get_training_args(
         batch_eval_metrics=batch_eval_metrics,
     )
 
-class AudioSeq2SeqTrainer(Seq2SeqTrainer):
-    """Custom trainer that correctly handles audio-to-text models with self-critical training"""
-    
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        
-    def compute_loss(self, model, inputs, return_outputs=False):
-        """Ensure all inputs are correctly passed to the model"""
-        
-        batch = {}
-        for key in inputs.keys():
-            batch[key] = inputs[key]
-            
-        if hasattr(self, '_debug_counter'):
-            self._debug_counter += 1
-        else:
-            self._debug_counter = 0
-            
-        if self._debug_counter < 3:
-            print(f"Batch keys available: {list(batch.keys())}")
-            
-        outputs = model(**batch)
-        
-        if isinstance(outputs, dict):
-            loss = outputs.get("loss")
-        else:
-            loss = outputs[0] if isinstance(outputs, tuple) else outputs
-            
-        return (loss, outputs) if return_outputs else loss
+
 
 def main():
     
@@ -1309,35 +1063,17 @@ def main():
     
     model = create_model(param)
     
-    
-    
-    wrapped_model = SelfCriticalTraining(
-        model=model,
-        tokenizer=tokenizer,
-        scheduled_sampling_ratio=0.7,
-        monitor_gates=True,
-        max_length=param.text_ctx,
-        pad_token_id=param.pad_token_id,
-        eos_token_id=param.eos_token_id
-    )
-    
+
     trainer = AudioSeq2SeqTrainer(
         args=training_args,
-        model=wrapped_model,
+        model=model,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         data_collator=DataCollator(tokenizer=tokenizer),
         compute_metrics=metrics_fn)
     
-    example_batch = next(iter(trainer.get_train_dataloader()))
-    print("Example batch keys:", list(example_batch.keys()))
     
     
     trainer.train()
-    
-    gate_stats = wrapped_model.gate_stats
-    if gate_stats:
-        analyze_gate_behavior(gate_stats)
 
-    
     
