@@ -18,7 +18,6 @@ import pyworld as pw
 from torch import nn, Tensor, functional as F
 from torch.nn import init
 
-
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
@@ -57,8 +56,6 @@ class Dimensions:
     cross_attn: bool
     features: List[str]
     f0_rotary: bool
-
-
 
 def exists(v):
     return v is not None
@@ -263,7 +260,6 @@ def sinusoids(length, channels, max_timescale=10000):
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
 class PositionalEncoding(nn.Module):
-
     def __init__(self, d_model: int = 512, max_len: int = 10000) -> None:
         super(PositionalEncoding, self).__init__()
         pe = torch.zeros(max_len, d_model, requires_grad=False)
