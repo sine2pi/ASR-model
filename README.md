@@ -500,7 +500,7 @@ class Residual(nn.Module):
             self.mlp_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
 
     def forward(self, x, xa=None, mask=None, f0=None, modalities=None):
-
+        r = x
         x = x + self.attna(self.lna(x), mask=mask, f0=f0)[0]
         
         if self.attnb and xa is not None:
@@ -542,7 +542,7 @@ class Residual(nn.Module):
                 x = x + mlp_gate * mlp_out
             else:
                 x = x + mlp_out
-                
+        x = x + r
         return x
 
 def optimized_attention(q, k, v, mask=None, scale=None, pad_token=0, fzero_val=0.0001):
