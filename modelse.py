@@ -770,7 +770,8 @@ class FeatureEncoder(nn.Module):
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
         x = self._norm(x)
         return x
-     
+
+
 class FeatureFusionModule(nn.Module):
     def __init__(self, dims, num_features, head=4):
         super().__init__()
@@ -803,31 +804,31 @@ class FeatureFusionModule(nn.Module):
             if feature in self.feature_projections:
                 processed_features[feature] = self.feature_projections[feature](tensor)
         
-        attended_features = {}
-        feature_list = list(processed_features.keys())
+        reference_feature = "spectrogram" if "spectrogram" in processed_features else list(processed_features.keys())[0]
+        reference_tensor = processed_features[reference_feature]
         
-        for i, feature in enumerate(feature_list):
-            queries = processed_features[feature]
-            attended = [queries]
-    
-            for j, other_feature in enumerate(feature_list):
-                if i != j:
-                    cross_output, _ = self.cross_attentions[feature](
-                        queries, processed_features[other_feature])
-                    attended.append(cross_output)
-                    
+        attended_features = {}
+        
+        for feature, tensor in processed_features.items():
+            attended = [tensor]
+            
+            for other_feature, other_tensor in processed_features.items():
+                if feature != other_feature:
+                    attended_tensor, _ = self.cross_attentions[feature](
+                        tensor, other_tensor)
+                    attended.append(attended_tensor)
+            
             attended_features[feature] = torch.stack(attended).mean(dim=0)
         
         gate_weights = {f: torch.sigmoid(self.gates[f]) 
-                       for f in attended_features if f in self.gates}
+                      for f in attended_features if f in self.gates}
         
-        total_weight = sum(gate_weights.values()) + 1e-5
-        normalized_weights = {f: w / total_weight for f, w in gate_weights.items()}
-        combined = sum(tensor * normalized_weights[f].to(tensor.device) 
-                       for f, tensor in attended_features.items())
-        output = self.output_projection(self.output_norm(combined))
+        output = self.output_projection(self.output_norm(attended_features[reference_feature]))
         
-        return output
+        return {
+            "combined": output,
+            **attended_features
+        }
         
 class AudioEncoder(nn.Module):
     def __init__(self, mels: int, layer: int, dims: int, head: int, ctx: int, features: List[str], debug: bool = False, f0_rotary: bool = False, act: str = "gelu"):
@@ -863,14 +864,12 @@ class AudioEncoder(nn.Module):
             )
             })
 
-
     def forward(self, x):
-        
         if self._counter < 1:
             s = x.get("spectrogram")
             w = x.get("waveform")
             p = x.get("pitch")
-            plot_waveform_and_spectrogram(x=s, w=w, p=p, hop_length=128)
+            plot_waveform_and_spectrogram(x=s, w=w, p=p, hop_length=128)        
         
         feature_outputs = {}
         if self.f0_rotary:
@@ -892,16 +891,11 @@ class AudioEncoder(nn.Module):
             ).to(next(self.parameters()).device)
         
         if len(feature_outputs) > 1:
-            combined = self.feature_fusion(feature_outputs)
+            fusion_result = self.feature_fusion(feature_outputs)
+            
+            combined = fusion_result["combined"]
             feature_outputs["combined"] = combined
-            for feature in self.features:
-                if feature in feature_outputs:
-                    alpha = 0.7
-                    feature_outputs[feature] = (
-                        alpha * feature_outputs[feature] + 
-                        (1-alpha) * combined
-                    )
-        
+            
         if self._counter % 10 == 0 and self.debug:
             feature_names = list(x.keys())
             feature_shapes = {k: v.shape for k, v in x.items()}
@@ -911,6 +905,7 @@ class AudioEncoder(nn.Module):
         self._counter += 1
         
         return feature_outputs
+
 
 class TextDecoder(nn.Module):
     def __init__(self, vocab: int, layer: int, dims: int, head: int, ctx: int, cross_attn: bool, 
