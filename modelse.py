@@ -15,7 +15,8 @@ import evaluate
 import transformers
 from dataclasses import dataclass
 import pyworld as pw
-from torch import nn, Tensor, functional as F, init
+from torch import nn, Tensor, functional as F
+from torch.nn import init
 
 
 torch.backends.cudnn.allow_tf32 = True
