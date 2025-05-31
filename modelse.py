@@ -1045,15 +1045,12 @@ class Echo(nn.Module):
 
         encoder_outputs = self.encoder(encoder_inputs)
         logits = self.decoder(input_ids, encoder_outputs)
-
+        
         loss = None
         if labels is not None:
-            loss_fn = torch.nn.CrossEntropyLoss(ignore_index=0)
-            shifted_logits = logits[:, :-1, :].contiguous()
-            shifted_labels = labels[:, 1:].contiguous()
-            loss = loss_fn(
-                shifted_logits.view(-1, shifted_logits.shape[-1]), 
-                shifted_labels.view(-1))
+            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=0)
+            labels = labels.to(logits.device)
+            loss = loss_fct(logits.view(-1, self.param.vocab), labels.reshape(-1))
           
         return {
             "logits": logits,
