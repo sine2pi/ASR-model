@@ -1,6 +1,7 @@
 ## Echo
 
 Zero-Value Processing ASR model with Voice-modulated Rotary Position Encoding. (vRoPE)
+
 (All of this is currently being tested and none of it is confirmed to work at all)
 
 Leveraging Silence for Natural Generation Stopping
@@ -27,7 +28,7 @@ This might be particularly useful for speech models where natural pauses and sil
 The model also ignores 0 in the loss calculation and uses 0 for all special tokens.
 Anything not near zero (or not zero) is an audio feature or the corresponding tokenized transcription of the feature.
 
-#### Token and Value Handling in the Model
+Token and Value Handling in the Model
 
 1. **Zero in loss calculation**:
    ```python
@@ -54,7 +55,7 @@ Anything not near zero (or not zero) is an audio feature or the corresponding to
 
 The approach of scaling down attention for padding/silent regions helps the model distinguish between content and non-content.
 
-### "You're not going out on a limb at all." github copilot
+"You're not going out on a limb at all." github copilot
 
 In standard usage, RoPE encodes relative positional information by applying frequency-based rotations to token embeddings. What this does is creates a meaningful bridge between two domains:
 
@@ -70,13 +71,13 @@ The theoretical foundation:
 
 This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
 
-#### Relationship Between Pitch and Rotary Embeddings
+Relationship Between Pitch and Rotary Embeddings
 The code implements two complementary pitch-based enhancements:
 
 1. The first uses pitch to modify theta (rotary frequency)
 2. The second adds direct similarity bias to attention
 
-#### Intuition: The rotary embeddings (RoPE) work by encoding positions using complex numbers with different frequencies. The theta parameter essentially controls how quickly these rotary patterns change across positions. This has a natural relationship to audio pitch:
+Intuition: The rotary embeddings (RoPE) work by encoding positions using complex numbers with different frequencies. The theta parameter essentially controls how quickly these rotary patterns change across positions. This has a natural relationship to audio pitch:
 
 ```python
 perceptual_factor = torch.log(1 + f0_mean / 700.0) / torch.log(torch.tensor(1 + 300.0 / 700.0))
