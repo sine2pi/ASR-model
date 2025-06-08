@@ -1,4 +1,7 @@
 ## Echo
+
+### Zero-Value Processing ASR model with Voice-modulated Rotary Position Encoding. (vRoPE)
+
 #### All of this is currently being tested and none of it is confirmed to work at all. 
 
 ### Leveraging Silence for Natural Generation Stopping
