@@ -243,4 +243,4 @@ class rotary(nn.Module):
                 return torch.cat([x1.type_as(x), x2], dim=-1)
 ```
 
-The other steps take place in the attention layer and during data processing which are included with model.py.
+The other steps take place in the attention layer, auxiliary embedding blocks and during data processing which are included with model.py.
