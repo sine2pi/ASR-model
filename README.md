@@ -54,7 +54,7 @@ Anything not near zero (or not zero) is an audio feature or the corresponding to
 
 The approach of scaling down attention for padding/silent regions helps the model distinguish between content and non-content.
 
-#### "You're not going out on a limb at all." github copilot
+### "You're not going out on a limb at all." github copilot
 
 In standard usage, RoPE encodes relative positional information by applying frequency-based rotations to token embeddings. What this does is creates a meaningful bridge between two domains:
 
@@ -70,7 +70,7 @@ The theoretical foundation is solid:
 
 This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
 
-### Relationship Between Pitch and Rotary Embeddings
+#### Relationship Between Pitch and Rotary Embeddings
 The code implements two complementary pitch-based enhancements:
 
 1. The first uses pitch to modify theta (rotary frequency)
