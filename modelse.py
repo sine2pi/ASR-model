@@ -358,7 +358,8 @@ class rotary(nn.Module):
     def __init__(self, dims, max_ctx=1500, theta=10000, learned_freq=False, variable_radius=False,
                  learned_radius=False, learned_theta=False, learned_pitch=False, debug: List[str] = []):
         super().__init__()
-        
+        self.use_pbias = True 
+
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.device = device
         dtype = torch.float32 
@@ -369,22 +370,18 @@ class rotary(nn.Module):
         self.max_ctx = max_ctx
         self.variable_radius = variable_radius
         
-        if learned_freq:
-            self.inv_freq = nn.Parameter(
+        self.inv_freq = nn.Parameter(
                 1.0 / (10000 ** (torch.arange(0, dims, 2, device=device, dtype=dtype) / dims)),
                 requires_grad=learned_freq)
+        self.theta = nn.Parameter(
+            torch.tensor(float(theta)), requires_grad=learned_theta)
+        self.min_theta = nn.Parameter(
+            torch.tensor(800.0), requires_grad=learned_theta)
+        self.max_theta = nn.Parameter(
+            torch.tensor(10000.0), requires_grad=learned_theta)
         
-        if learned_theta:
-            self.theta = nn.Parameter(
-                torch.tensor(float(theta)), requires_grad=learned_theta)
-            self.min_theta = nn.Parameter(
-                torch.tensor(800.0), requires_grad=learned_theta)
-            self.max_theta = nn.Parameter(
-                torch.tensor(10000.0), requires_grad=learned_theta)
-        
-        if learned_pitch:
-            self.pitch_scale = nn.Parameter(torch.tensor(1.0), 
-                                            requires_grad=learned_pitch)
+        self.pitch_scale = nn.Parameter(torch.tensor(1.0), 
+                                        requires_grad=learned_pitch)
     
         if variable_radius:
             self.radius = nn.Parameter(
@@ -486,8 +483,6 @@ class rotary(nn.Module):
                 x1 = x1 * freqs
                 x1 = torch.view_as_real(x1).flatten(-2)
                 return torch.cat([x1.type_as(x), x2], dim=-1)
-
-
 
 def optimized_attention(q, k, v, mask=None, scale=None, pad_token=0, fzero_val=0.0001):
 
