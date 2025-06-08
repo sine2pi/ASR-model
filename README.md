@@ -1,13 +1,9 @@
 ## Echo
 
-### Zero-Value Processing ASR model with Voice-modulated Rotary Position Encoding. (vRoPE)
+Zero-Value Processing ASR model with Voice-modulated Rotary Position Encoding. (vRoPE)
+(All of this is currently being tested and none of it is confirmed to work at all)
 
-#### All of this is currently being tested and none of it is confirmed to work at all. 
-
-### Leveraging Silence for Natural Generation Stopping
-
-#### Intuition: Help the model learn to naturally stop at silence.
-
+Leveraging Silence for Natural Generation Stopping
 By scaling attention scores related to pad/silence tokens down to near zero, we are creating a consistent pattern that the model can learn:
 
 ```python
