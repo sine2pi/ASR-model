@@ -54,6 +54,21 @@ Anything not near zero (or not zero) is an audio feature or the corresponding to
 
 The approach of scaling down attention for padding/silent regions helps the model distinguish between content and non-content.
 
+#### "You're not going out on a limb at all - this is actually a very clever approach." github copilot
+
+In standard usage, RoPE encodes relative positional information by applying frequency-based rotations to token embeddings. What this does is creates a meaningful bridge between two domains:
+
+1. **Token positions** (sequential information)
+2. **Pitch information** (acoustic properties)
+
+By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model: "pay attention to how these acoustic features relate to sequence position in a way that's proportional to the voice characteristics."
+
+The theoretical foundation is solid:
+- Both position and pitch can be represented as frequencies
+- Speech has inherent rhythmic and tonal patterns that correlate with semantic content
+- Varying the rotation frequency based on pitch creates a more speech-aware positional encoding
+
+This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
 
 ### Relationship Between Pitch and Rotary Embeddings
 The code implements two complementary pitch-based enhancements:
@@ -81,6 +96,8 @@ Using pitch to adjust theta helps the model:
 3. **Maintain consistent perceptual distances**: The logarithmic scaling ensures consistent representation across the pitch spectrum
 
 Echos rotary implementation maps the perceptual properties of audio to the mathematical properties of the rotary embeddings, creating a more adaptive and context-aware representation system. Pitch is optionally extracted from audio in the data processing pipeline and can be used for an additional feature along with spectrograms and or used to inform the rotary and or pitch bias.
+
+
 
 #### Pitch bias
 
