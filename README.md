@@ -1,6 +1,6 @@
-### Echo
+## Echo
 
-#### Leveraging Silence for Natural Generation Stopping
+### Leveraging Silence for Natural Generation Stopping
 
 #### Intuition: Help the model learn to naturally stop at silence.
 
@@ -54,7 +54,8 @@ Anything not near zero (or not zero) is an audio feature or the corresponding to
 
 The approach of scaling down attention for padding/silent regions helps the model distinguish between content and non-content.
 
-#### Relationship Between Pitch and Rotary Embeddings
+
+### Relationship Between Pitch and Rotary Embeddings
 The code implements two complementary pitch-based enhancements:
 
 1. The first uses pitch to modify theta (rotary frequency)
