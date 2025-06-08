@@ -1,6 +1,5 @@
 ## Echo
-
-Zero-Value Processing ASR model with Voice-modulated Rotary Position Encoding. (vRoPE)
+### Zero-Value Processing ASR model with Voice-modulated Rotary Position Encoding. (vRoPE)
 
 (All of this is currently being tested and none of it is confirmed to work at all)
 
@@ -20,9 +19,9 @@ This creates a direct correspondence between:
 
 The benefits of this approach:
 
-1. **Consistent signals**: The model gets similar signals for silence in both input data and attention patterns
-2. **Content-based stopping**: Model can learn to end generation based on acoustic properties rather than just position
-3. **Learnable behavior**: Using a learnable parameter (`self.fzero`) lets the model find the optimal scaling factor
+1. Consistent signals: The model gets similar signals for silence in both input data and attention patterns
+2. Content-based stopping: Model can learn to end generation based on acoustic properties rather than just position
+3. Learnable behavior: Using a learnable parameter (`self.fzero`) lets the model find the optimal scaling factor
 
 This might be particularly useful for speech models where natural pauses and silences should guide generation boundaries.
 The model also ignores 0 in the loss calculation and uses 0 for all special tokens.
@@ -30,19 +29,19 @@ Anything not near zero (or not zero) is an audio feature or the corresponding to
 
 Token and Value Handling in the Model
 
-1. **Zero in loss calculation**:
+1. Zero in loss calculation:
    ```python
    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=0)
    ```
    The model explicitly ignores index 0 in the loss calculation using `ignore_index=0` parameter.
 
-2. **Zero for special tokens**:
+2. Zero for special tokens:
    ```python
    tokenizer.pad_token_id = 0
    tokenizer.eos_token_id = 0
    tokenizer.bos_token_id = 0
    ```
-3. **Attention scaling for zero tokens**:
+3. Attention scaling for zero tokens:
    ```python
    zscale = torch.ones_like(token_ids)
    fzero = torch.clamp(F.softplus(self.fzero), self.min, self.max)
@@ -50,7 +49,7 @@ Token and Value Handling in the Model
    ```
    This specifically scales attention scores for pad tokens (0) down to near-zero values.
 
-4. **Non-zero values represent meaningful content**:
+4. Non-zero values represent meaningful content:
    In the processing pipeline, actual audio features (after processing) and text tokens (after tokenization) are represented by non-zero values, making them stand out from the padded/silent regions.
 
 The approach of scaling down attention for padding/silent regions helps the model distinguish between content and non-content.
@@ -59,8 +58,8 @@ The approach of scaling down attention for padding/silent regions helps the mode
 
 In standard usage, RoPE encodes relative positional information by applying frequency-based rotations to token embeddings. What this does is creates a meaningful bridge between two domains:
 
-1. **Token positions** (sequential information)
-2. **Pitch information** (acoustic properties)
+1. Token positions (sequential information)
+2. Pitch information (acoustic properties)
 
 By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model: "pay attention to how these acoustic features relate to sequence position in a way that's proportional to the voice characteristics."
 
@@ -86,19 +85,19 @@ f0_theta = self.min_theta + perceptual_factor * (self.max_theta - self.min_theta
 
 This relationship should work because:
 
-1. **Both are frequency-based concepts**: Pitch is a frequency, and theta controls frequency of position encodings
-2. **Both follow logarithmic perception**: The code uses a logarithmic scaling that matches how humans perceive pitch differences
-3. **Both need different ranges for different content**: Just as low-pitched voices need different analysis than high-pitched ones, different content needs different position encoding patterns
+1. Both are frequency-based concepts: Pitch is a frequency, and theta controls frequency of position encodings
+2. Both follow logarithmic perception: The code uses a logarithmic scaling that matches how humans perceive pitch differences
+3. Both need different ranges for different content: Just as low-pitched voices need different analysis than high-pitched ones, different content needs different position encoding patterns
 
 Using pitch to adjust theta helps the model:
 
-1. **Adapt to speaker characteristics**: Different speakers (bass, tenor, alto, soprano) have fundamentally different pitch ranges
-2. **Process frequency-dependent information**: Formants and other speech features shift based on fundamental frequency
-3. **Maintain consistent perceptual distances**: The logarithmic scaling ensures consistent representation across the pitch spectrum
+1. Adapt to speaker characteristics: Different speakers (bass, tenor, alto, soprano) have fundamentally different pitch ranges
+2. Process frequency-dependent information: Formants and other speech features shift based on fundamental frequency
+3. Maintain consistent perceptual distances: The logarithmic scaling ensures consistent representation across the pitch spectrum
 
 Echos rotary implementation maps the perceptual properties of audio to the mathematical properties of the rotary embeddings, creating a more adaptive and context-aware representation system. Pitch is optionally extracted from audio in the data processing pipeline and can be used for an additional feature along with spectrograms and or used to inform the rotary and or pitch bias.
 
-#### Pitch bias
+Pitch bias
 
 The pitch bias implementation creates an attention bias matrix:
 
@@ -126,11 +125,13 @@ The learned `pitch_scale` parameter lets the model tune how much to rely on pitc
 
 ```python
 
+
 class rotary(nn.Module):
-    def __init__(self, dims, max_ctx=1500, theta=10000, learned_freq=False, variable_radius=False,
+    _seen = set()  
+    def __init__(self, dims, max_ctx=1500, theta=5000, learned_freq=False, variable_radius=False,
                  learned_radius=False, learned_theta=False, learned_pitch=False, debug: List[str] = []):
         super().__init__()
-        self.use_pbias = True 
+        self.use_pbias = False
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.device = device
@@ -142,22 +143,18 @@ class rotary(nn.Module):
         self.max_ctx = max_ctx
         self.variable_radius = variable_radius
         
-        if learned_freq:
-            self.inv_freq = nn.Parameter(
-                1.0 / (10000 ** (torch.arange(0, dims, 2, device=device, dtype=dtype) / dims)),
+        self.inv_freq = nn.Parameter(
+                1.0 / (5000  (torch.arange(0, dims, 2, device=device, dtype=dtype) / dims)),
                 requires_grad=learned_freq)
+        self.theta = nn.Parameter(
+            torch.tensor(float(theta)), requires_grad=learned_theta)
+        self.min_theta = nn.Parameter(
+            torch.tensor(600.0), requires_grad=learned_theta)
+        self.max_theta = nn.Parameter(
+            torch.tensor(2400.0), requires_grad=learned_theta)
         
-        if learned_theta:
-            self.theta = nn.Parameter(
-                torch.tensor(float(theta)), requires_grad=learned_theta)
-            self.min_theta = nn.Parameter(
-                torch.tensor(800.0), requires_grad=learned_theta)
-            self.max_theta = nn.Parameter(
-                torch.tensor(10000.0), requires_grad=learned_theta)
-        
-        if learned_pitch:
-            self.pitch_scale = nn.Parameter(torch.tensor(1.0), 
-                                            requires_grad=learned_pitch)
+        self.pitch_scale = nn.Parameter(torch.tensor(1.0), 
+                                        requires_grad=learned_pitch)
     
         if variable_radius:
             self.radius = nn.Parameter(
@@ -206,7 +203,7 @@ class rotary(nn.Module):
             # min_theta, max_theta = 800.0, 10000.0
             # f0_theta = min_theta + perceptual_factor * (max_theta - min_theta)
             f0_theta = self.min_theta + perceptual_factor * (self.max_theta - self.min_theta)
-            inv_freq = 1.0 / (f0_theta ** (torch.arange(0, self.dims, 2, device=self.device) / self.dims))
+            inv_freq = 1.0 / (f0_theta  (torch.arange(0, self.dims, 2, device=self.device) / self.dims))
         else:
             inv_freq = self.inv_freq
         freqs = torch.einsum('i,j->ij', t, inv_freq)
@@ -218,15 +215,22 @@ class rotary(nn.Module):
         else:
             freqs = torch.polar(torch.ones_like(freqs), freqs)
         freqs = freqs.unsqueeze(0)
-        
+            
         if "rotary" in self.debug:
-            if self._counter == 1:
-                print(f'ROTA -- freqs: {freqs.shape}, x: {x},  {t.shape if x is not None else None}', freqs.shape, t.shape)
-            if f0 is not None and self._counter % 100 == 0:
-                print(f"Step {self._counter}: Using raw F0 as theta: {f0_theta:.2f} Hz")
+            if f0 is not None:
+                key = f"{self._counter}_{f0_theta:.2f}"
+                if key not in rotary._seen:
+                    if not hasattr(self, '_prev_f0_theta'):
+                        self._prev_f0_theta = f0_theta
+                        print(f"Step {self._counter}: Using raw F0 as theta: {f0_theta:.2f} Hz")
+                    elif abs(self._prev_f0_theta - f0_theta) > 200.0:
+                        print(f"Step {self._counter}: Using raw F0 as theta: {f0_theta:.2f} Hz")
+                        self._prev_f0_theta = f0_theta
+                    rotary._seen.add(key)
             self._counter += 1
             
-        return freqs
+        return freqs      
+            
 
     @staticmethod
     def apply_rotary(x, freqs):
@@ -259,6 +263,9 @@ class rotary(nn.Module):
                 x1 = x1 * freqs
                 x1 = torch.view_as_real(x1).flatten(-2)
                 return torch.cat([x1.type_as(x), x2], dim=-1)
+
+
+
 ```
 
 The other steps take place in the attention layer, auxiliary embedding blocks and during data processing which are included with model.py.
