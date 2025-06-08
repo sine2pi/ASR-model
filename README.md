@@ -64,7 +64,7 @@ In standard usage, RoPE encodes relative positional information by applying freq
 
 By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model: "pay attention to how these acoustic features relate to sequence position in a way that's proportional to the voice characteristics."
 
-The theoretical foundation is solid:
+The theoretical foundation:
 - Both position and pitch can be represented as frequencies
 - Speech has inherent rhythmic and tonal patterns that correlate with semantic content
 - Varying the rotation frequency based on pitch creates a more speech-aware positional encoding
@@ -97,8 +97,6 @@ Using pitch to adjust theta helps the model:
 3. **Maintain consistent perceptual distances**: The logarithmic scaling ensures consistent representation across the pitch spectrum
 
 Echos rotary implementation maps the perceptual properties of audio to the mathematical properties of the rotary embeddings, creating a more adaptive and context-aware representation system. Pitch is optionally extracted from audio in the data processing pipeline and can be used for an additional feature along with spectrograms and or used to inform the rotary and or pitch bias.
-
-
 
 #### Pitch bias
 
