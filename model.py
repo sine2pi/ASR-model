@@ -1434,7 +1434,7 @@ def compute_metrics(eval_pred, compute_result: bool = True, print_pred: bool = F
         else:
             pred_ids = pred_ids.tolist()
     if hasattr(label_ids, "tolist"):
-        label_ids = label_ids.tolist()
+        label_ids = label_ids[:, :-1].tolist()
     label_ids = [[0 if token == -100 else token for token in seq] for seq in label_ids]
     
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True, add_special_tokens=False)
