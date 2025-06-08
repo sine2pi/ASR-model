@@ -24,6 +24,35 @@ The benefits of this approach:
 3. **Learnable behavior**: Using a learnable parameter (`self.fzero`) lets the model find the optimal scaling factor
 
 This might be particularly useful for speech models where natural pauses and silences should guide generation boundaries.
+The model also ignores 0 in the loss calculation and uses 0 for all special tokens.
+Anything not near zero (or not zero) is an audio feature or the corresponding tokenized transcription of the feature.
+
+### Token and Value Handling in the Model
+
+1. **Zero in loss calculation**:
+   ```python
+   loss_fn = torch.nn.CrossEntropyLoss(ignore_index=0)
+   ```
+   The model explicitly ignores index 0 in the loss calculation using `ignore_index=0` parameter.
+
+2. **Zero for special tokens**:
+   ```python
+   tokenizer.pad_token_id = 0
+   tokenizer.eos_token_id = 0
+   tokenizer.bos_token_id = 0
+   ```
+3. **Attention scaling for zero tokens**:
+   ```python
+   zscale = torch.ones_like(token_ids)
+   fzero = torch.clamp(F.softplus(self.fzero), self.min, self.max)
+   zscale[token_ids.float() == self.pad_token] = fzero.to(q.device, q.dtype)
+   ```
+   This specifically scales attention scores for pad tokens (0) down to near-zero values.
+
+4. **Non-zero values represent meaningful content**:
+   In the processing pipeline, actual audio features (after processing) and text tokens (after tokenization) are represented by non-zero values, making them stand out from the padded/silent regions.
+
+The approach of scaling down attention for padding/silent regions helps the model distinguish between content and non-content.
 
 #### Relationship Between Pitch and Rotary Embeddings
 The code implements two complementary pitch-based enhancements:
