@@ -1361,7 +1361,7 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
                 decoder=torchcrepe.decode.viterbi,
                 return_periodicity=True, 
                 device=device, 
-                pad=False
+                pad=True
             )
             batch["pitch"] = pit
             batch["period"] = periodocity
@@ -1376,7 +1376,7 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
             decoder=torchcrepe.decode.viterbi,
             return_periodicity=False, 
             device=device, 
-            pad=False
+            pad=True
         )
         batch["pitch"] = pit
         
