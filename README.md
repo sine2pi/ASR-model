@@ -1,5 +1,30 @@
 ### Echo
 
+#### Leveraging Silence for Natural Generation Stopping
+
+Intuition: Help the model learn to naturally stop at silence.
+
+By scaling attention scores related to pad/silence tokens down to near zero, we are creating a consistent pattern that the model can learn:
+
+```python
+token_ids = k[:, :, :, 0]
+zscale = torch.ones_like(token_ids)
+fzero = torch.clamp(F.softplus(self.fzero), self.min, self.max)
+zscale[token_ids.float() == self.pad_token] = fzero.to(q.device, q.dtype)
+```
+
+This creates a direct correspondence between:
+- Log mel spectrograms near zero in silent regions
+- Attention scores that are scaled down for pad tokens
+
+The benefits of this approach:
+
+1. **Consistent signals**: The model gets similar signals for silence in both input data and attention patterns
+2. **Content-based stopping**: Model can learn to end generation based on acoustic properties rather than just position
+3. **Learnable behavior**: Using a learnable parameter (`self.fzero`) lets the model find the optimal scaling factor
+
+This might be particularly useful for speech models where natural pauses and silences should guide generation boundaries.
+
 #### Relationship Between Pitch and Rotary Embeddings
 The code implements two complementary pitch-based enhancements:
 
