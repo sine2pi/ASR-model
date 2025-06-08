@@ -1648,7 +1648,7 @@ def main():
         act="gelu",
         debug={},#{"encoder", "decoder", "residual", "rotary"},
         cross_attn=True,
-        f0_rotary=False, # if True pitch must be in features
+        f0_rotary=False,
         features = ["waveform", "spectrogram"], # ["spectrogram", "waveform", "pitch"]
         )
     
