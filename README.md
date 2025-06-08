@@ -80,7 +80,7 @@ Using pitch to adjust theta helps the model:
 2. **Process frequency-dependent information**: Formants and other speech features shift based on fundamental frequency
 3. **Maintain consistent perceptual distances**: The logarithmic scaling ensures consistent representation across the pitch spectrum
 
-Echos rotary implementation maps the perceptual properties of audio to the mathematical properties of the rotary embeddings, creating a more adaptive and context-aware representation system.
+Echos rotary implementation maps the perceptual properties of audio to the mathematical properties of the rotary embeddings, creating a more adaptive and context-aware representation system. Pitch is optionally extracted from audio in the data processing pipeline and can be used for an additional feature along with spectrograms and or used to inform the rotary and or pitch bias.
 
 #### Pitch bias
 
