@@ -739,7 +739,7 @@ class Residual(nn.Module):
         x = x + self.attna(self.lna(x), mask=mask, f0=f0)[0]
         
         if self.attnb and xa is not None:
-            cross = self.attnb(self.lnb(x), xa, f0=f0)[0]
+            cross = self.attnb(self.lnb(x), xa, f0=f0, mask=None)[0]
             blend = torch.sigmoid(self.blend_xa)
             x = blend * x + (1 - blend) * cross
         
@@ -979,7 +979,7 @@ class TextDecoder(nn.Module):
                 encoding = encoder_outputs[feature]
                 output = x
                 for layer in self.processors[feature]:
-                    output = layer(output, xa=encoding, mask=mask)
+                    output = layer(output, xa=encoding, mask=None)
                 if self.sequential:
                     x = output
                 else:
@@ -1394,8 +1394,6 @@ def extract_features(batch, tokenizer, spectrogram, waveforms, pitch,
     return batch
 
 def compute_metrics(eval_pred, compute_result: bool = True, print_pred: bool = False, num_samples: int = 0, tokenizer=None):
-    global extractor, model, optimizer, scheduler
-
     pred_logits = eval_pred.predictions
     label_ids = eval_pred.label_ids
 
@@ -1412,31 +1410,31 @@ def compute_metrics(eval_pred, compute_result: bool = True, print_pred: bool = F
         if not isinstance(pred_ids, torch.Tensor):
             pred_ids = torch.tensor(pred_ids)
         pred_ids = pred_ids.argmax(dim=-1)
-        pred_ids = pred_ids[:, 1:].tolist()
+        pred_ids = pred_ids[:, 1:].tolist()  
     elif hasattr(pred_ids, "tolist"):
         if isinstance(pred_ids, torch.Tensor) and pred_ids.ndim >= 2:
             pred_ids = pred_ids[:, 1:].tolist()
         else:
             pred_ids = pred_ids.tolist()
+            
     if hasattr(label_ids, "tolist"):
         label_ids = label_ids.tolist()
-    label_ids = [[0 if token == -100 else token for token in seq] for seq in label_ids]
     
-    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True, add_special_tokens=False)
-    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True, add_special_tokens=False)
+    label_ids = [[t for t in seq if t != 0] for seq in label_ids]
+    pred_ids = [[t for t in seq if t != 0] for seq in pred_ids]
+    
+    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
     if print_pred:
-        for i in range(num_samples):
+        for i in range(min(num_samples, len(pred_str))):
             print(f"Preds: {pred_str[i]}")
             print(f"Label: {label_str[i]}")
-            print(f"preds: {pred_ids[i]}")
-            print(f"label: {label_ids[i]}")
             print("--------------------------------")
     
     wer = 100 * metric.compute(predictions=pred_str, references=label_str)
-    metrics = {"wer": wer}
-    return metrics
-
+    return {"wer": wer}
+    
 logger = logging.getLogger(__name__)
 
 def create_model(param: Dimensions) -> Echo:
