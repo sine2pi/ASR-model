@@ -603,7 +603,7 @@ class MultiheadA(nn.Module):
         
         qk = (q * scale) @ (k * scale).transpose(-1, -2)
         
-        if f0 is not None and self.rope(learned_pitch = True):
+        if f0 is not None and self.rope.use_pbias:
             pitch_bias = self.rope.get_pitch_bias(f0)
             if pitch_bias is not None:
                 qk = qk + pitch_bias[:,:,:ctx,:ctx]
