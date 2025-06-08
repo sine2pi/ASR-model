@@ -27,7 +27,7 @@ This might be particularly useful for speech models where natural pauses and sil
 The model also ignores 0 in the loss calculation and uses 0 for all special tokens.
 Anything not near zero (or not zero) is an audio feature or the corresponding tokenized transcription of the feature.
 
-### Token and Value Handling in the Model
+#### Token and Value Handling in the Model
 
 1. **Zero in loss calculation**:
    ```python
