@@ -1,4 +1,5 @@
 ## Echo
+#### All of this is currently being tested and none of it is confirmed to work at all. 
 
 ### Leveraging Silence for Natural Generation Stopping
 
@@ -122,6 +123,8 @@ This makes tokens with similar pitch attend to each other more, which helps:
 - Group harmonically related segments
 
 The learned `pitch_scale` parameter lets the model tune how much to rely on pitch similarity.
+
+
 
 ```python
 
