@@ -1,4 +1,4 @@
-Echo
+### Echo
 
 #### Relationship Between Pitch and Rotary Embeddings
 The code implements two complementary pitch-based enhancements:
