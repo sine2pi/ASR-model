@@ -1,11 +1,11 @@
 
+from plotws import plot_waveform_and_spectrogram
 import pyworld as pw
 import os, math, warnings, logging, gzip, base64
 import torch, torchaudio
 import torchcrepe
 import torch.nn.functional as F
 import torch.nn.init as init
-import matplotlib.pyplot as plt
 from torch import nn, Tensor
 import numpy as np
 from typing import Optional, Dict, Union, List, Tuple, Any
@@ -54,134 +54,11 @@ class Dimensions:
     audio_dims: int
     audio_head: int
     audio_idx: int
-    pad_token_id: int
-    eos_token_id: int
     act: str
     debug: List[str]
     cross_attn: bool
     features: List[str]
     f0_rotary: bool
-
-def plot_waveform_and_spectrogram(x=None, w=None, p=None, per=None, sample_idx=0, sr=16000, hop_length=160, 
-                                 title="", markers=None, marker_labels=None, 
-                                 show_voiced_regions=True, show_energy=False):
-    
-    num_plots = sum([x is not None, w is not None, p is not None, per is not None])
-    if num_plots == 0:
-        raise ValueError("No data to plot. Please provide at least one input tensor.")
-    time_spans = []
-    
-    if w is not None:
-        w_np = w[sample_idx].detach().cpu().numpy()
-        if w_np.ndim > 1:
-            w_np = w_np.squeeze()
-        time_spans.append(len(w_np) / sr)
-    if x is not None:
-        x_np = x[sample_idx].detach().cpu().numpy()
-        if x_np.shape[0] < x_np.shape[1]:
-            x_np = x_np.T
-        time_spans.append(x_np.shape[0] * hop_length / sr)
-    if p is not None:
-        p_np = p[sample_idx].detach().cpu().numpy()
-        if p_np.ndim > 1:
-            p_np = p_np.squeeze()
-        time_spans.append(len(p_np) * hop_length / sr)
-    if per is not None:
-        per_np = per[sample_idx].detach().cpu().numpy()
-        if per_np.ndim > 1:
-            per_np = per_np.squeeze()
-        time_spans.append(len(per_np) * hop_length / sr)
-    max_time = max(time_spans) if time_spans else 0
-    fig, axs = plt.subplots(num_plots, 1, figsize=(14, 4*num_plots), sharex=True)
-    if num_plots == 1:
-        axs = [axs]
-    if show_voiced_regions and per is not None:
-        per_np = per[sample_idx].detach().cpu().numpy()
-        if per_np.ndim > 1:
-            per_np = per_np.squeeze()
-        t_per = np.arange(len(per_np)) * hop_length / sr
-        threshold = 0.5
-        for ax in axs:
-            for i in range(len(per_np)-1):
-                if per_np[i] > threshold:
-                    ax.axvspan(t_per[i], t_per[i+1], color='lightblue', alpha=0.2, zorder=0)
-    current_ax = 0
-    if w is not None:
-        w_np = w[sample_idx].detach().cpu().numpy()
-        if w_np.ndim > 1:
-            w_np = w_np.squeeze()
-        t = np.arange(len(w_np)) / sr
-        axs[current_ax].plot(t, w_np, color="tab:blue")
-        
-        if show_energy:
-            frame_length = hop_length
-            hop_length_energy = hop_length // 2
-            energy = []
-            for i in range(0, len(w_np)-frame_length, hop_length_energy):
-                frame = w_np[i:i+frame_length]
-                energy.append(np.sqrt(np.mean(frame**2)))
-            energy = np.array(energy)
-            energy = energy / np.max(energy) * 0.8 * max(abs(w_np.min()), abs(w_np.max()))  
-            t_energy = np.arange(len(energy)) * hop_length_energy / sr
-            axs[current_ax].plot(t_energy, energy, color="red", alpha=0.7, label="Energy")
-            axs[current_ax].legend(loc='upper right')
-        axs[current_ax].set_title("Waveform")
-        axs[current_ax].set_ylabel("Amplitude")
-        axs[current_ax].set_xlim([0, max_time])
-        axs[current_ax].grid(True, axis='x', linestyle='--', alpha=0.3)
-        current_ax += 1
-    
-    if x is not None:
-        x_np = x[sample_idx].detach().cpu().numpy()
-        if x_np.shape[0] < x_np.shape[1]:
-            x_np = x_np.T
-        im = axs[current_ax].imshow(x_np.T, aspect="auto", origin="lower", cmap="magma", 
-                                   extent=[0, x_np.shape[0]*hop_length/sr, 0, x_np.shape[1]])
-        axs[current_ax].set_title("Spectrogram")
-        axs[current_ax].set_ylabel("Mel Bin")
-        axs[current_ax].set_xlim([0, max_time])
-        axs[current_ax].grid(True, axis='x', linestyle='--', alpha=0.3)
-        fig.colorbar(im, ax=axs[current_ax])
-        current_ax += 1
-    
-    if p is not None:
-        p_np = p[sample_idx].detach().cpu().numpy()
-        if p_np.ndim > 1:
-            p_np = p_np.squeeze()
-        t_p = np.arange(len(p_np)) * hop_length / sr
-        axs[current_ax].plot(t_p, p_np, color="tab:green")
-        axs[current_ax].set_title("Pitch")
-        axs[current_ax].set_ylabel("Frequency (Hz)")
-        axs[current_ax].set_xlim([0, max_time])
-        axs[current_ax].grid(True, axis='both', linestyle='--', alpha=0.3)
-        axs[current_ax].set_ylim([0, min(1000, p_np.max() * 1.2)])
-        current_ax += 1
-    
-    if per is not None:
-        per_np = per[sample_idx].detach().cpu().numpy()
-        if per_np.ndim > 1:
-            per_np = per_np.squeeze()
-        t_per = np.arange(len(per_np)) * hop_length / sr
-        axs[current_ax].plot(t_per, per_np, color="tab:red")
-        axs[current_ax].set_title("Period (Voice Activity)")
-        axs[current_ax].set_ylabel("periodocity")
-        axs[current_ax].set_xlim([0, max_time])
-        axs[current_ax].grid(True, axis='both', linestyle='--', alpha=0.3)
-        axs[current_ax].set_ylim([-0.05, 1.05])
-        axs[current_ax].axhline(y=0.5, color='k', linestyle='--', alpha=0.3)
-    
-    if markers is not None:
-        for i, t in enumerate(markers):
-            label = marker_labels[i] if marker_labels and i < len(marker_labels) else None
-            for ax in axs:
-                ax.axvline(x=t, color='k', linestyle='-', alpha=0.7, label=label if i == 0 else None)
-        if marker_labels:
-            axs[0].legend(loc='upper right', fontsize='small')
-    axs[-1].set_xlabel("Time (s)")
-    fig.suptitle(title, fontsize=16)
-    plt.tight_layout(rect=[0, 0, 1, 0.97])
-    plt.show()
-    return fig
 
 def exists(v):
     return v is not None
@@ -239,6 +116,7 @@ def LayerNorm(x: Tensor, normalized_shape: Union[int, Tensor, List, Tuple],
                eps: float = 1e-5) -> Tensor:
     return F.layer_norm(x, normalized_shape, weight, bias, eps)
 
+
 def get_device():
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -293,6 +171,7 @@ def print_grads(grads):
                     ratio = gate_sum / mlp_sum
                     gate_ratios[base] = ratio
     
+
     for name, ratio in gate_ratios.items():
         print(f"{name}: gate/mlp ratio = {ratio:.4f}")
 
@@ -309,7 +188,6 @@ def print_grads(grads):
     for base, vals in attn_grads.items():
         if len(vals) == 3:  # Has q,k,v
             print(f"{base}: Q={vals['q']:.4f}, K={vals['k']:.4f}, V={vals['v']:.4f}")
-
 
 def sinusoids(length, channels, max_timescale=10000):
     """Returns sinusoids for positional embedding"""
@@ -329,7 +207,7 @@ class RotarySim(nn.Module):
     def forward(self, x, f0=None):
         t = torch.arange(x, device=self.device).float()
         freqs = self.get_freqs(t, f0)
-
+        
         sim_mat = self.pos_similarity(freqs)
         return freqs, sim_mat
     
@@ -347,18 +225,19 @@ class RotarySim(nn.Module):
         return freqs
     
     def pos_similarity(self, freqs):
-        real = freqs.real.unsqueeze(-2)  # [..., 1, dims/2]
-        imag = freqs.imag.unsqueeze(-2)  # [..., 1, dims/2]
-        vecs = torch.cat([real, imag], dim=-1)  # [..., 1, dims]
-
-        vecs = vecs.squeeze(0)  # [ctx, dims]
-        return F.cosine_similarity(vecs.unsqueeze(1), vecs.unsqueeze(0), dim=-1)  # [ctx, ctx]
+        real = freqs.real.unsqueeze(-2)
+        imag = freqs.imag.unsqueeze(-2)
+        vecs = torch.cat([real, imag], dim=-1)
+        
+        vecs = vecs.squeeze(0)
+        return F.cosine_similarity(vecs.unsqueeze(1), vecs.unsqueeze(0), dim=-1)
 
 class rotary(nn.Module):
-    def __init__(self, dims, max_ctx=1500, theta=10000, learned_freq=False, variable_radius=False,
+    _seen = set()  
+    def __init__(self, dims, max_ctx=1500, theta=5000, learned_freq=False, variable_radius=False,
                  learned_radius=False, learned_theta=False, learned_pitch=False, debug: List[str] = []):
         super().__init__()
-        self.use_pbias = True 
+        self.use_pbias = False
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.device = device
@@ -371,14 +250,14 @@ class rotary(nn.Module):
         self.variable_radius = variable_radius
         
         self.inv_freq = nn.Parameter(
-                1.0 / (10000 ** (torch.arange(0, dims, 2, device=device, dtype=dtype) / dims)),
+                1.0 / (5000 ** (torch.arange(0, dims, 2, device=device, dtype=dtype) / dims)),
                 requires_grad=learned_freq)
         self.theta = nn.Parameter(
             torch.tensor(float(theta)), requires_grad=learned_theta)
         self.min_theta = nn.Parameter(
-            torch.tensor(800.0), requires_grad=learned_theta)
+            torch.tensor(600.0), requires_grad=learned_theta)
         self.max_theta = nn.Parameter(
-            torch.tensor(10000.0), requires_grad=learned_theta)
+            torch.tensor(2400.0), requires_grad=learned_theta)
         
         self.pitch_scale = nn.Parameter(torch.tensor(1.0), 
                                         requires_grad=learned_pitch)
@@ -442,15 +321,21 @@ class rotary(nn.Module):
         else:
             freqs = torch.polar(torch.ones_like(freqs), freqs)
         freqs = freqs.unsqueeze(0)
-        
+            
         if "rotary" in self.debug:
-            if self._counter == 1:
-                print(f'ROTA -- freqs: {freqs.shape}, x: {x},  {t.shape if x is not None else None}', freqs.shape, t.shape)
-            if f0 is not None and self._counter % 100 == 0:
-                print(f"Step {self._counter}: Using raw F0 as theta: {f0_theta:.2f} Hz")
+            if f0 is not None:
+                key = f"{self._counter}_{f0_theta:.2f}"
+                if key not in rotary._seen:
+                    if not hasattr(self, '_prev_f0_theta'):
+                        self._prev_f0_theta = f0_theta
+                        print(f"Step {self._counter}: Using raw F0 as theta: {f0_theta:.2f} Hz")
+                    elif abs(self._prev_f0_theta - f0_theta) > 200.0:
+                        print(f"Step {self._counter}: Using raw F0 as theta: {f0_theta:.2f} Hz")
+                        self._prev_f0_theta = f0_theta
+                    rotary._seen.add(key)
             self._counter += 1
             
-        return freqs
+        return freqs      
 
     @staticmethod
     def apply_rotary(x, freqs):
@@ -485,34 +370,25 @@ class rotary(nn.Module):
                 return torch.cat([x1.type_as(x), x2], dim=-1)
 
 def optimized_attention(q, k, v, mask=None, scale=None, pad_token=0, fzero_val=0.0001):
-
-    batch, heads, ctx, dim = q.shape
+    batch, heads, ctx, dims = q.shape
     token_ids = k[:, :, :, 0]
     is_padding = (token_ids.float() == pad_token).unsqueeze(-2)
     log_scale_factor = -10.0  
     attn_mask = torch.zeros((batch, heads, ctx, ctx), device=q.device)
-    
     if mask is not None:
         attn_mask = attn_mask + mask.unsqueeze(0).unsqueeze(0)
-    
     attn_mask = torch.where(is_padding, 
                             torch.tensor(log_scale_factor, device=q.device), 
                             attn_mask)
     attn_output = torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, 
-        attn_mask=attn_mask,
-        dropout_p=0.0,
-        is_causal=False
-    )
-    
+        q, k, v, attn_mask=attn_mask,
+        dropout_p=0.0, is_causal=False)
     attn_output = attn_output.permute(0, 2, 1, 3).flatten(start_dim=2)
     return attn_output
         
 class MultiheadA(nn.Module):
-
     def __init__(self, dims: int, head: int, rotary_emb: bool = False, 
                  zero_val: float = 0.0001, min: float = 0.000001, max: float = 0.001, debug: List[str] = [], use_optimized_attn=False):
-        
         super(MultiheadA, self).__init__()
 
         self.debug = debug
@@ -526,7 +402,7 @@ class MultiheadA(nn.Module):
         self.zero_val = zero_val
         self.use_optimized_attn = use_optimized_attn
         self._counter = 0
-        self.bias = False
+
         
         if dims % head != 0:
             raise ValueError(f"Dimensions {dims} must be divisible by number of heads {head}.")
@@ -556,18 +432,15 @@ class MultiheadA(nn.Module):
             # self.rope.add_to_rotary()
             
         else:
-            self.rope = None
-              
+            self.rope = None        
         
     def forward(self, x: Tensor, xa: Tensor = None, mask: Tensor = None, 
                 return_attn: bool = False, f0: Tensor = None) -> tuple:
 
         z = default(xa, x)
-        
         q = self.q(x).to(x.dtype)
         k = self.k(z).to(x.dtype)
         v = self.v(z).to(x.dtype)
-    
         batch, ctx, dims = q.shape
         scale = (dims // self.head) ** -0.25
         
@@ -591,14 +464,8 @@ class MultiheadA(nn.Module):
             v = v.view(*v.shape[:2], self.head, -1).permute(0, 2, 1, 3)
         
         if self.use_optimized_attn and not return_attn:
-            wv = optimized_attention(
-                q * scale, 
-                k * scale, 
-                v, 
-                mask=mask,
-                pad_token=self.pad_token,
-                fzero_val=torch.clamp(F.softplus(self.fzero), self.min, self.max).item()
-            )
+            wv = optimized_attention(q * scale, k * scale, v, mask=mask,
+                pad_token=self.pad_token, fzero_val=torch.clamp(F.softplus(self.fzero), self.min, self.max).item())
             return self.o(wv), None
         
         qk = (q * scale) @ (k * scale).transpose(-1, -2)
@@ -608,7 +475,6 @@ class MultiheadA(nn.Module):
             if pitch_bias is not None:
                 qk = qk + pitch_bias[:,:,:ctx,:ctx]
         
-        
         token_ids = k[:, :, :, 0]
         zscale = torch.ones_like(token_ids)
         fzero = torch.clamp(F.softplus(self.fzero), self.min, self.max)
@@ -617,7 +483,6 @@ class MultiheadA(nn.Module):
         if mask is not None:
             mask = mask[:ctx, :ctx]
             qk = qk + mask.unsqueeze(0).unsqueeze(0) * zscale.unsqueeze(-2).expand(qk.shape)
-        
         qk = qk * zscale.unsqueeze(-2)
         
         if return_attn:
@@ -630,14 +495,10 @@ class MultiheadA(nn.Module):
             print(f"Step {self._counter}: Using rotary embeddings: {self.rotary_emb}")
             print(f"MHA: q={q.shape}, k={k.shape}, v={v.shape}")
             print(f"Attention shape: {qk.shape}, wv shape: {wv.shape}")
-
         self._counter += 1        
                 
         return self.o(wv), qk.detach()
     
-
-
-
 class FeatureConditionedGate(nn.Module):
     def __init__(self, dims, features_dim):
         super().__init__()
@@ -707,7 +568,7 @@ class CrossModalGate(nn.Module):
         
         combined = torch.cat([spec_contribution, wave_contribution, pitch_contribution], dim=-1)
         return self.integration(combined)
-    
+
 class Residual(nn.Module):
     
     def __init__(self, dims: int, head: int, ctx, act, cross_attn=True, debug: List[str] = [], 
@@ -803,7 +664,6 @@ class Residual(nn.Module):
                 
         return x
 
-
 class PitchEncoder(nn.Module):
     def __init__(self, input_dims, dims, head, layer, kernel_size, act):
         super().__init__()
@@ -829,7 +689,6 @@ class PitchEncoder(nn.Module):
         
     def forward(self, x):
         return self.encoder(x)
-
 
 class WaveformEncoder(nn.Module):
     def __init__(self, input_dims, dims, head, layer, kernel_size, act):
@@ -922,7 +781,6 @@ class AudioEncoder(nn.Module):
             )
             })
 
-
     def forward(self, x):
         
         if self._counter < 1:
@@ -943,18 +801,15 @@ class AudioEncoder(nn.Module):
                 for blk in self.processors[feature]:
                     feat = blk(feat, f0=f0)
                 feature_outputs[feature] = feat
-               
+              
         if "encoder" in self.debug and self._counter % 100 == 0:
             feature_names = list(x.keys())
             feature_shapes = {k: v.shape for k, v in x.items()}
             print(f"Step {self._counter}: Processed modalities: {feature_names}")
             print(f"Feature shapes: {feature_shapes}")
-            
         self._counter += 1
         
         return feature_outputs
-
-
 
 class TextDecoder(nn.Module):
     def __init__(self, vocab: int, layer: int, dims: int, head: int, ctx: int, cross_attn: bool, 
@@ -1020,12 +875,21 @@ class TextDecoder(nn.Module):
                 
         return logits
 
-
-
 class Echo(nn.Module):
     def __init__(self, param: Dimensions):
         super().__init__()
         self.param = param
+
+        self.shared = nn.ModuleDict({
+            "rotary_encoder": rotary(dims=param.audio_dims // param.audio_head, max_ctx=param.audio_ctx),
+            "rotary_decoder": rotary(dims=param.text_dims // param.text_head, max_ctx=param.text_ctx),
+        })
+
+        self.param_tracking_paths = {
+            "RotationA": "encoder.blockA.0.attna.rotary.inv_freq",
+            "RotationB": "decoder.rotary.inv_freq",
+            "Silence": "encoder.blockA.0.attna.Factor",
+        }
 
         self.encoder = AudioEncoder(
             mels=param.mels,
@@ -1090,12 +954,17 @@ class Echo(nn.Module):
 
         loss = None
         if labels is not None:
-            loss_fn = torch.nn.CrossEntropyLoss(ignore_index=0)
-            shifted_logits = logits[:, :-1, :].contiguous()
-            shifted_labels = labels[:, 1:].contiguous()
-            loss = loss_fn(
-                shifted_logits.view(-1, shifted_logits.shape[-1]), 
-                shifted_labels.view(-1))
+            loss = F.cross_entropy(
+                logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=0)
+
+        # loss = None
+        # if labels is not None:
+        #     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=0)
+        #     shifted_logits = logits[:, :-1, :].contiguous()
+        #     shifted_labels = labels[:, 1:].contiguous()
+        #     loss = loss_fn(
+        #         shifted_logits.view(-1, shifted_logits.shape[-1]), 
+        #         shifted_labels.view(-1))
           
         return {
             "logits": logits,
@@ -1103,7 +972,8 @@ class Echo(nn.Module):
             "labels": labels,
             "input_ids": input_ids,
             "decoder_input_ids": decoder_input_ids,
-            "encoder_output": encoder_outputs} 
+            "encoder_output": encoder_outputs
+            } 
 
     def device(self):
         return next(self.parameters()).device
@@ -1159,15 +1029,14 @@ class Echo(nn.Module):
             if count > 0:
                 print(f"{module_type}: {count}")
 
-
-
 metric = evaluate.load(path="wer")
 
 @dataclass
 class DataCollator:
     tokenizer: Any
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        global extractor
+        pad_token = self.tokenizer.pad_token_id
+        bos_token = self.tokenizer.bos_token_id
         spec_pad = 0
         wav_pad = 0
         batch = {}
@@ -1210,15 +1079,15 @@ class DataCollator:
 
             for label in labels_list:
                 label_list = label.tolist() if isinstance(label, torch.Tensor) else label
-                decoder_input = [self.tokenizer.bos_token_id] + label_list                
-                label_with_eos = label_list + [self.tokenizer.pad_token_id]  
+                decoder_input = [bos_token] + label_list                
+                label_with_eos = label_list + [pad_token]  
                 input_padding_len = max_len_labels + 1 - len(decoder_input)
                 label_padding_len = max_len_labels + 1 - len(label_with_eos)                
-                padded_input = decoder_input + [self.tokenizer.pad_token_id] * input_padding_len
-                padded_labels = label_with_eos + [self.tokenizer.pad_token_id] * label_padding_len                
+                padded_input = decoder_input + [pad_token] * input_padding_len
+                padded_labels = label_with_eos + [pad_token] * label_padding_len                
                 all_input_ids.append(padded_input)
                 all_labels.append(padded_labels)            
-                
+
             batch["input_ids"] = torch.tensor(all_input_ids, dtype=torch.long)
             batch["labels"] = torch.tensor(all_labels, dtype=torch.long)
 
@@ -1236,7 +1105,6 @@ class DataCollator:
                 pad_pitch.append(pad_pitch_item)
             batch["pitch"] = torch.stack(pad_pitch)
         return batch
-
 
 def downsample(wav, output_dims=64):
     if wav.dim() == 1:
@@ -1285,10 +1153,10 @@ def extract_enhanced_pitch(wav_1d, sampling_rate, hop_length):
     
     return pitch_features
 
-def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=True, pitch2=False, period=False, downsamples=True, oh_my=False,
+def extract_features(batch, tokenizer, spectrogram, waveforms, pitch,
                      hop_length=128, fmin=0, fmax=8000, n_mels=128, n_fft=1024, sampling_rate=16000,
                      pad_mode="constant", center=True, power=2.0, window_fn=torch.hann_window, mel_scale="htk", 
-                     norm=None, normalized=False):
+                     norm=None, normalized=False, downsamples=False, period=False, pitch2=False, oh_my=False):
     
     global model, extractor
 
@@ -1327,16 +1195,15 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
             center=center, 
             mel_scale=mel_scale,
             window_fn=window_fn,
-            pad_mode=pad_mode,  
-
-            )
-    
+            pad_mode=pad_mode)
+        
         mel_spectrogram = transform(wav)      
         log_mel = torch.clamp(mel_spectrogram, min=1e-10).log10()
         log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
         spec = (log_mel + 4.0) / 4.0
         spec = torch.tensor(spec)
-
+        batch["spectrogram"] = spec
+        
     wav_1d = wav.unsqueeze(0)
     
     if waveforms:
@@ -1377,8 +1244,8 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
             return_periodicity=False, 
             device=device, 
             pad=True
-        )
-        batch["pitch"] = pit
+            )
+            batch["pitch"] = pit
         
     if pitch2:
         wav_1d = wav.squeeze(0)
@@ -1387,9 +1254,6 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
         f0 = pw.stonemask(wav_1d.numpy().astype(np.float64), f0, t, sampling_rate)
         pit = torch.from_numpy(f0).float().unsqueeze(0)
         batch["pitch"] = pit
-        
-    if spectrogram:
-        batch["spectrogram"] = spec
                     
     if spectrogram and waveforms and pitch and oh_my:
         spec_mean = batch["spectrogram"].mean()
@@ -1406,6 +1270,7 @@ def extract_features(batch, tokenizer, spectrogram=True, waveforms=True, pitch=T
             batch["pitch"] = (batch["pitch"] - pitch_min) / (pitch_max - pitch_min)
         
     batch["labels"] = tokenizer.encode(batch["transcription"], add_special_tokens=False)
+    
     return batch
 
 def compute_metrics(eval_pred, compute_result: bool = True, print_pred: bool = False, num_samples: int = 0, tokenizer=None):
@@ -1434,7 +1299,7 @@ def compute_metrics(eval_pred, compute_result: bool = True, print_pred: bool = F
         else:
             pred_ids = pred_ids.tolist()
     if hasattr(label_ids, "tolist"):
-        label_ids = label_ids[:, :-1].tolist()
+        label_ids = label_ids.tolist()
     label_ids = [[0 if token == -100 else token for token in seq] for seq in label_ids]
     
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True, add_special_tokens=False)
@@ -1465,17 +1330,22 @@ def create_model(param: Dimensions) -> Echo:
     print(f"Total parameters: {total_params:,}")
     return model
 
-def setup_tokenizer(token: str, local_tokenizer_path: str = "./tokenizer") -> WhisperTokenizer:
+def setup_tokenizer(token: str, local_tokenizer_path: str = "./tokenizer3") -> WhisperTokenizer:
     tokenizer = WhisperTokenizer.from_pretrained(
         local_tokenizer_path,
-        pad_token="<PAD>", # This is the padding token = 0
-        eos_token="<EOS>",
-        bos_token="<BOS>",
         token=token,
+        bos_token = "<BOS>",
+        pad_token = "<PAD>",
+        # eos_token = "<EOS>",
         local_files_only=True)
     tokenizer.pad_token_id = 0
-    tokenizer.eos_token_id = 0
-    tokenizer.bos_token_id = 50258
+    tokenizer.bos_token_id = 1
+    tokenizer.add_tokens(["<BOS>", "<PAD>"])
+    tokenizer.add_special_tokens({
+        "bos_token": "<BOS>",
+        "pad_token": "<PAD>",
+        # "eos_token": "<EOS>"
+        })    
     return tokenizer
 
 def prepare_datasets(tokenizer: WhisperTokenizer, token: str, sanity_check: bool = False, dataset_config: Optional[Dict] = None) -> Tuple[any, any]:
@@ -1498,8 +1368,7 @@ def prepare_datasets(tokenizer: WhisperTokenizer, token: str, sanity_check: bool
         "en_us", 
         token=token, 
         trust_remote_code=True,
-        streaming=False
-    )
+        streaming=False)
     
     dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000))
     
@@ -1587,10 +1456,7 @@ def get_training_args(
         save_safetensors=False,
         eval_on_start=eval_on_start,
         batch_eval_metrics=batch_eval_metrics,
-        max_grad_norm=max_grad_norm,
-        
-    )
-
+        max_grad_norm=max_grad_norm)
 
 def main():
      
@@ -1639,17 +1505,15 @@ def main():
         audio_dims=512,
         audio_idx=4,
         vocab=len(tokenizer),
-        text_ctx=256,
+        text_ctx=512,
         text_head=4,
         text_dims=512,
         text_idx=4,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        act="gelu",
+        act="swish",
         debug={},#{"encoder", "decoder", "residual", "rotary"},
         cross_attn=True,
-        f0_rotary=False,
-        features = ["waveform", "spectrogram"], # ["spectrogram", "waveform", "pitch"]
+        f0_rotary=True, 
+        features = ["spectrogram"], # ["spectrogram", "waveform", "pitch"]
         )
     
     sanity_check = False
@@ -1658,8 +1522,8 @@ def main():
 
     dataset_config = {
         "spectrogram": True,
-        "waveforms": True,
-        "pitch": False,
+        "waveforms": False,
+        "pitch": True,
         "downsamples": False,
         "hop_length": 128,
         "fmin": 150,
@@ -1676,7 +1540,6 @@ def main():
         "normalized": False,
         }
     
-
     metrics_fn = partial(compute_metrics, print_pred=True, num_samples=1, 
                     tokenizer=tokenizer)
     
@@ -1689,7 +1552,7 @@ def main():
         dataset_config=dataset_config)
     
     model = create_model(param)
-    model.decoder.feature_order = ["waveform", "spectrogram", "pitch"]
+    # model.decoder.feature_order = ["spectrogram", "waveform", "pitch"]
     trainer = Seq2SeqTrainer(
         args=training_args,
         model=model,
@@ -1698,11 +1561,10 @@ def main():
         data_collator=DataCollator(tokenizer=tokenizer),
         compute_metrics=metrics_fn)
     
+
     grads, _ = grad_check(model)
     trainer.train()
     print_grads(grads)
-
-
 
 if __name__ == "__main__":
     main()
