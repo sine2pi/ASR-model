@@ -2,7 +2,7 @@
 
 #### Leveraging Silence for Natural Generation Stopping
 
-Intuition: Help the model learn to naturally stop at silence.
+#### Intuition: Help the model learn to naturally stop at silence.
 
 By scaling attention scores related to pad/silence tokens down to near zero, we are creating a consistent pattern that the model can learn:
 
@@ -60,16 +60,14 @@ The code implements two complementary pitch-based enhancements:
 1. The first uses pitch to modify theta (rotary frequency)
 2. The second adds direct similarity bias to attention
 
-#### Intuition.
-
-The rotary embeddings (RoPE) work by encoding positions using complex numbers with different frequencies. The theta parameter essentially controls how quickly these rotary patterns change across positions. This has a natural relationship to audio pitch:
+#### Intuition: The rotary embeddings (RoPE) work by encoding positions using complex numbers with different frequencies. The theta parameter essentially controls how quickly these rotary patterns change across positions. This has a natural relationship to audio pitch:
 
 ```python
 perceptual_factor = torch.log(1 + f0_mean / 700.0) / torch.log(torch.tensor(1 + 300.0 / 700.0))
 f0_theta = self.min_theta + perceptual_factor * (self.max_theta - self.min_theta)
 ```
 
-This relationship works because:
+This relationship should work because:
 
 1. **Both are frequency-based concepts**: Pitch is a frequency, and theta controls frequency of position encodings
 2. **Both follow logarithmic perception**: The code uses a logarithmic scaling that matches how humans perceive pitch differences
