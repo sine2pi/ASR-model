@@ -8,7 +8,8 @@ To highlight the relationship between pitch and rotary embeddings echo implement
 
 By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model: "pay attention to how these acoustic features relate to sequence position in a way that's proportional to the voice characteristics."  This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
 
-The patterns below show how positions "see" each other in relation to theta and f0:
+The patterns below show how positions "see" each other in relation to theta and f0.
+
 Bright diagonal line: Each position matches itself perfectly
 Wider bright bands: Positions can "see" farther (good for long dependencies) but can be noisy.
 Narrow bands: More focus on nearby positions (good for local patterns)
