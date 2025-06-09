@@ -10,7 +10,7 @@ By modulating the RoPE frequencies based on pitch (F0), we are essentially telli
 
 The patterns below show how positions "see" each other in relation to theta and f0.
 
-Bright diagonal line: Each position matches itself perfectly
+Bright diagonal line: Each position matches itself perfectly.
 Wider bright bands: Positions can "see" farther (good for long dependencies) but can be noisy.
 Narrow bands: More focus on nearby positions (good for local patterns)
 
