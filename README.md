@@ -6,7 +6,7 @@ To highlight the relationship between pitch and rotary embeddings echo implement
 1. The first uses pitch to modify theta (rotary frequency)
 2. The second adds direct similarity bias to attention
 
-By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model: "pay attention to how these acoustic features relate to sequence position in a way that's proportional to the voice characteristics."  This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
+By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model to pay attention to the acoustic features relate to sequence position in a way that's proportional to the voice characteristics.  This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
 
 The patterns below show how positions "see" each other in relation to theta and f0.
 
