@@ -1,21 +1,12 @@
 ## Echo
 ### Zero-Value Processing ASR model with Voice-modulated Rotary Position Encoding. (vRoPE)
 
-
-Relationship Between Pitch and Rotary Embeddings
-The code implements two complementary pitch-based enhancements:
+To highlight the relationship between pitch and rotary embeddings echo implements two complementary pitch-based enhancements:
 
 1. The first uses pitch to modify theta (rotary frequency)
 2. The second adds direct similarity bias to attention
-3. 
-By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model: "pay attention to how these acoustic features relate to sequence position in a way that's proportional to the voice characteristics."
 
-The theoretical foundation:
-- Both position and pitch can be represented as frequencies
-- Speech has inherent rhythmic and tonal patterns that correlate with semantic content
-- Varying the rotation frequency based on pitch creates a more speech-aware positional encoding
-
-This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
+By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model: "pay attention to how these acoustic features relate to sequence position in a way that's proportional to the voice characteristics."  This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
 
 The patterns below show how positions "see" each other in relation to theta and f0:
 Bright diagonal line: Each position matches itself perfectly
@@ -35,6 +26,11 @@ This makes tokens with similar pitch attend to each other more, which helps:
 - Track speaker consistency
 - Maintain coherent pitch patterns
 - Group harmonically related segments
+
+The theoretical foundation:
+- Both position and pitch can be represented as frequencies
+- Speech has inherent rhythmic and tonal patterns that correlate with semantic content
+- Varying the rotation frequency based on pitch creates a more speech-aware positional encoding
 
 Leveraging Silence for Natural Generation Stopping
 By scaling attention scores related to pad/silence tokens down to near zero, we are creating a consistent pattern that the model can learn
