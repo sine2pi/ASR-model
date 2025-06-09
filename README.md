@@ -23,18 +23,12 @@ The benefits of this approach:
 2. Content-based stopping: Model can learn to end generation based on acoustic properties rather than just position
 3. Learnable behavior: Using a learnable parameter (`self.fzero`) lets the model find the optimal scaling factor
 
-This might be particularly useful for speech models where natural pauses and silences should guide generation boundaries.
-The model also ignores 0 in the loss calculation and uses 0 for all special tokens.
-Anything not near zero (or not zero) is an audio feature or the corresponding tokenized transcription of the feature.
-
 Token and Value Handling in the Model
-
 1. Zero in loss calculation:
    ```python
    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=0)
    ```
    The model explicitly ignores index 0 in the loss calculation using `ignore_index=0` parameter.
-
 2. Zero for special tokens:
    ```python
    tokenizer.pad_token_id = 0
@@ -48,13 +42,6 @@ Token and Value Handling in the Model
    zscale[token_ids.float() == self.pad_token] = fzero.to(q.device, q.dtype)
    ```
    This specifically scales attention scores for pad tokens (0) down to near-zero values.
-
-4. Non-zero values represent meaningful content:
-   In the processing pipeline, actual audio features (after processing) and text tokens (after tokenization) are represented by non-zero values, making them stand out from the padded/silent regions.
-
-The approach of scaling down attention for padding/silent regions helps the model distinguish between content and non-content.
-
-"You're not going out on a limb at all." github copilot
 
 In standard usage, RoPE encodes relative positional information by applying frequency-based rotations to token embeddings. What this does is creates a meaningful bridge between two domains:
 
@@ -76,24 +63,123 @@ The code implements two complementary pitch-based enhancements:
 1. The first uses pitch to modify theta (rotary frequency)
 2. The second adds direct similarity bias to attention
 
-Intuition: The rotary embeddings (RoPE) work by encoding positions using complex numbers with different frequencies. The theta parameter essentially controls how quickly these rotary patterns change across positions. This has a natural relationship to audio pitch:
+The patterns show how positions "see" each other:
+Bright diagonal line: Each position matches itself perfectly
+Wider bright bands: Positions can "see" farther (good for long dependencies) but can be noisy.
+Narrow bands: More focus on nearby positions (good for local patterns)
 
+![2](https://github.com/user-attachments/assets/28d00fc5-2676-41ed-a971-e4d857af43f8)
+![1](https://github.com/user-attachments/assets/9089e806-966b-41aa-8793-bee03a6e6be1)
+
+plot code:
 ```python
-perceptual_factor = torch.log(1 + f0_mean / 700.0) / torch.log(torch.tensor(1 + 300.0 / 700.0))
-f0_theta = self.min_theta + perceptual_factor * (self.max_theta - self.min_theta)
+
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
+
+def test_rot(ctx=12, dims=120, f0s=[10, 100, 200, 300, 400, 500, 600]):
+   
+    results = {}
+    t = torch.arange(ctx).float()
+    
+    theta = 5000
+    inv_f = 1.0 / (theta ** (torch.arange(0, dims, 2) / dims))
+    
+    base_f = torch.einsum('i,j->ij', t, inv_f)
+    base_emb = torch.polar(torch.ones_like(base_f), base_f)
+    
+    real = base_emb.real
+    imag = base_emb.imag
+    vecs = torch.cat([real.unsqueeze(-2), imag.unsqueeze(-2)], dim=-1).squeeze(-2)
+    base_sim = F.cosine_similarity(vecs.unsqueeze(1), vecs.unsqueeze(0), dim=-1)
+    
+    results["base"] = base_sim
+    results["rope"] = base_sim  # Standard RoPE with θ=10000
+    
+    for f0 in f0s:
+        f0c = torch.clamp(torch.tensor(f0), min=80.0, max=600.0)
+        fac = torch.log(1 + f0c / 700.0) / torch.log(torch.tensor(1 + 300.0 / 700.0))
+        f0_t = 600.0 + fac * (2400.0 - 600.0)
+        o_inv = 1.0 / (f0_t ** (torch.arange(0, dims, 2) / dims))
+        o_freq = torch.einsum('i,j->ij', t, o_inv)
+        o_emb = torch.polar(torch.ones_like(o_freq), o_freq)
+        
+        h_fac = torch.log(1 + f0c / 700.0) / torch.log(torch.tensor(1 + 300.0 / 700.0))
+        h_freq = base_f * (1.0 + 0.3 * h_fac)
+        h_emb = torch.polar(torch.ones_like(h_freq), h_freq)
+        
+        for name, emb in [("orig"+str(f0), o_emb), ("hyb"+str(f0), h_emb)]:
+            r = emb.real
+            i = emb.imag
+            v = torch.cat([r.unsqueeze(-2), i.unsqueeze(-2)], dim=-1).squeeze(-2)
+            sim = F.cosine_similarity(v.unsqueeze(1), v.unsqueeze(0), dim=-1)
+            results[name] = sim
+    
+    return results
+
+sims = test_rot()
+rows = 2
+cols = len(sims) // rows + (1 if len(sims) % rows else 0)
+fig, axes = plt.subplots(rows, cols, figsize=(15, 8))
+axes = axes.flatten()
+
+for i, (key, sim) in enumerate(sims.items()):
+    axes[i].imshow(sim.numpy(), cmap='viridis')
+    axes[i].set_title(key)
+    axes[i].axis('off')
+
+plt.tight_layout()
+plt.show()
+
+def test_mod(ctx=10, dims=64, mods=[0.1, 0.3, 0.5, 0.7]):
+    t = torch.arange(ctx).float()
+    theta = 10000
+    inv_f = 1.0 / (theta ** (torch.arange(0, dims, 2) / dims))
+    base_f = torch.einsum('i,j->ij', t, inv_f)
+    
+    f0s = [100, 1000, 10000]
+    res = {)
+
+    base = torch.polar(torch.ones_like(base_f), base_f)
+    r = base.real
+    i = base.imag
+    v = torch.cat([r.unsqueeze(-2), i.unsqueeze(-2)], dim=-1).squeeze(-2)
+    res["base"] = F.cosine_similarity(v.unsqueeze(1), v.unsqueeze(0), dim=-1)
+    
+    for f0 in f0s:
+        f0c = torch.clamp(torch.tensor(f0), min=80.0, max=600.0)
+        fac = torch.log(1 + f0c / 700.0) / torch.log(torch.tensor(1 + 300.0 / 700.0))
+        
+        for m in mods:
+            freq = base_f * (1.0 + m * fac)
+            emb = torch.polar(torch.ones_like(freq), freq)
+            
+            r = emb.real
+            i = emb.imag
+            v = torch.cat([r.unsqueeze(-2), i.unsqueeze(-2)], dim=-1).squeeze(-2)
+            sim = F.cosine_similarity(v.unsqueeze(1), v.unsqueeze(0), dim=-1)
+            
+            res[f"f{f0}_m{m}"] = sim
+    
+    return res
+
+sims = test_mod()
+n = len(sims)
+r = 3
+c = (n + r - 1) // r
+fig, ax = plt.subplots(r, c, figsize=(12, 9))
+ax = ax.flatten()
+
+for i, (k, s) in enumerate(sims.items()):
+    ax[i].imshow(s.numpy(), cmap='viridis')
+    ax[i].set_title(k)
+    ax[i].axis('off')
+
+plt.tight_layout()
+plt.show()
 ```
-
-This relationship should work because:
-
-1. Both are frequency-based concepts: Pitch is a frequency, and theta controls frequency of position encodings
-2. Both follow logarithmic perception: The code uses a logarithmic scaling that matches how humans perceive pitch differences
-3. Both need different ranges for different content: Just as low-pitched voices need different analysis than high-pitched ones, different content needs different position encoding patterns
-
-Using pitch to adjust theta helps the model:
-
-1. Adapt to speaker characteristics: Different speakers (bass, tenor, alto, soprano) have fundamentally different pitch ranges
-2. Process frequency-dependent information: Formants and other speech features shift based on fundamental frequency
-3. Maintain consistent perceptual distances: The logarithmic scaling ensures consistent representation across the pitch spectrum
 
 Echos rotary implementation maps the perceptual properties of audio to the mathematical properties of the rotary embeddings, creating a more adaptive and context-aware representation system. Pitch is optionally extracted from audio in the data processing pipeline and can be used for an additional feature along with spectrograms and or used to inform the rotary and or pitch bias.
 
@@ -121,10 +207,7 @@ This makes tokens with similar pitch attend to each other more, which helps:
 
 The learned `pitch_scale` parameter lets the model tune how much to rely on pitch similarity.
 
-
-
 ```python
-
 
 class rotary(nn.Module):
     _seen = set()  
