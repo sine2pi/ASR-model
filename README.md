@@ -33,6 +33,9 @@ The theoretical foundation:
 - Speech has inherent rhythmic and tonal patterns that correlate with semantic content
 - Varying the rotation frequency based on pitch creates a more speech-aware positional encoding
 
+
+---
+
 Leveraging Silence for Natural Generation Stopping
 By scaling attention scores related to pad/silence tokens down to near zero, we are creating a consistent pattern that the model can learn
 
