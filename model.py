@@ -235,8 +235,7 @@ def LayerNorm(x: Tensor, normalized_shape: Union[int, Tensor, List, Tuple],
                weight: Optional[Tensor] = None, bias: Optional[Tensor] = None,
                eps: float = 1e-5) -> Tensor:
     return F.layer_norm(x, normalized_shape, weight, bias, eps)
-
-
+                   
 def get_device():
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -291,7 +290,6 @@ def print_grads(grads):
                     ratio = gate_sum / mlp_sum
                     gate_ratios[base] = ratio
     
-
     for name, ratio in gate_ratios.items():
         print(f"{name}: gate/mlp ratio = {ratio:.4f}")
 
@@ -354,7 +352,7 @@ class RotarySim(nn.Module):
 
 class rotary(nn.Module):
     _seen = set()  
-    def __init__(self, dims, max_ctx=1500, theta=5000, learned_freq=False, variable_radius=False,
+    def __init__(self, dims, max_ctx=1500, theta=10000, learned_freq=False, variable_radius=False,
                  learned_radius=False, learned_theta=False, learned_pitch=False, debug: List[str] = []):
         super().__init__()
         self.use_pbias = False
@@ -370,7 +368,7 @@ class rotary(nn.Module):
         self.variable_radius = variable_radius
         
         self.inv_freq = nn.Parameter(
-                1.0 / (5000 ** (torch.arange(0, dims, 2, device=device, dtype=dtype) / dims)),
+                1.0 / (10000 ** (torch.arange(0, dims, 2, device=device, dtype=dtype) / dims)),
                 requires_grad=learned_freq)
         self.theta = nn.Parameter(
             torch.tensor(float(theta)), requires_grad=learned_theta)
