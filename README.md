@@ -43,9 +43,9 @@ The theoretical foundation:
 
 ![flow](https://github.com/user-attachments/assets/28298306-816d-40b5-8390-63c762e0b69f)
 
-This was a pilot run for diagnostics and it's too early to make any deterministc statemnents about the model.
+This was a pilot run for diagnostics and it's too early to make any statement about the model.
 
-Some observations:
+However, some observations:
 
 ### Gate/MLP Ratios
 
