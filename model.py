@@ -1617,9 +1617,7 @@ def main():
         data_collator=DataCollator(tokenizer=tokenizer),
         compute_metrics=metrics_fn)
     
-    grads, activations, _ = grad_check(model)
     trainer.train()
-    print_grads(grads, activations)
 
 if __name__ == "__main__":
     main()
