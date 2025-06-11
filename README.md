@@ -110,7 +110,6 @@ These patterns explain why the model reached such impressive performance (5.37% 
 
 # Gating Analysis: Function vs. Shortcut Behavior
 
-Looking at your gradient flow analysis with those high gate/MLP ratios, this is a fascinating pattern that requires careful interpretation. Let me explain what's happening with these gates:
 
 ## What the Gate/MLP Ratios Tell Us
 
