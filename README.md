@@ -129,8 +129,5 @@ The high gate usage validates the fundamental frequency conditioning approach:
 - The decoder is learning to selectively attend to pitch-relevant patterns
 - The gates are functioning as a kind of "pitch-aware filter" that determines which information should flow through the network
 
-## Conclusion
-
 The gates are performing content-selective routing - a more sophisticated behavior than simple bypassing. This explains the excellent performance on a speech recognition task where selectively filtering frequency-specific information is critical.
 
-This is exactly what you want to see when using conditional embeddings with a gated architecture - the gates are actively responding to the conditioning signal.
