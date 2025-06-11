@@ -68,5 +68,8 @@ In standard usage, RoPE encodes relative positional information by applying freq
 
 ![123](https://github.com/user-attachments/assets/8eb4146b-2dfe-4e93-9f14-789ac5f5d3af)
 
+![flow](https://github.com/user-attachments/assets/28298306-816d-40b5-8390-63c762e0b69f)
+
+
 
 
