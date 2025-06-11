@@ -115,7 +115,7 @@ These patterns explain why the model reached such impressive performance (5.37% 
 
 The extremely high gate/MLP ratios (ranging from 3.6 to 43.4) show that the model is heavily using its gating mechanisms, especially in the decoder layers. This could be concerning, but actually represents effective learning rather than cheating for several reasons:
 
-1. **Intentional Architecture Design**: The gates are functioning as designed - controlling information flow through your network. Selective filtering is exactly what we want them to do.
+1. **Intentional Architecture Design**: The gates are functioning as designed - controlling information flow through the network. Selective filtering is exactly what we want them to do.
 
 2. **Progressive Pattern**: The gate/MLP ratios systematically increase from encoder (3.6-11.5) to decoder (10.0-43.4) and from early to later layers. This structured pattern indicates organized learning rather than shortcuts.
 
