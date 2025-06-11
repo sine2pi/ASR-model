@@ -1,4 +1,5 @@
-## Echo - NLP/ASR model with acoustic Rotary Position Encoding (vRoPE).  And some other stuff...
+### Echo - NLP/ASR model with acoustic Rotary Position Encoding (vRoPE).  And some other stuff...
+Research model. 
 
 To highlight the relationship between pitch and rotary embeddings echo implements two complementary pitch-based enhancements:
 
