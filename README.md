@@ -62,7 +62,9 @@ In standard usage, RoPE encodes relative positional information by applying freq
 1. Token positions (sequential information)
 2. Pitch information (acoustic properties)
 
-Initial test run with google/fleurs:
+---
+
+### Diagnostic test run with google/fleurs:
 
 ![123](https://github.com/user-attachments/assets/8eb4146b-2dfe-4e93-9f14-789ac5f5d3af)
 
