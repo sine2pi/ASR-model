@@ -43,9 +43,11 @@ The theoretical foundation:
 
 ![flow](https://github.com/user-attachments/assets/28298306-816d-40b5-8390-63c762e0b69f)
 
+This was a pilot run for diagnostics and it's too early to make any deterministc statemnents about the model.
 
+Some observations:
 
-## Gate/MLP Ratios
+### Gate/MLP Ratios
 
 These ratios show the relative importance of gating mechanisms versus standard MLP paths:
 
