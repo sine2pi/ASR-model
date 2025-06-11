@@ -64,7 +64,7 @@ In standard usage, RoPE encodes relative positional information by applying freq
 
 ---
 
-### Diagnostic test run with google/fleurs:
+### Diagnostic test run with google/fleurs - Spectrogram + f0_rotary:
 
 ![123](https://github.com/user-attachments/assets/8eb4146b-2dfe-4e93-9f14-789ac5f5d3af)
 
