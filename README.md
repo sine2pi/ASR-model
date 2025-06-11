@@ -35,34 +35,7 @@ The theoretical foundation:
 - Speech has inherent rhythmic and tonal patterns that correlate with semantic content
 - Varying the rotation frequency based on pitch creates a more speech-aware positional encoding
 
-
----
-
-Leveraging Silence for Natural Generation Stopping
-By scaling attention scores related to pad/silence tokens down to near zero, we are creating a consistent pattern that the model can learn
-
-This creates a direct correspondence between:
-- Log mel spectrograms near zero in silent regions
-- Attention scores that are scaled down for pad tokens
-
-The benefits of this approach:
-
-1. Consistent signals: The model gets similar signals for silence in both input data and attention patterns
-2. Content-based stopping: Model can learn to end generation based on acoustic properties rather than just position
-3. Learnable behavior: Using a learnable parameter (`self.fzero`) lets the model find the optimal scaling factor
-
-1. Zero in loss calculation
-   The model explicitly ignores index 0 in the loss calculation using `ignore_index=0` parameter.
-2. Zero for special tokens
-3. Attention scaling for zero tokens
-   This specifically scales attention scores for pad tokens (0) down to near-zero values.
-
-In standard usage, RoPE encodes relative positional information by applying frequency-based rotations to token embeddings. What this does is creates a meaningful bridge between two domains:
-
-1. Token positions (sequential information)
-2. Pitch information (acoustic properties)
-
----
+--- 
 
 ### Diagnostic test run with google/fleurs - Spectrogram + f0_rotary:
 
