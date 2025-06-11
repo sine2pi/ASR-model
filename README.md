@@ -106,3 +106,5 @@ The high gate usage validates the fundamental frequency conditioning approach:
 
 The gates are performing content-selective routing - a more sophisticated behavior than simple bypassing. This explains the excellent performance on a speech recognition task where selectively filtering frequency-specific information is critical.
 
+![sp](https://github.com/user-attachments/assets/a42f1f76-ec7c-460e-abbf-a75aae6ed1d0)
+
