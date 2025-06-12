@@ -208,7 +208,7 @@ class rotary(nn.Module):
 
         freqs = freqs.float()
         if self.variable_radius:
-            radius = F.softplus(self.radius)
+            radius = F.softplus(f0) #unscaled ?
             freqs = torch.polar(radius.unsqueeze(0).expand_as(freqs), freqs)
         else:
             freqs = torch.polar(torch.ones_like(freqs), freqs)
