@@ -197,6 +197,7 @@ class rotary(nn.Module):
         if f0 is not None:
             f0_mean = f0.mean()
             f0_theta = (f0_mean**2) * self.pitch_scale
+            #f0_theta = f0_mean * (f0_mean / self.theta) * self.theta * self.pitch_scale
             inv_freq = 1.0 / (f0_theta ** (torch.arange(0, self.dims, 2, device=self.device) / self.dims)) 
         else:
             inv_freq = self.inv_freq
@@ -206,20 +207,13 @@ class rotary(nn.Module):
             if f0 is not None:
                 f0 = f0[0]
                 seq_len = x
-                f0 = torch.tensor(f0, device=x.device if isinstance(x, torch.Tensor) else self.device)
+                f0 = torch.tensor(f0, device=device if isinstance(x, torch.Tensor) else device)
                 f0 = self.align_f0_to_tokens(f0, freqs.shape[-1])
-                max_f0 = torch.max(f0)
- 
-                if max_f0 > 0:
-                    radius = f0 / max_f0
-                else:
-                    radius = torch.ones_like(f0)
-                    
+                radius = 1.0 / (f0 + 1)
                 freqs = torch.polar(radius, freqs)
             else:
                 freqs = torch.polar(torch.ones_like(freqs), freqs)
-            freqs = freqs.unsqueeze(0)
-            print(f"radius, {radius}")
+        freqs = freqs.unsqueeze(0)
 
         if "rotary" in self.debug:
             if f0 is not None:
