@@ -5,7 +5,7 @@ To highlight the relationship between pitch and rotary embeddings echo implement
 
 1. The first uses pitch to modify theta (rotary frequency)
 2. The second adds direct similarity bias to attention
-3. Variable radii added in place of unit circle radius(1.0) associated with torch.polar with pitch time aligned with tokens creating acoustically-weighted positional encodings where the "loudness" of each position in the embedding space reflects the acoustic prominence in the original speech.
+3. Variable radii added in place of unit circle radius(1.0) associated with torch.polar. The frequencies (f0) are time aligned with tokens creating acoustically-weighted positional encodings where the "loudness" of each position in the embedding space reflects the acoustic prominence in the original speech.
 
 By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model to pay attention to the acoustic features relate to sequence position in a way that's proportional to the voice characteristics.  This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
 
