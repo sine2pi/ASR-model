@@ -4,8 +4,9 @@ Research model.
 To highlight the relationship between pitch and rotary embeddings echo implements two complementary pitch-based enhancements:
 
 1. The first uses pitch to modify theta (rotary frequency)
-2. The second adds direct similarity bias to attention
-3. Variable radii added in place of unit circle radius(1.0) associated with torch.polar. The frequencies (f0) are time aligned with tokens creating acoustically-weighted positional encodings where the "loudness" of each position in the embedding space reflects the acoustic prominence in the original speech.
+  -- Tests indicate that direct use of f0 without mapping resulted in better WER, 10k arbitrary?
+3. The second adds direct similarity bias to attention
+4. Variable radii added in place of unit circle radius(1.0) associated with torch.polar. The frequencies (f0) are time aligned with tokens creating acoustically-weighted positional encodings where the "loudness" of each position in the embedding space reflects the acoustic prominence in the original speech.
 
 By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model to pay attention to the acoustic features relate to sequence position in a way that's proportional to the voice characteristics.  This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
 
@@ -52,6 +53,7 @@ The high gate usage validates the fundamental frequency conditioning approach:
 - Pitch-adaptive rotary embeddings are providing meaningful signal that the gates are actively utilizing
 - The decoder is learning to selectively attend to pitch-relevant patterns
 - The gates are functioning as a kind of "pitch-aware filter" that determines which information should flow through the network
+- Mapping f0 to standard 10k theta/base results worse than using f0 directly.
 
 
 ![sp](https://github.com/user-attachments/assets/a29f8c97-71c7-4bfc-9c11-76005614822c)
