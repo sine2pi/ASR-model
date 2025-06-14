@@ -44,7 +44,11 @@ This rotary also uses variable radii. Pitch maps to each via a variable length r
 
 ### Diagnostic test run with google/fleurs - Spectrogram + f0_rotary:
 
-<img width="570" alt="score" src="https://github.com/user-attachments/assets/679d5032-6e84-4fe6-892c-6b01c6cb14ce" />
+<img width="689" alt="graph" src="https://github.com/user-attachments/assets/c161a89d-539c-4983-8d24-12ec41ebc859" />
+
+<img width="277" alt="321" src="https://github.com/user-attachments/assets/4cc71b43-3e48-4241-b381-5bda17ed9d0d" />
+
+https://huggingface.co/Sin2pi/Echo17/tensorboard
 
 ## The F0-Conditioned Rotation Mechanism
 
@@ -56,8 +60,6 @@ The high gate usage validates the fundamental frequency conditioning approach:
 - Mapping f0 to standard 10k theta/base results worse than using f0 directly.
 
 
-<img width="689" alt="graph" src="https://github.com/user-attachments/assets/c161a89d-539c-4983-8d24-12ec41ebc859" />
 
-<img width="277" alt="321" src="https://github.com/user-attachments/assets/4cc71b43-3e48-4241-b381-5bda17ed9d0d" />
 
 
