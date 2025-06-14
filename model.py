@@ -242,7 +242,7 @@ class rotary(nn.Module):
         t = torch.arange(seq_len, device=self.device).float()
 
         if f0 is not None:
-            f0_mean = f0.mean()
+            f0_mean = f0.mean() + 1e-8
             theta = self.theta
             f0_theta = (theta / 2) * (f0_mean * 1e-2 + 1.0)
             freqs = 1.0 / (f0_theta ** (torch.arange(0, self.dims, 2, device=self.device) / self.dims))
