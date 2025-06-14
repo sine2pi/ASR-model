@@ -45,8 +45,8 @@ This rotary also uses variable radii. Pitch maps to each via a variable length r
 ### Diagnostic test run with google/fleurs - Spectrogram + f0_rotary:
 
 <img width="689" alt="graph" src="https://github.com/user-attachments/assets/c161a89d-539c-4983-8d24-12ec41ebc859" />
-
 <img width="277" alt="321" src="https://github.com/user-attachments/assets/4cc71b43-3e48-4241-b381-5bda17ed9d0d" />
+<img width="727" alt="eff" src="https://github.com/user-attachments/assets/ffb9dd2f-e536-4d4d-9590-cacc1e78ebcf" />
 
 https://huggingface.co/Sin2pi/Echo17/tensorboard
 
