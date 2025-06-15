@@ -603,7 +603,7 @@ class Residual(nn.Module):  # noqa: F811
             x = x + gate * mlp_out
         
         elif self.fgate:
-            embedding = f0.mean(dim=1) if f0 is not None else xa.mean(dim=1)
+            embedding = f0.mean(dim=1) if f0 is not None else default(xa, x).mean(dim=1)
             gate = self.fg(normx, embedding)
             x = x + gate * mlp_out
         
