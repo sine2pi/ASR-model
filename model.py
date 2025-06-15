@@ -604,7 +604,7 @@ class Residual(nn.Module):  # noqa: F811
         
         elif self.fgate:
             embedding = f0.mean(dim=1) if f0 is not None else default(xa, x).mean(dim=1)
-            gate = self.fg(normx, embedding)
+            gate = self.fgate(normx, embedding)
             x = x + gate * mlp_out
         
         elif self.mgate:
