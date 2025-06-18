@@ -1,5 +1,4 @@
-### Echo - NLP/ASR model with acoustic variable radii relative position encoding (vRoPE) that maps pitch to token.  And some other stuff...
-Research model. 
+### Echo - NLP/ASR model with acoustic variable radii encoding (vRoPE) that maps pitch to token. 
 
 To highlight the relationship between pitch and rotary embeddings echo implements two complementary pitch-based enhancements:
 
@@ -18,9 +17,6 @@ Narrow bands: More focus on nearby positions (good for local patterns)
 
 ![2](https://github.com/user-attachments/assets/28d00fc5-2676-41ed-a971-e4d857af43f8)
 ![1](https://github.com/user-attachments/assets/9089e806-966b-41aa-8793-bee03a6e6be1)
-
-Static 10k theta is perfectly fine for a text model but probably not for a NLP ai.
-
 
 Echos rotary implementation maps the perceptual properties of audio to the mathematical properties of the rotary embeddings, creating a more adaptive and context-aware representation system. Pitch is optionally extracted from audio in the data processing pipeline and can be used for an additional feature along with spectrograms and or used to inform the rotary and or pitch bias.
 
@@ -56,7 +52,7 @@ https://huggingface.co/Sin2pi/Echo17/tensorboard
 
 1000 steps with f0
 
-<img width="506" alt="321" src="https://github.com/user-attachments/assets/24a68910-b316-4cfc-8927-5c6fd846b919" />
+<img width="470" alt="321" src="https://github.com/user-attachments/assets/24a68910-b316-4cfc-8927-5c6fd846b919" />
 
 
 ## The F0-Conditioned Rotation Mechanism
