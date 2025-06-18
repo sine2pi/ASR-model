@@ -50,6 +50,15 @@ This rotary also uses variable radii. Pitch maps to each via a variable length r
 
 https://huggingface.co/Sin2pi/Echo17/tensorboard
 
+1000 steps no f0
+
+<img width="470" alt="123" src="https://github.com/user-attachments/assets/1b3ca1e8-0b7d-47dd-802b-5eda9537ae13" />
+
+1000 steps with f0
+
+<img width="506" alt="321" src="https://github.com/user-attachments/assets/24a68910-b316-4cfc-8927-5c6fd846b919" />
+
+
 ## The F0-Conditioned Rotation Mechanism
 
 The high gate usage validates the fundamental frequency conditioning approach:
