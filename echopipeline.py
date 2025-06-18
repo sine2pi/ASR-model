@@ -128,9 +128,9 @@ class DataCollator:
             batch["pitch"] = torch.stack(pad_pitch)
 
         if "f0" in features[0] and features[0]["f0"] is not None:
-            f0_labels = batch.get("labels", None)
-            if f0_labels is not None:
-                target_length = f0_labels.shape[-1]
+            input_ids_batch = batch.get("input_ids", None)  
+            if input_ids_batch is not None:
+                target_length = input_ids_batch.shape[-1] 
                 aligned_list = []
                 original_list = []
                 for feature in features:
@@ -141,8 +141,8 @@ class DataCollator:
                     else:
                         aligned_f0 = f0
                     aligned_list.append(aligned_f0)
-                batch["f0d"] = torch.stack(aligned_list)  # [batch_size, target_length]
-                batch["f0"] = torch.stack(original_list)  # [batch_size, original_length]
+                batch["f0d"] = torch.stack(aligned_list)  
+                batch["f0"] = torch.stack(original_list)  
 
         if "envelope" in features[0] and features[0]["envelope"] is not None:
             env_list = [f["envelope"] for f in features]
