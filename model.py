@@ -240,7 +240,8 @@ def sinusoids(length, channels, max_timescale=10000):
 
 class rotary(nn.Module):
 
-    def __init__(self, dims, max_ctx=1500, theta=10000, radii=False, debug: List[str] = [], use_pbias = False):
+    def __init__(self, dims, max_ctx=1500, theta=10000, learned_freq=False, radii=False,
+                 learned_radius=False, learned_theta=False, learned_pitch=False, debug: List[str] = [], use_pbias = False):
         super().__init__()
 
         self.use_pbias = use_pbias 
