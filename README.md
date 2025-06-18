@@ -68,5 +68,6 @@ The high gate usage validates the fundamental frequency conditioning approach:
 
 
 
+![output](https://github.com/user-attachments/assets/d52a48b1-8717-4d29-9452-cfdf43c92fe8)
 
 
