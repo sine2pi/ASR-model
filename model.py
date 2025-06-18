@@ -279,27 +279,27 @@ def extract_f0(waveform, sampling_rate=16000, hop_length=128, device="cuda:0"):
     f0_tensor = torch.from_numpy(f0).float().to(device)
     return f0_tensor.unsqueeze(0).unsqueeze(0)
 
+
 class rotary(nn.Module):
     _seen = set()  
     def __init__(self, dims, max_ctx=1500, theta=10000, learned_freq=False, radii=False,
                  learned_radius=False, learned_theta=False, learned_pitch=False, debug: List[str] = [], use_pbias = False):
         super().__init__()
 
-        self.dims = dims
         self.use_pbias = use_pbias 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.dtype = torch.float32 
         self.debug = debug
         self._counter = 0
-
+        self.dims = dims
         self.max_ctx = max_ctx
         self.radii = radii
         f0_factor = 0.5
-        self.adaptation: bool = False
+        self.learned_adaptation: bool = False
         pitch_scale = 1.0
         radius = 1
         
-        if self.adaptation:
+        if self.learned_adaptation:
             self.f0_scale = nn.Parameter(torch.tensor(f0_factor, device=self.device, dtype=self.dtype), requires_grad=True)
         else:
             self.register_buffer('f0_scale', torch.tensor(f0_factor))
@@ -310,36 +310,44 @@ class rotary(nn.Module):
         self.freqs = nn.Parameter(torch.tensor(freqs, device=self.device, dtype=self.dtype), requires_grad=True)
         self.radius = nn.Parameter(torch.ones(radius, device=self.device, dtype=self.dtype), requires_grad=True)
 
-    def forward(self, x=None, feat=None, layer=None) -> Tensor:
-        f0 = feat.get("f0") if feat else None
+    def forward(self, x=None, layer=None, enc=None) -> Tensor:
+
+        f0 = enc.get("f0") if enc else None
         if isinstance(x, int):
             ctx = x
         else:
             batch, ctx, dims = x.shape
         t = torch.arange(ctx, device=self.device).float()
+        
         if f0 is not None:
             f0_mean=f0.mean()+1e-8
             theta=f0_mean*self.pitch_scale
             freqs = 1. / (theta ** (torch.arange(0, self.dims, 2, device=self.device, dtype=self.dtype)[:(self.dims // 2)].float() /self.dims))
         else:        
             freqs = self.freqs
+            
         freqs = torch.einsum('i,j->ij', t, freqs)
         freqs = freqs.float()
-        
+        # print(f"{layer} : {f0_mean} : {theta:.2f} : {ctx} ")
         if self.radii:
-            radius = feat.get("f0d") if feat else self.radius
+            # radius = self.align_f0(f0, ctx)
+            radius = enc.get("f0d") if enc else self.radius
             radius = radius.float()
+            
         else:
             radius = self.radius
-            freqs = torch.polar(radius.unsqueeze(-1), freqs)  # freqs = torch.polar(torch.ones_like(freqs), freqs.unsqueeze(0))
-       
+            # freqs = torch.polar(self.radius.unsqueeze(-1), freqs)
+        freqs = torch.polar(radius.unsqueeze(-1), freqs)
+
         if "rotary" in self.debug:
             if f0 is not None:
                 key = f"{self._counter}_{theta:.2f}"
                 if key not in rotary._seen:
                     if not hasattr(self, '_prev_f0_theta'):
                         self._prev_f0_theta = theta
+                        # print(f"Step {self._counter}: Theta: {theta:.2f} Hz")
                     elif abs(self._prev_f0_theta - theta) > 100.0:
+                        # print(f"Step {self._counter}: Theta: {theta:.2f} Hz, freqs: {freqs.shape}")
                         print(f"{layer} : {f0_mean} : Theta: {theta:.2f} : {theta:.2f} : {ctx} ")
                         if self.radii:  
                             print(f"radius: {radius} Hz, enc: {layer} Hz, ctx: {ctx}")
@@ -377,6 +385,7 @@ class rotary(nn.Module):
                 x1 = x1 * freqs
                 x1 = torch.view_as_real(x1).flatten(-2)
                 return torch.cat([x1.type_as(x), x2], dim=-1)
+
 
 class MultiheadA(nn.Module):
     _seen = set()  
