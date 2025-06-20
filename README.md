@@ -22,7 +22,7 @@ To highlight the relationship between pitch and rotary embeddings echo implement
 <img width="470" alt="3213" src="https://github.com/user-attachments/assets/2932117f-c1ac-4772-8d9a-622edd9c5e07" />
 
 
-
+Whisper: STEP 1000 • WER:91.89% • Loss:7.8292 • LR:0.00098035
 
 By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model to pay attention to the acoustic features relate to sequence position in a way that's proportional to the voice characteristics.  This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
 
