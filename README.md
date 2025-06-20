@@ -19,7 +19,8 @@ To highlight the relationship between pitch and rotary embeddings echo implement
 
 1000 steps with f0 / theta substitutions:
 
-<img width="470" alt="321" src="https://github.com/user-attachments/assets/24a68910-b316-4cfc-8927-5c6fd846b919" />
+<img width="470" alt="3213" src="https://github.com/user-attachments/assets/2932117f-c1ac-4772-8d9a-622edd9c5e07" />
+
 
 
 
