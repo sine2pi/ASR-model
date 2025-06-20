@@ -1,6 +1,7 @@
 
 import pyworld as pw
 import os
+from torch.amp import autocast
 import math, random
 import warnings
 import logging
@@ -10,21 +11,31 @@ import torch
 import torchaudio
 import torch.nn.functional as F
 import torch.nn.init as init
-from torch import nn, Tensor
+from torch import nn, einsum, broadcast_tensors, Tensor
 import numpy as np
+from einops import rearrange, repeat
+import matplotlib.pyplot as plt
 from typing import Optional, Dict, Union, List, Tuple, Any
 from functools import partial
 from datetime import datetime
-from datasets import load_dataset, Audio, concatenate_datasets
+from datasets import load_dataset, Audio
 from transformers.trainer_seq2seq import Seq2SeqTrainer
 from transformers.training_args_seq2seq import Seq2SeqTrainingArguments
 import transformers
 import evaluate
 from dataclasses import dataclass
-import matplotlib.pyplot as plt
+from math import pi, log
 
-device = torch.device(device="cuda:0")
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
+transformers.utils.logging.set_verbosity_error()
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
+
+warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.ERROR)
 
 extractor = None
 tokenizer = None
@@ -130,7 +141,6 @@ def plot_waveform(x=None, w=None, p=None, per=None, sample_idx=0, sr=16000, hop_
         axs[current_ax].set_ylabel("Mel Bin")
         axs[current_ax].set_xlim([0, max_time])
         axs[current_ax].grid(True, axis='x', linestyle='--', alpha=0.3)
-        # fig.colorbar(im, ax=axs[current_ax])
         current_ax += 1
     
     if p is not None:
@@ -172,6 +182,11 @@ def plot_waveform(x=None, w=None, p=None, per=None, sample_idx=0, sr=16000, hop_
     plt.show()
     return fig
 
+def dict_to(d, device, dtype=dtype):
+    """Because PyTorch should have this built-in but doesn't"""
+    return {k: v.to(device, dtype) if isinstance(v, torch.Tensor) else v 
+            for k, v in d.items()}
+    
 def exists(v):
     return v is not None
 
@@ -227,7 +242,7 @@ def get_device():
 def get_dtype():
     return torch.float32 if torch.cuda.is_available() else torch.float64
 
-def get_tox():
+def tox():
     return {"device": get_device(), "dtype": get_dtype()}
 
 def sinusoids(length, channels, max_timescale=10000):
@@ -238,13 +253,93 @@ def sinusoids(length, channels, max_timescale=10000):
     scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
-class rotary(nn.Module):
+def rotate_half(x):
+    x = rearrange(x, '... (d r) -> ... d r', r = 2)
+    x1, x2 = x.unbind(dim = -1)
+    x = torch.stack((-x2, x1), dim = -1)
+    return rearrange(x, '... d r -> ... (d r)')
 
+def broadcat(tensors, dim = -1):
+    broadcasted_tensors = broadcast_tensors(*tensors)
+    return torch.cat(broadcasted_tensors, dim = dim)
+
+def slice_at_dim(t, dim_slice: slice, *, dim):
+    dim += (t.ndim if dim < 0 else 0)
+    colons = [slice(None)] * t.ndim
+    colons[dim] = dim_slice
+    return t[tuple(colons)]
+
+def align_f0(f0, ctx):
+    b, l = f0.shape
+    if l == ctx:
+        return f0.squeeze(0).float()  
+    frames_per_token = l / ctx
+    idx = torch.arange(ctx, device=device, dtype=dtype)
+    src_idx = (idx * frames_per_token).long().clamp(0, l-1)
+    batch_idx = torch.arange(b, device=device, dtype=dtype).unsqueeze(1)
+    f0 = f0[batch_idx, src_idx]
+    return f0.squeeze(0).float()
+
+def align_f0(f0, target_length, method='nearest', device=device, dtype=dtype):
+    if device is None:
+        device = f0.device
+    if dtype is None:
+        dtype = f0.dtype
+    original_shape = f0.shape
+    squeeze_batch = False
+    reshape_back = None
+    
+    if f0.dim() == 1:
+        f0 = f0.unsqueeze(0)
+        squeeze_batch = True
+    elif f0.dim() == 2:
+        pass
+    elif f0.dim() == 3:
+        batch_size, seq_len, length = f0.shape
+        f0 = f0.view(-1, length)
+        reshape_back = (batch_size, seq_len)
+    else:
+        raise ValueError(f"F0 tensor must be 1D, 2D, or 3D, got {f0.dim()}D")
+    batch_size, current_length = f0.shape
+    if current_length == target_length:
+        result = f0
+    elif method == 'nearest':
+        frames_per_token = current_length / target_length
+        target_indices = torch.arange(target_length, device=device, dtype=torch.float32)
+        source_indices = (target_indices * frames_per_token).long().clamp(0, current_length - 1)
+        batch_indices = torch.arange(batch_size, device=device, dtype=torch.long).unsqueeze(1)
+        result = f0[batch_indices, source_indices]
+    else:
+        import torch.nn.functional as F
+        f0_for_interp = f0.unsqueeze(1)
+        mode_map = {'linear': 'linear', 'cubic': 'bicubic'}
+        if method not in mode_map:
+            raise ValueError(f"Method '{method}' not supported. Use 'nearest', 'linear', or 'cubic'")
+        
+        result = F.interpolate(
+            f0_for_interp.float(),
+            size=target_length,
+            mode=mode_map[method],
+            align_corners=False
+        ).squeeze(1)
+    
+    if reshape_back is not None:
+        result = result.view(reshape_back[0], reshape_back[1], target_length)
+    elif squeeze_batch:
+        result = result.squeeze(0)
+    return result.to(dtype)
+
+class rotary(nn.Module):
+    _seen = set()  
     def __init__(self, dims, max_ctx=1500, theta=10000, learned_freq=False, radii=False,
-                 learned_radius=False, learned_theta=False, learned_pitch=False, debug: List[str] = [], use_pbias = False):
+                 learned_radius=False, learned_theta=False, learned_pitch=False, debug: List[str] = [], 
+                 use_pbias=False, use_2d_axial=False, spec_shape=None):
         super().__init__()
 
-        self.use_pbias = use_pbias 
+        self.use_pbias = False
+        self.use_2d_axial = use_2d_axial
+        self.spec_shape = spec_shape
+        self.last_f0_theta = None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.dtype = torch.float32 
         self.debug = debug
@@ -264,9 +359,49 @@ class rotary(nn.Module):
 
         self.theta = nn.Parameter(torch.tensor(theta, device=self.device, dtype=self.dtype), requires_grad=True)
         self.pitch_scale = nn.Parameter(torch.tensor(pitch_scale, device=self.device, dtype=self.dtype), requires_grad=True)
-        freqs = 1. / (theta ** (torch.arange(0, dims, 2, device=self.device, dtype=self.dtype)[:(dims // 2)].float() / dims))
-        self.freqs = nn.Parameter(torch.tensor(freqs, device=self.device, dtype=self.dtype), requires_grad=True)
+        
+        if use_2d_axial and spec_shape is not None:
+            time_frames, freq_bins = spec_shape
+            self.time_frames = time_frames
+            self.freq_bins = freq_bins
+            
+            time_theta = 50.0
+            time_freqs = 1.0 / (time_theta ** (torch.arange(0, dims, 4)[:(dims // 4)].float() / dims))
+            self.register_buffer('time_freqs', time_freqs)
+            
+            freq_theta = 100.0
+            freq_freqs = 1.0 / (freq_theta ** (torch.arange(0, dims, 4)[:(dims // 4)].float() / dims))
+            self.register_buffer('freq_freqs', freq_freqs)
+        else:
+            freqs = 1. / (theta ** (torch.arange(0, dims, 2, device=self.device, dtype=self.dtype)[:(dims // 2)].float() / dims))
+            self.freqs = nn.Parameter(torch.tensor(freqs, device=self.device, dtype=self.dtype), requires_grad=True)
         self.radius = nn.Parameter(torch.ones(radius, device=self.device, dtype=self.dtype), requires_grad=True)
+
+    def compute_2d_axial_freqs(self, seq_len):
+        if not self.use_2d_axial:
+            return None
+        time_frames = self.time_frames
+        freq_bins = self.freq_bins
+    
+        t = torch.arange(seq_len, device=self.device, dtype=self.dtype)
+        t_x = (t % time_frames).float()
+        t_y = torch.div(t, time_frames, rounding_mode='floor').float()
+        freqs_x = torch.outer(t_x, self.time_freqs)
+        freqs_y = torch.outer(t_y, self.freq_freqs)
+        freqs_cis_x = torch.polar(torch.ones_like(freqs_x), freqs_x)
+        freqs_cis_y = torch.polar(torch.ones_like(freqs_y), freqs_y)
+        return torch.cat([freqs_cis_x, freqs_cis_y], dim=-1)
+
+    def align_f0(self, f0, ctx):
+        b, l = f0.shape
+        if l == ctx:
+            return f0.squeeze(0).float()  
+        frames_per_token = l / ctx
+        idx = torch.arange(ctx, device=self.device, dtype=self.dtype)
+        src_idx = (idx * frames_per_token).long().clamp(0, l-1)
+        batch_idx = torch.arange(b, device=self.device, dtype=self.dtype).unsqueeze(1)
+        f0 = f0[batch_idx, src_idx]
+        return f0.squeeze(0).float()
 
     def get_pitch_bias(self, f0):
         if f0 is None:
@@ -277,109 +412,77 @@ class rotary(nn.Module):
                                     f0_norm.unsqueeze(1)) * self.pitch_scale)
         return f0_sim.unsqueeze(0).unsqueeze(0)
 
-    def align_f0(self, f0, ctx):
-        b, l = f0.shape
-        if l == ctx:
-            return f0.squeeze(0).float()  
-        frames_per_token = l / ctx
-        idx = torch.arange(ctx, device=self.device, dtype=torch.float32)
-        src_idx = (idx * frames_per_token).long().clamp(0, l-1)
-        batch_idx = torch.arange(b, device=self.device, dtype=torch.float32).unsqueeze(1)
-        f0 = f0[batch_idx, src_idx]
-        return f0.squeeze(0).float()
-   
-    def forward(self, x: Tensor, xa: Tensor = None, f0: Tensor = None, mask: Tensor = None, layer = None) -> Tensor:
-        
+    def forward(self, x=None, f0=None, layer=None, input_type="audio") -> Tensor:
         if isinstance(x, int):
             ctx = x
-        else:
+        elif isinstance(x, torch.Tensor) and x.ndim == 3:
             batch, ctx, dims = x.shape
-        t = torch.arange(ctx, device=self.device).float()
-        
-        if self.learned_adaptation:
-            freqs = self.get_f0_adapted_freqs(ctx, f0)
-            x_complex = torch.view_as_complex(
-                x.float().reshape(*x.shape[:-1], -1, 2).contiguous())
-            x_rotated = x_complex * freqs.unsqueeze(0).unsqueeze(0)
-            freqs = torch.view_as_real(x_rotated).flatten(3).type_as(x)
+        else:
+            batch, head, ctx, head_dim = x.shape
+            
+        if self.use_2d_axial and input_type == "spectrogram":
+            freqs_2d = self.compute_2d_axial_freqs(ctx)
+            if freqs_2d is not None:
+                return freqs_2d.unsqueeze(0)
+                
+        t = torch.arange(ctx, device=self.device, dtype=self.dtype)
 
         if f0 is not None:
-            f0_mean=f0.mean()+1e-8
-            theta=f0_mean*self.pitch_scale
-            freqs = 1. / (theta ** (torch.arange(0, self.dims, 2, device=self.device, dtype=self.dtype)[:(self.dims // 2)].float() /self.dims))
-        else:        
-            freqs = self.freqs
-        freqs = torch.einsum('i,j->ij', t, freqs)
-        freqs = freqs.float()
-
-        if self.radii:
-            radius = self.align_f0(f0, ctx)
-            radius = torch.clamp(radius, min=40.0, max=600.0)
-            radius = radius / 600.0 
-            radius = radius.float()
-        else:
-            radius = self.radius
-        freqs = torch.polar(radius.unsqueeze(-1), freqs)
-
-        if "rotary" in self.debug and self._counter % 100 == 50:
-            if f0 is not None:
+            f0_mean = f0.mean() + 1e-8
+            theta = f0_mean * self.pitch_scale
+            freqs = 1.0 / (theta ** (torch.arange(0, self.dims, 2, device=self.device, dtype=self.dtype)[:(self.dims // 2)].float() / self.dims))
+            if "rotary" in self.debug:
                 print(f"{layer}: {theta:.2f} : {f0_mean:.2f} : {ctx} ")
-                if self.radii:  
-                    print(f"radius: {radius} Hz, enc: {layer} Hz, ctx: {ctx}")
-            self._counter += 1
-        return freqs      
+        else:
+            freqs = self.freqs
+            
+        freqs = t[:, None] * freqs[None, :]
+        
+        if self.radii:
+            if f0 is not None:
+                radius = self.align_f0(f0, ctx)
+            else:
+                radius = self.radius
+                if "rotary" in self.debug:
+                    print(f"{layer} radius: {radius} ctx: {ctx}")
+        else:
+            radius = freqs
+            
+        freqs = torch.polar(torch.ones_like(radius), freqs.unsqueeze(0))
+        
+        self._counter += 1
+        return freqs.unsqueeze(0)
 
     @staticmethod
     def apply_rotary(x, freqs):
-        multihead_format = len(freqs.shape) == 4
-        if multihead_format:
-            x1 = x[..., :freqs.shape[-1]*2]
-            x2 = x[..., freqs.shape[-1]*2:]
-            x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
-            x1 = torch.view_as_complex(x1)
-            x1 = x1 * freqs
-            x1 = torch.view_as_real(x1).flatten(-2)
-            return torch.cat([x1.type_as(x), x2], dim=-1)
-        else:
-            x1 = x[..., :freqs.shape[-1]*2]
-            x2 = x[..., freqs.shape[-1]*2:]
-            
-            if x.ndim == 2:  
-                x1 = x1.unsqueeze(0)
-                x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
-                x1 = torch.view_as_complex(x1)
-                x1 = x1 * freqs
-                x1 = torch.view_as_real(x1).flatten(-2)
-                x1 = x1.squeeze(0)  
-                return torch.cat([x1.type_as(x), x2], dim=-1)
-            else:  
-                x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
-                x1 = torch.view_as_complex(x1)
-                x1 = x1 * freqs
-                x1 = torch.view_as_real(x1).flatten(-2)
-                return torch.cat([x1.type_as(x), x2], dim=-1)
+        x1 = x[..., :freqs.shape[-1]*2]
+        x2 = x[..., freqs.shape[-1]*2:]
+        orig_shape = x1.shape
+        if x1.ndim == 2:
+            x1 = x1.unsqueeze(0)
+        x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
+        x1 = torch.view_as_complex(x1) * freqs
+        x1 = torch.view_as_real(x1).flatten(-2)
+        x1 = x1.view(orig_shape)
+        return torch.cat([x1.type_as(x), x2], dim=-1)
 
 class MultiheadA(nn.Module):
     _seen = set()  
     rbf = False
     def __init__(self, dims: int, head: int, rotary_emb: bool = True, 
-                 zero_val: float = 0.0001, minz: float = 0.0, maxz: float = 0.001, debug: List[str] = [], optim_attn=False):
-        
+                 zero_val: float = 1e-4, minz: float = 1e-6, maxz: float = 1e-3, debug: List[str] = [], optim_attn=False):
         super(MultiheadA, self).__init__()
 
         self.dims = dims
         self.head = head
         self.head_dim = dims // head
-        
-        self.q = Linear(dims, dims)
-        self.k = Linear(dims, dims, bias=False)
-        self.v = Linear(dims, dims)
-        self.o = Linear(dims, dims)
-
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.dtype = torch.float32
         self.debug = debug
         self._counter = 0
+
+        self.q = Linear(dims, dims).to(device, dtype)
+        self.k = Linear(dims, dims, bias=False).to(device, dtype)
+        self.v = Linear(dims, dims).to(device, dtype)
+        self.o = Linear(dims, dims).to(device, dtype)
 
         self.pad_token = 0
         self.rotary_emb = rotary_emb
@@ -387,9 +490,15 @@ class MultiheadA(nn.Module):
         self.maxz = maxz
         self.zero_val = zero_val
         self.optim_attn = optim_attn        
-        self.fzero = nn.Parameter(torch.tensor(zero_val, dtype=torch.float32), requires_grad=False)
+        self.fzero = nn.Parameter(torch.tensor(zero_val, device=device, dtype=dtype), requires_grad=False)
         
         if rotary_emb:
+            self.rope_2d = rotary(
+                dims=self.head_dim,
+                use_2d_axial=False,
+                spec_shape=(1500, 128),  
+                debug=debug
+            )
             self.rope = rotary(
                 dims=self.head_dim,
                 debug = debug,
@@ -400,8 +509,9 @@ class MultiheadA(nn.Module):
                 learned_radius=False,
                 )
         else:
-            self.rope = None               
-        
+            self.rope_2d = None
+            self.rope = None
+
     def enhanced_attention_scores(self, q, k, rbf_sigma=1.0, rbf_ratio=0.0):
         scale = (self.dims // self.head) ** -0.25
         dot_scores = torch.matmul(q, k.transpose(-1, -2)) * scale
@@ -414,27 +524,34 @@ class MultiheadA(nn.Module):
         rbf_scores = torch.exp(-dist_sq / (2 * rbf_sigma**2))
         return (1 - rbf_ratio) * dot_scores + rbf_ratio * rbf_scores
           
-    def forward(self, x: Tensor, xa: Tensor = None, f0: Tensor = None, mask: Tensor = None, layer = None) -> tuple:
-        
+    def forward(self, x: Tensor, xa: Tensor = None, f0: Tensor = None, mask: Tensor = None, layer = None, feature_type="audio") -> tuple:
+        x = x.to(device, dtype)
+        if xa is not None:
+            xa = xa.to(device, dtype)
+            
         batch, ctx, dims = x.shape
         scale = (self.dims // self.head) ** -0.25
         
-        z = xa if xa is not None else x
-        q = self.q(x).to(x.dtype)
-        k = self.k(z).to(x.dtype)
-        v = self.v(z).to(x.dtype)
+        z = default(xa, x).to(device, dtype)
+        q = self.q(x)
+        k = self.k(z)
+        v = self.v(z)
+        qlen = q.shape[1]
+        klen = k.shape[1]
 
         if self.rotary_emb:   
-            qf = self.rope(q.size(1), f0=f0, layer=layer)
-            kf = self.rope(k.size(1), f0=f0, layer=layer)
-
             q = q.view(*q.shape[:2], self.head, -1).permute(0, 2, 1, 3)
             k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
             v = v.view(*v.shape[:2], self.head, -1).permute(0, 2, 1, 3)
-            
-            q = self.rope.apply_rotary(q, qf)
-            k = self.rope.apply_rotary(k, kf)
-            
+            qlen = q.shape[2]
+            klen = k.shape[2]
+
+            if feature_type == "spectrogram":
+                input_type="spectrogram"
+            else:
+                input_type="audio"
+            q = self.rope.apply_rotary(q, (self.rope(qlen, f0=f0, layer=layer, input_type=input_type)))
+            k = self.rope.apply_rotary(k, (self.rope(klen, f0=f0, layer=layer, input_type=input_type)))
         else:
             q = q.view(*q.shape[:2], self.head, -1).permute(0, 2, 1, 3)
             k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
@@ -452,20 +569,17 @@ class MultiheadA(nn.Module):
         token_ids = k[:, :, :, 0]
         zscale = torch.ones_like(token_ids)
         fzero = torch.clamp(F.softplus(self.fzero), self.minz, self.maxz)
-        zscale[token_ids.float() == self.pad_token] = fzero.to(q.device, q.dtype)
+        zscale[token_ids.float() == self.pad_token] = fzero
         
         if mask is not None:
             mask = mask[:q.shape[2], :q.shape[2]]
             qk = qk + mask.unsqueeze(0).unsqueeze(0) * zscale.unsqueeze(-2).expand(qk.shape)
         qk = qk * zscale.unsqueeze(-2)
-
         w = F.softmax(qk, dim=-1).to(q.dtype)
         wv = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
         
         if "multihead" in self.debug and self._counter % 100 == 0:
-            print(f"Step {self._counter}: Using rotary embeddings: {self.rotary_emb}")
-            print(f"MHA: q={q.shape}, k={k.shape}, v={v.shape}")
-            print(f"Attention shape: {qk.shape}, wv shape: {wv.shape}")
+            print(f"MHA: q={q.shape}, k={k.shape}, v={v.shape} - {qk.shape}, wv shape: {wv.shape}")
         self._counter += 1        
         return self.o(wv), qk.detach()
 
@@ -523,8 +637,6 @@ class Residual(nn.Module):
                  tgate=True, mgate=False, cgate=False, mem_size=512, features=None):
         super().__init__()
         
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.dtype = torch.float32
         self.dims = dims
         self.head = head
         self.ctx = ctx
@@ -564,12 +676,16 @@ class Residual(nn.Module):
         if not any([t_gate, m_gate, c_gate]):
             self.mlp_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
 
-    def forward(self, x, xa=None, mask=None, f0=None, mode=None, layer=None):
+    def forward(self, x, xa=None, mask=None, f0=None, mode=None, layer=None, feature_type="audio") -> Tensor:
+        x = x.to(device, dtype)
+        if xa is not None:
+            xa = xa.to(device, dtype)
+
         bln = self.blend
-        x = x + self.attna(self.lna(x), xa=None, mask=mask, f0=f0, layer=layer)[0]
+        x = x + self.attna(self.lna(x), xa=None, mask=mask, f0=f0, layer=layer, feature_type=feature_type)[0]
         
         if self.attnb and xa is not None:
-            c = self.attnb(self.lnb(x), xa=xa, f0=f0, mask=None, layer=layer)[0]
+            c = self.attnb(self.lnb(x), xa=xa, f0=f0, mask=None, layer=layer, feature_type=feature_type)[0]
             b = torch.sigmoid(bln)
             x = b * x + (1 - b) * c
         
@@ -609,34 +725,74 @@ class Residual(nn.Module):
                   
         return x
 
-class PEncoder(nn.Module):
-    def __init__(self, input_dims, dims, head, layer, kernel_size, act):
+class FEncoder(nn.Module):
+    def __init__(self, input_dims, dims, head, layer, kernel_size, act, stride=1, use_rope=False, spec_shape=None):
         super().__init__()
         
-        self.head_dim = dims // head
-        self.dropout = 0.01
+        self.head = head
+        self.head_dim = dims // head  
+        self.dropout = 0.01 
+        self.use_rope = use_rope
+        self.dims = dims
         
         act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
         act_fn = act_map.get(act, nn.GELU())
         
         self.encoder = nn.Sequential(
-            Conv1d(input_dims, dims//4, kernel_size=7, stride=8, padding=3), act_fn,
-            Conv1d(dims//4, dims//2, kernel_size=5, stride=4, padding=2), act_fn,
-            Conv1d(dims//2, dims, kernel_size=5, stride=5, padding=2),act_fn)
+            Conv1d(input_dims, dims, kernel_size=kernel_size, stride=stride, padding=kernel_size//2), act_fn,
+            Conv1d(dims, dims, kernel_size=5, padding=2), act_fn,
+            Conv1d(dims, dims, kernel_size=3, padding=1, groups=dims), act_fn)
         
-    def forward(self, x, f0=None, layer=None):
-        x = self.encoder(x).permute(0, 2, 1)
-        x = x + self.positional(x.shape[1]).to(x.device, x.dtype)
-        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
-        x = self.norm(x)
+        if use_rope:
+            if spec_shape is not None:
+                self.rope = rotary(
+                    dims=self.head_dim,
+                    use_2d_axial=True,
+                    spec_shape=spec_shape, debug=[])
+            else:
+                self.rope = rotary(
+                    dims=self.head_dim,
+                    use_2d_axial=False, debug=[])
+        else:
+            self.rope = None
+            self.positional = lambda length: sinusoids(length, dims)
+            
+        self.norm = RMSNorm(dims)
+        self._norm = RMSNorm(dims)
+
+    def apply_rope_to_features(self, x, f0=None, layer=None, feature_type="audio"):
+        if not self.use_rope or self.rope is None:
+            return x
+            
+        batch, seq_len, dims = x.shape
+        x = x.view(batch, seq_len, self.head, self.head_dim).permute(0, 2, 1, 3)
+        if feature_type == "spectrogram" and hasattr(self.rope, 'use_2d_axial') and self.rope.use_2d_axial:
+            rope_freqs = self.rope(seq_len, f0=f0, layer=layer, input_type="spectrogram")
+        else:
+            rope_freqs = self.rope(seq_len, f0=f0, layer=layer, input_type="audio")
+        x = self.rope.apply_rotary(x, rope_freqs)
+        x = x.permute(0, 2, 1, 3).contiguous().view(batch, seq_len, dims)
         return x
-        
+
+    def forward(self, x, f0=None, layer=None, feature_type="audio"):
+        x = self.encoder(x).permute(0, 2, 1)
+        if self.use_rope:
+            x = self.apply_rope_to_features(x, f0=f0, layer=layer, feature_type=feature_type)
+        else:
+            x = x + self.positional(x.shape[1]).to(x.device, x.dtype)
+        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
+        x = self._norm(x)
+        return x
+
 class WEncoder(nn.Module):
-    def __init__(self, input_dims, dims, head, layer, kernel_size, act):
+    def __init__(self, input_dims, dims, head, layer, kernel_size, act, use_rope=False):
         super().__init__()
         
+        self.head = head
         self.head_dim = dims // head
         self.dropout = 0.01
+        self.use_rope = use_rope
+        self.dims = dims
         
         act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
         act_fn = act_map.get(act, nn.GELU())
@@ -649,44 +805,85 @@ class WEncoder(nn.Module):
         self.encoder = nn.Sequential(
             Conv1d(dims, dims, kernel_size=3, padding=1, groups=dims//8),  act_fn,
             Conv1d(dims, dims, kernel_size=1), act_fn)
-        
-        self.positional = lambda length: sinusoids(length, dims)
+        if use_rope:
+            self.rope = rotary(
+                dims=self.head_dim,
+                use_2d_axial=False,
+                theta=50.0, debug=[])
+        else:
+            self.rope = None
+            self.positional = lambda length: sinusoids(length, dims)
         self.norm = RMSNorm(dims)
+
+    def apply_rope_to_features(self, x, f0=None, layer=None):
+        if not self.use_rope or self.rope is None:
+            return x
+        batch, seq_len, dims = x.shape
+        x = x.view(batch, seq_len, self.head, self.head_dim).permute(0, 2, 1, 3)
+        rope_freqs = self.rope(seq_len, f0=f0, layer=layer, input_type="waveform")
+        x = self.rope.apply_rotary(x, rope_freqs)
+        x = x.permute(0, 2, 1, 3).contiguous().view(batch, seq_len, dims)
+        return x
         
-    def forward(self, x, f0=None, layer=None):
+    def forward(self, x, f0=None, layer=None, feature_type="waveform"):
         x = self.downsample(x)
         x = self.encoder(x)
         x = x.permute(0, 2, 1)
-        x = x + self.positional(x.shape[1]).to(x.device, x.dtype)
+        if self.use_rope:
+            x = self.apply_rope_to_features(x, f0=f0, layer=layer)
+        else:
+            x = x + self.positional(x.shape[1]).to(x.device, x.dtype)
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
         return self.norm(x)
 
-class FEncoder(nn.Module):
-    def __init__(self, input_dims, dims, head, layer, kernel_size, act, stride=1):
+class PEncoder(nn.Module):
+    def __init__(self, input_dims, dims, head, layer, kernel_size, act, use_rope=False):
         super().__init__()
         
-        self.head_dim = dims // head  
-        self.dropout = 0.01 
+        self.head = head
+        self.head_dim = dims // head
+        self.dropout = 0.01
+        self.use_rope = use_rope
+        self.dims = dims
         
         act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
         act_fn = act_map.get(act, nn.GELU())
         
         self.encoder = nn.Sequential(
-            Conv1d(input_dims, dims, kernel_size=kernel_size, stride=stride, padding=kernel_size//2), act_fn,
-            Conv1d(dims, dims, kernel_size=5, padding=2), act_fn,
-            Conv1d(dims, dims, kernel_size=3, padding=1, groups=dims), act_fn)
+            Conv1d(input_dims, dims//4, kernel_size=7, stride=8, padding=3), act_fn,
+            Conv1d(dims//4, dims//2, kernel_size=5, stride=4, padding=2), act_fn,
+            Conv1d(dims//2, dims, kernel_size=5, stride=5, padding=2), act_fn)
         
-        self.positional = lambda length: sinusoids(length, dims)
+        if use_rope:
+            self.rope = rotary(
+                dims=self.head_dim,
+                use_2d_axial=False,
+                theta=100.0, debug=[])
+        else:
+            self.rope = None
+            self.positional = lambda length: sinusoids(length, dims)
         self.norm = RMSNorm(dims)
-        self._norm = RMSNorm(dims)
 
-    def forward(self, x, f0=None, layer=None):
-        x = self.encoder(x).permute(0, 2, 1)
-        x = x + self.positional(x.shape[1]).to(x.device, x.dtype)
-        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
-        x = self._norm(x)
+    def apply_rope_to_features(self, x, f0=None, layer=None):
+        if not self.use_rope or self.rope is None:
+            return x
+        batch, seq_len, dims = x.shape
+        x = x.view(batch, seq_len, self.head, self.head_dim).permute(0, 2, 1, 3)
+        rope_freqs = self.rope(seq_len, f0=f0, layer=layer, input_type="pitch")
+        x = self.rope.apply_rotary(x, rope_freqs)
+        x = x.permute(0, 2, 1, 3).contiguous().view(batch, seq_len, dims)
         return x
-          
+        
+    def forward(self, x, f0=None, layer=None, feature_type="pitch"):
+        x = self.encoder(x).permute(0, 2, 1)
+        if self.use_rope:
+            x = self.apply_rope_to_features(x, f0=f0, layer=layer)
+        else:
+            x = x + self.positional(x.shape[1]).to(x.device, x.dtype)
+        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
+        x = self.norm(x)
+        return x
+
 class AudioEncoder(nn.Module):
     _seen = set()  
     def __init__(self, mels: int, ctx: int, dims: int, head: int, layer: int, debug: List[str], features: List[str], 
@@ -697,15 +894,11 @@ class AudioEncoder(nn.Module):
         self.head = head
         self.ctx = ctx
         self.head_dim = dims // head
-
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.dtype = torch.float32
         self.debug = debug
         self._counter = 0
 
         self.features = features
         self.dropout = 0.01
-        self.f0_rotary = f0_rotary
 
         self.rope = rotary(
             dims=self.head_dim,
@@ -746,29 +939,44 @@ class AudioEncoder(nn.Module):
             FEncoder(input_dims=1, dims=dims, head=head, layer=layer, kernel_size=9, act=act, stride=2)
             for _ in range(layer)])
 
-    def forward(self, x, f0=None, layer="ENC"):
+        self.rope_2d = rotary(
+            dims=self.head_dim,
+            use_2d_axial=True,
+            spec_shape=(ctx, mels),
+            debug=debug
+        )
+        
+        self.rope_1d = rotary(
+            dims=self.head_dim,
+            use_2d_axial=False,
+            debug=debug
+        )
+
+    def forward(self, enc, f0=None, layer="ENC"):
+        enc = dict_to(enc, device, dtype)
+        
         if self._counter < 1:
-            s = x.get("spectrogram")
-            w = x.get("waveform")
-            p = f0 if f0 is not None else x.get("pitch")
+            s = enc.get("spectrogram")
+            w = enc.get("waveform")
+            p = f0 if f0 is not None else default(enc.get("pitch"), enc.get("f0"))
             plot_waveform(x=s, w=w, p=p, hop_length=128)
 
-        enc = {}
+        out = {}
+        out.update(enc)
 
-        for y in self.features:
-            if y in x and y in self.blocks:
-                f = x[y]
-                for block in self.blocks[y]:
-                    f = block(f, f0=f0, layer=layer)
-                enc[y] = f
+        for f in self.features:
+            if f in enc and f in self.blocks:
+                x = enc[f]
+                for block in self.blocks[f]:
+                    x = block(x, f0=f0, layer=layer, feature_type=f)
+                out[f] = x
                         
         if "encoder" in self.debug and self._counter % 100 == 0:
-            names = list(x.keys())
+            names = list(x.keys()) 
             shapes = {k: v.shape for k, v in x.items()}
-            print(f"Step {self._counter}: mode: {names}")
-            print(f"shapes: {shapes}")
+            print(f"Step {self._counter}: mode: {names}: shapes: {shapes}")
         self._counter += 1
-        return enc
+        return out
 
 class TextDecoder(nn.Module):
     def __init__(self, vocab: int, ctx: int, dims: int, head: int, layer: int, cross_attn: bool, 
@@ -810,29 +1018,34 @@ class TextDecoder(nn.Module):
         self.register_buffer("mask", mask, persistent=False)
 
     def forward(self, x, enc, f0=None, order=None, layer='DEC') -> Tensor:
-        bln = self.blend
+        enc = dict_to(enc, device, dtype)
         x = x.to(device)
+        bln = self.blend
+
         if order is None:
             order = self.features
+        
         mask = self.mask[:x.shape[1], :x.shape[1]]
         x = self.token(x) + self.positional[:x.shape[1]]
         x = F.dropout(x, p=self.dropout, training=self.training)
+        
         for block in self.block:
             x = block(x, xa=None, f0=f0, mask=mask, layer=layer)
+
         for f in order:
             if f in enc:
                 xa = enc[f]
                 for block in self.blocks[f]:
                     out = block(x=x, xa=xa, f0=f0, mask=None, layer=layer)
+
                 a = torch.sigmoid(bln[f])
                 x = a * out + (1 - a) * x
-        x = self.ln_dec(x)
-
+                        
         if "decoder" in self.debug and self._counter % 100 == 0:
-            for name, param in self.named_parameters():
-                if param.requires_grad:
-                    print(f"DECODER LAYER {name}: grad_norm={param.median():.4f}")
-        self._counter += 1     
+            print(f"Step {self._counter}: Decoder output shape: {x.shape}, enc keys: {list(enc.keys())}, order: {order}")
+        self._counter += 1  
+
+        x = self.ln_dec(x)   
         return x @ torch.transpose(self.token.weight.to(dtype), 0, 1).float()
 
 class Echo(nn.Module):
@@ -907,9 +1120,11 @@ class Echo(nn.Module):
             encoder_inputs["envelope"] = envelope
         if phase is not None:
             encoder_inputs["phase"] = phase
-        # if f0 is not None:
-        #     encoder_inputs["f0"] = f0
-
+        if f0 is not None:
+            encoder_inputs["f0"] = f0
+        if f0d is not None:
+            encoder_inputs["f0d"] = f0d
+            
         encoder_outputs = self.encoder(encoder_inputs, f0=f0)
         logits = self.decoder(input_ids, encoder_outputs, f0=f0d)
 
@@ -928,6 +1143,7 @@ class Echo(nn.Module):
             "encoder_output": encoder_outputs,
             } 
 
+    @property
     def device(self):
         return next(self.parameters()).device
     @property
@@ -1010,4 +1226,620 @@ class Echo(nn.Module):
         """Reset the internal counter for debugging purposes."""
         self._counter = 0
         print("Counter reset to 0.")
+
+metric = evaluate.load(path="wer")
+
+def align_f0(f0, ctx):
+    ctx = torch.tensor(ctx)
+    bat, length = f0.shape
+    if length == ctx:
+        return f0 
+    frames = length / ctx
+    idx = torch.arange(ctx, device=f0.device)
+    idx = (idx * frames).long()
+    batch_idx = torch.arange(bat, device=f0.device).unsqueeze(1)
+    return f0[batch_idx, idx.unsqueeze(0).expand(bat, -1)]
+    
+@dataclass
+class DataCollator:
+    tokenizer: Any
+    def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        pad_token_id = tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else 0
+        bos_token_id = tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else 1
+        
+        batch = {}
+
+        if "spectrogram" in features[0] and features[0]["spectrogram"] is not None:
+            spectrogram_list = [f["spectrogram"] for f in features]
+            max_len_feat = max(f.shape[-1] for f in spectrogram_list)
+            pad_spectrogram = []
+            for feat in spectrogram_list:                
+                current_len = feat.shape[-1]
+                padding = max_len_feat - current_len
+                if padding > 0:
+                    pad_feat = F.pad(feat, (0, padding), mode='constant', value=pad_token_id)
+                else:
+                    pad_feat = feat
+                pad_spectrogram.append(pad_feat)
+            batch["spectrogram"] = torch.stack(pad_spectrogram)
+            
+        if "waveform" in features[0] and features[0]["waveform"] is not None:
+            waveform_list = [f["waveform"] for f in features]
+            max_len_wav = max(w.shape[-1] for w in waveform_list)
+            pad_waveforms = []
+            for wav in waveform_list:
+                current_len = wav.shape[-1]
+                padding = max_len_wav - current_len
+                if padding > 0:
+                    if wav.ndim == 1:
+                        wav = wav.unsqueeze(0)
+                    pad_wav = F.pad(wav, (0, padding), mode='constant', value=pad_token_id)
+                else:
+                    pad_wav = wav
+                pad_waveforms.append(pad_wav)
+            batch["waveform"] = torch.stack(pad_waveforms)
+
+        if "label" in features[0] and features[0]["label"] is not None:
+            labels_list = [f["label"] for f in features]
+            max_len = max(len(l) for l in labels_list)
+            all_ids = []
+            all_labels = []
+
+            for label in labels_list:
+                label_list = label.tolist() if isinstance(label, torch.Tensor) else label
+                decoder_input = [bos_token_id] + label_list                
+                label_eos = label_list + [pad_token_id]  
+                input_len = max_len + 1 - len(decoder_input)
+                label_len = max_len + 1 - len(label_eos)                
+                padded_input = decoder_input + [pad_token_id] * input_len
+                padded_labels = label_eos + [pad_token_id] * label_len                
+                all_ids.append(padded_input)
+                all_labels.append(padded_labels)            
+            batch["input_ids"] = torch.tensor(all_ids, dtype=torch.long)
+            batch["labels"] = torch.tensor(all_labels, dtype=torch.long)
+
+        if "pitch" in features[0] and features[0]["pitch"] is not None:
+            pitch_list = [f["pitch"] for f in features]
+            max_len_pitch = max(e.shape[-1] for e in pitch_list)
+            pad_pitch = []
+            for pitch in pitch_list:
+                current_len = pitch.shape[-1]
+                padding = max_len_pitch - current_len
+                if padding > 0:
+                    pad_pitch_item = F.pad(pitch, (0, padding), mode='constant', value=pad_token_id)
+                else:
+                    pad_pitch_item = pitch
+                pad_pitch.append(pad_pitch_item)
+            batch["pitch"] = torch.stack(pad_pitch)
+
+        if "f0" in features[0] and features[0]["f0"] is not None:
+            input_ids_batch = batch.get("input_ids", None)  
+            if input_ids_batch is not None:
+                target_length = input_ids_batch.shape[-1] 
+                aligned_list = []
+                original_list = []
+                for feature in features:
+                    f0 = feature["f0"]
+                    original_list.append(f0)
+                    if f0.shape[-1] != target_length:
+                        aligned_f0 = align_f0(f0.unsqueeze(0), target_length).squeeze(0)
+                    else:
+                        aligned_f0 = f0
+                    aligned_list.append(aligned_f0)
+                batch["f0d"] = torch.stack(aligned_list)  
+                batch["f0"] = torch.stack(original_list)  
+        
+        if "envelope" in features[0] and features[0]["envelope"] is not None:
+            env_list = [f["envelope"] for f in features]
+            max_len = max(f.shape[-1] for f in env_list)
+            pad_env = []
+            for feat in env_list:                
+                current_len = feat.shape[-1]
+                padding = max_len_feat - current_len
+                if padding > 0:
+                    pad_feat = F.pad(feat, (0, padding), mode='constant', value=pad_token_id)
+                else:
+                    pad_feat = feat
+                pad_env.append(pad_feat)
+            batch["envelope"] = torch.stack(pad_env)
+
+        if "phase" in features[0] and features[0]["phase"] is not None:
+            ph_list = [f["phase"] for f in features]
+            max_len = max(f.shape[-1] for f in ph_list)
+            pad_ph = []
+            for feat in ph_list:                
+                current_len = feat.shape[-1]
+                padding = max_len_feat - current_len
+                if padding > 0:
+                    pad_feat = F.pad(feat, (0, padding), mode='constant', value=pad_token_id)
+                else:
+                    pad_feat = feat
+                pad_ph.append(pad_feat)
+            batch["phase"] = torch.stack(pad_ph) 
+
+        return batch
+
+def hilbert_transform(x):
+    N = x.shape[-1]
+    xf = torch.fft.rfft(x)
+    h = torch.zeros(N // 2 + 1, device=x.device, dtype=x.dtype)
+    if N % 2 == 0:
+        h[0] = h[N//2] = 1
+        h[1:N//2] = 2
+    else:
+        h[0] = 1
+        h[1:(N+1)//2] = 2
+    return torch.fft.irfft(xf * h, n=N)
+
+def analytic_signal(x):
+    return x + 1j * hilbert_transform(x)
+
+def hilbert_transform_2d(x, dim=-1):
+    N = x.shape[dim]
+    if dim == -1 or dim == len(x.shape) - 1:
+        xf = torch.fft.rfft(x)
+    else:
+        xf = torch.fft.rfft(x, dim=dim)
+    h_shape = [1] * len(x.shape)
+    h_shape[dim] = N // 2 + 1
+    h = torch.zeros(h_shape, device=x.device, dtype=x.dtype)
+    if dim == -1 or dim == len(x.shape) - 1:
+        if N % 2 == 0:
+            h[..., 0] = h[..., -1] = 1
+            h[..., 1:-1] = 2
+        else:
+            h[..., 0] = 1
+            h[..., 1:] = 2
+    else:
+        pass
+    return torch.fft.irfft(xf * h, n=N, dim=dim)
+
+def hilbert_transform_true_2d(x):
+    xf = torch.fft.rfft2(x)
+    h1, h2 = torch.meshgrid(
+        torch.fft.rfftfreq(x.shape[-2]) * 2 - 1,
+        torch.fft.rfftfreq(x.shape[-1]) * 2 - 1,
+        indexing='ij')
+    h = -1j / (math.pi * (h1 + 1j*h2))
+    h[0, 0] = 0 
+    return torch.fft.irfft2(xf * h.to(x.device))
+
+def process_spectrogram_with_hilbert(spec):
+    analytic = spec + 1j * hilbert_transform(spec)
+    envelope = torch.abs(analytic)
+    phase = torch.angle(analytic)
+    return envelope, phase
+        
+def load_wave(wave_data, sample_rate):
+    if isinstance(wave_data, str):
+        waveform, sr = torchaudio.load(uri=wave_data, normalize=False)
+    elif isinstance(wave_data, dict):
+        waveform = torch.tensor(data=wave_data["array"]).float()
+        sr = wave_data["sampling_rate"]
+    else:
+        raise TypeError("Invalid wave_data format.")
+    
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+    
+    if sr != sample_rate:
+        original_length = waveform.shape[1]
+        target_length = int(original_length * (sample_rate / sr))
+        
+        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sample_rate)
+        waveform = resampler(waveform)
+        
+    return waveform.flatten()
+
+def extract_features(batch, tokenizer, spectrogram, waveforms, pitch, frequency=False,
+                     hop_length=128, fmin=0, fmax=8000, n_mels=128, n_fft=1024, sampling_rate=16000,
+                     pad_mode="constant", center=True, power=2.0, window_fn=torch.hann_window, mel_scale="htk", 
+                     norm=None, normalized=False, downsamples=False, period=False, hilbert=False):
+
+    dtype = torch.float32
+    device = torch.device("cuda:0")
+    audio = batch["audio"]
+    sampling_rate = audio["sampling_rate"]
+    sr = audio["sampling_rate"]
+    wav = load_wave(wave_data=audio, sample_rate=sr)
+
+    if spectrogram:
+        transform = torchaudio.transforms.MelSpectrogram(
+            f_max=fmax,
+            f_min=fmin,
+            n_mels=n_mels,
+            sample_rate=sr,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            norm=norm,
+            normalized=normalized,
+            power=power,
+            center=center, 
+            mel_scale=mel_scale,
+            window_fn=window_fn,
+            pad_mode=pad_mode)
+        
+        mel_spectrogram = transform(wav)      
+        log_mel = torch.clamp(mel_spectrogram, min=1e-10).log10()
+        log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
+        spec = (log_mel + 4.0) / 4.0
+        spec = torch.tensor(spec)
+        batch["spectrogram"] = spec
+        
+    if hilbert:
+        envelope_list = []
+        phase_list = []
+        
+        for ch_idx in range(spec.shape[0]):
+            envelope, phase = process_spectrogram_with_hilbert(spec[ch_idx])
+            envelope_list.append(envelope)
+            phase_list.append(phase)
+            
+        batch["envelope"] = torch.stack(envelope_list)
+        batch["phase"] = torch.stack(phase_list)
+        
+    wav_1d = wav.unsqueeze(0)
+    
+    if waveforms:
+        batch["waveform"] = wav_1d
+            
+    if pitch:
+        wav_np = wav.numpy().astype(np.float64)  
+        f0, t = pw.dio(wav_np, sampling_rate, 
+                    frame_period=hop_length/sampling_rate*1000)
+        f0 = pw.stonemask(wav_np, f0, t, sampling_rate)
+        f0 = torch.from_numpy(f0).float()
+        batch["pitch"] = f0.unsqueeze(0)  
+        
+    if frequency:
+        wav_np = wav.numpy().astype(np.float64)  
+        f0, t = pw.dio(wav_np, sampling_rate, frame_period=hop_length/sampling_rate*1000)
+        f0 = pw.stonemask(wav_np, f0, t, sampling_rate)
+        f0 = torch.from_numpy(f0).float()   
+        batch["f0"] = f0
+                  
+    if spectrogram and waveforms and pitch:
+        spec_mean = batch["spectrogram"].mean()
+        spec_std = batch["spectrogram"].std() + 1e-6
+        batch["spectrogram"] = (batch["spectrogram"] - spec_mean) / spec_std
+        
+        wav_mean = batch["waveform"].mean()
+        wav_std = batch["waveform"].std() + 1e-6
+        batch["waveform"] = (batch["waveform"] - wav_mean) / wav_std
+        
+        if batch["pitch"].max() > 1.0:
+            pitch_min = 50.0
+            pitch_max = 500.0
+            batch["pitch"] = (batch["pitch"] - pitch_min) / (pitch_max - pitch_min)
+            
+    batch["label"] = tokenizer.encode(batch["transcription"], add_special_tokens=False)
+    return batch
+
+def compute_metrics(eval_pred, compute_result: bool = True, 
+                    print_pred: bool = False, num_samples: int = 0, tokenizer=None, pitch=None, model=None):
+    
+    pred_logits = eval_pred.predictions
+    label_ids = eval_pred.label_ids
+
+    if hasattr(pred_logits, "cpu"):
+        pred_logits = pred_logits.cpu()
+    if hasattr(label_ids, "cpu"):
+        label_ids = label_ids.cpu()
+    if isinstance(pred_logits, tuple):
+        pred_ids = pred_logits[0]
+    else:
+        pred_ids = pred_logits
+    if hasattr(pred_ids, "ndim") and pred_ids.ndim == 3:
+        if not isinstance(pred_ids, torch.Tensor):
+            pred_ids = torch.tensor(pred_ids)
+        pred_ids = pred_ids.argmax(dim=-1)
+        pred_ids = pred_ids.tolist()
+            
+    if hasattr(label_ids, "tolist"):
+        label_ids = label_ids.tolist()
+        
+    label_ids = [[0 if token == -100 else token for token in seq] for seq in label_ids]
+    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=False)
+    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=False)
+
+    if print_pred:
+        for i in range(min(num_samples, len(pred_str))):
+            print(f"Preds: {pred_str[i]}")
+            print(f"Label: {label_str[i]}")
+            print(f"preds: {pred_ids[i]}")
+            print(f"label: {label_ids[i]}")
+            print("--------------------------------")  
+    
+    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+    wer = 100 * metric.compute(predictions=pred_str, references=label_str)
+    
+    if model is None:
+        global global_model
+        if 'global_model' in globals():
+            model = global_model
+    
+    if model is not None:
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000
+        if trainable_params > 0:
+            efficiency_score = (100 - wer) / trainable_params
+        else:
+            print("Warning: Zero trainable parameters detected")
+            efficiency_score = 0.0
+    else:
+        print("Warning: Model not available for parameter counting")
+        trainable_params = 0.0
+        efficiency_score = 0.0
+    
+    if hasattr(wer, "item"):
+        wer = wer.item()
+    
+    metrics = {
+        "wer": float(wer),
+        "trainable_params_M": float(trainable_params),
+        "efficiency_score": float(efficiency_score),
+    }
+    
+    return metrics
+
+logger = logging.getLogger(__name__)
+
+def create_model(param: Dimensions) -> Echo:
+    model = Echo(param).to('cuda')
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Trainable parameters: {trainable_params:,}")
+    logger.info(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Total parameters: {total_params:,}")
+    
+    return model
+
+def setup_tokenizer(token: str, local_tokenizer_path: str = "D:/newmodel/model/tokenn/"):
+    from tokenizers import Tokenizer
+    tokenizer = Tokenizer.from_file(f"{local_tokenizer_path}/tokenizer.json")
+    orig_encode = tokenizer.encode
+    def enc(text, add_special_tokens=True):
+        ids = orig_encode(text).ids
+        if not add_special_tokens:
+            sp_ids = [tokenizer.token_to_id(t) for t in ["<PAD>", "<BOS>", "<EOS>"]]
+            ids = [id for id in ids if id not in sp_ids]
+        return ids
+    def bdec(ids_list, skip_special_tokens=True):
+        results = []
+        for ids in ids_list:
+            if skip_special_tokens:
+                ids = [id for id in ids if id not in [0, 1, 2]]
+            results.append(tokenizer.decode(ids))
+        return results
+    def save_pretrained(save_dir):
+        os.makedirs(save_dir, exist_ok=True)
+        tokenizer.save(f"{save_dir}/tokenizer.json")
+    tokenizer.encode = enc
+    tokenizer.batch_decode = bdec
+    tokenizer.save_pretrained = save_pretrained
+    tokenizer.pad_token_id = 0
+    tokenizer.bos_token_id = 1
+    tokenizer.eos_token_id = 2
+    return tokenizer
+
+def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_config: Optional[Dict] = None) -> Tuple[any, any]:
+    if dataset_config is None:
+        dataset_config = {
+            "spectrogram": True,
+            "waveforms": True,
+            "pitch": True,
+            "frequency": True,
+            "downsamples": True,
+            "hop_length": 128,
+            "fmin": 50,
+            "fmax": 2000,
+            "n_mels": 128,
+            "n_fft": 1024,
+            "sampling_rate": 16000,
+        }
+    
+    dataset = load_dataset(
+        "google/fleurs", 
+        "en_us", 
+        token=token, 
+        trust_remote_code=True,
+        streaming=False)
+    
+    dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000)).select_columns(["audio", "transcription"])
+    
+    if sanity_check:
+        dataset = dataset["test"].take(10)
+        dataset = dataset.select_columns(["audio", "transcription"])
+        logger.info(f"Sanity dataset size: {dataset.num_rows}") 
+        print(f"Sanity dataset size: {dataset.num_rows}")
+        prepare_fn = partial(extract_features, tokenizer=tokenizer, **dataset_config)
+        
+        dataset = dataset.map(
+            function=prepare_fn, 
+            remove_columns=["audio", "transcription"]
+        ).with_format(type="torch")
+        train_dataset = dataset
+        test_dataset = dataset
+    else:
+        def filter_func(x):
+            return (0 < len(x["transcription"]) < 512 and
+                   len(x["audio"]["array"]) > 0 and
+                   len(x["audio"]["array"]) < 1500 * 160)
+        
+        dataset = dataset.filter(filter_func).shuffle(seed=4)
+        logger.info(f"Dataset size: {dataset['train'].num_rows}, {dataset['test'].num_rows}")
+        print(f"Dataset size: {dataset['train'].num_rows}, {dataset['test'].num_rows}")
+        prepare_fn = partial(extract_features, tokenizer=tokenizer, **dataset_config)
+        columns_to_remove = list(next(iter(dataset.values())).features)
+        train_dataset = dataset["train"]
+        test_dataset = dataset["test"].take(50)
+        logger.info(f"Train dataset size: {train_dataset.num_rows}, Test dataset size: {test_dataset.num_rows}")
+        
+        train_dataset = train_dataset.map(
+            function=prepare_fn, 
+            remove_columns=columns_to_remove
+        ).with_format(type="torch")
+        
+        test_dataset = test_dataset.map(
+            function=prepare_fn, 
+            remove_columns=columns_to_remove
+        ).with_format(type="torch")
+    
+    return train_dataset, test_dataset
+
+def get_training_args(
+    log_dir: str,
+    batch_eval_metrics: bool = False,
+    max_steps: int = 10,
+    save_steps: int = 1000,
+    eval_steps: int = 1,
+    warmup_steps: int = 0,
+    num_train_epochs: int = 1,
+    logging_steps: int = 1,
+    eval_on_start: bool = False,
+    learning_rate: float = 1e-4,
+    weight_decay: float = 0.01,
+    max_grad_norm: float = 1.0,
+) -> Seq2SeqTrainingArguments:
+
+    return Seq2SeqTrainingArguments(
+        output_dir=log_dir,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+        gradient_accumulation_steps=1,
+        eval_accumulation_steps=1,
+        eval_strategy="steps",
+        save_strategy="steps",
+        max_steps=max_steps,
+        save_steps=save_steps,
+        eval_steps=eval_steps,
+        warmup_steps=warmup_steps,
+        num_train_epochs=num_train_epochs,
+        logging_steps=logging_steps,
+        logging_dir=log_dir,
+        logging_strategy="steps",
+        report_to=["tensorboard"],
+        push_to_hub=False,
+        disable_tqdm=False,
+        save_total_limit=1,
+        label_names=["labels"],
+        optim="adamw_torch",
+        lr_scheduler_type="cosine",
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        save_safetensors=False,
+        eval_on_start=eval_on_start,
+        batch_eval_metrics=batch_eval_metrics,
+        max_grad_norm=max_grad_norm,     
+    )
+
+def main():
+     
+    token = ""
+    log_dir = os.path.join('./output/logs', datetime.now().strftime(format='%m-%d_%H_%M_%S'))
+    os.makedirs(name=log_dir, exist_ok=True)
+    tokenizer = setup_tokenizer(token)
+
+    def sanity(sanity: bool):
+
+        if sanity:
+            training_args = get_training_args(
+            log_dir,
+            batch_eval_metrics = False,
+            max_steps = 10,
+            save_steps = 0,
+            eval_steps = 1,
+            warmup_steps = 0,
+            logging_steps = 1,
+            eval_on_start = False,
+            learning_rate = 5e-6,
+            weight_decay = 0.01,
+            )
+        else:
+            training_args = get_training_args(
+            log_dir,
+            batch_eval_metrics = False,
+            max_steps = 1000,
+            save_steps = 1005,
+            eval_steps = 100,   
+            warmup_steps = 100,
+            logging_steps = 10,
+            eval_on_start = False,
+            learning_rate = 2.5e-4,
+            weight_decay = 0.01,
+            )
+
+        return training_args
+        
+    param = Dimensions(
+        mels=128,
+        aud_ctx=1500,
+        aud_head=4,
+        aud_dims=512,
+        aud_idx=4,
+        vocab=40000,
+        text_ctx=512,
+        text_head=4,
+        text_dims=512,
+        text_idx=4,
+        act="swish",
+        debug={"rotary"},
+        cross_attn=True,
+        f0_rotary=False, 
+        features = ["spectrogram"]
+        )
+
+    sanity_check = False
+    training_args = sanity(sanity_check)
+    dataset_config = {
+        "spectrogram": True,
+        "waveforms": False,
+        "pitch": False,
+        "downsamples": False,
+        "frequency": False,
+        "hilbert": False,
+        "hop_length": 128,
+        "fmin": 150,
+        "fmax": 2000,
+        "n_mels": 128,
+        "n_fft": 1024,
+        "sampling_rate": 16000,
+        "pad_mode": "constant",
+        "center": True, 
+        "power": 2.0,
+        "window_fn": torch.hann_window,
+        "mel_scale": "htk",
+        "norm": None,
+        "normalized": False}
+    
+    model = create_model(param)
+    
+    global global_model
+    global_model = model
+    
+    metrics_fn = partial(compute_metrics, print_pred=False, num_samples=5, 
+                    tokenizer=tokenizer, model=model)
+    
+    print(f"{'Sanity check' if sanity_check else 'Training'} mode")
+    train_dataset, test_dataset = prepare_datasets(
+        tokenizer=tokenizer,
+        token=token,
+        sanity_check=sanity_check,
+        dataset_config=dataset_config)
+
+    trainer = Seq2SeqTrainer(
+        args=training_args,
+        model=model,
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,
+        data_collator=DataCollator(tokenizer=tokenizer),
+        compute_metrics=metrics_fn,
+        ) 
+       
+    model.init_weights()
+    trainer.train()
+
+if __name__ == "__main__":
+    main()
 
