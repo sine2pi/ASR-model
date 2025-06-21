@@ -413,8 +413,8 @@ class rotary(nn.Module):
         t = torch.arange(ctx, device=device, dtype=dtype)
 
         if f0 is not None:
-            f0_mean = f0.mean() + 1e-8
-            theta = f0_mean * self.pitch_scale
+            f0_mean = f0.mean()
+            theta = f0_mean + 1e-8
             freqs = 1.0 / (theta ** (torch.arange(0, self.dim, 2, device=device, dtype=dtype)[:(self.dim // 2)].float() / self.dim))
             if "rotary1" in self.debug:
                 print(f"{layer}: {theta:.2f} : {f0_mean:.2f} : {ctx} ")
@@ -588,13 +588,22 @@ class m_gate(nn.Module):
 class c_gate(nn.Module):
     def __init__(self, dims):
         super().__init__()
+        self.s_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
+        self.w_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
+        self.p_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
         self.e_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
         self.ph_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
         self.integ = Linear(dims*5, dims)
         
     def forward(self, x, features):
+        s_feat = features.get("spectrogram", x)
+        w_feat = features.get("waveform", x)
+        p_feat = features.get("pitch", x)
         e_feat = features.get("envelope", x)
         ph_feat = features.get("phase", x)
+        s = self.s_gate(x) * s_feat
+        w = self.w_gate(x) * w_feat
+        p = self.p_gate(x) * p_feat
         e = self.e_gate(x) * e_feat
         ph = self.ph_gate(x) * ph_feat
         comb = torch.cat([s, w, p, e, ph], dim=-1)
@@ -1279,7 +1288,7 @@ class DataCollator:
             pad_env = []
             for feat in env_list:                
                 current_len = feat.shape[-1]
-                padding = max_len_feat - current_len
+                padding = max_len - current_len
                 if padding > 0:
                     pad_feat = F.pad(feat, (0, padding), mode='constant', value=pad_token_id)
                 else:
@@ -1293,7 +1302,7 @@ class DataCollator:
             pad_ph = []
             for feat in ph_list:                
                 current_len = feat.shape[-1]
-                padding = max_len_feat - current_len
+                padding = max_len - current_len
                 if padding > 0:
                     pad_feat = F.pad(feat, (0, padding), mode='constant', value=pad_token_id)
                 else:
