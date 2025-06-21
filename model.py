@@ -340,13 +340,13 @@ class rotary(nn.Module):
         freqs = 1. / (theta ** (torch.arange(0, dim, 2, device=device, dtype=dtype)[:(dim // 2)].float() / dims))
         self.freqs = nn.Parameter(torch.tensor(freqs, device=device, dtype=dtype), requires_grad=True)
         self.radius = nn.Parameter(torch.ones(radius, device=device, dtype=dtype), requires_grad=True)
-        freq_data = 1.0 / (theta ** (torch.arange(start=0, end=dim, step=2).float() / dim))
-        self.inv_freq = nn.Parameter(freq_data, requires_grad=True)
+        freq = 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000 
+        self.inv_freq = nn.Parameter(freq, requires_grad=True)
 
     def update_base(self, pitch):
         theta = pitch.squeeze(0).to(device, dtype)
         f0_mean = theta.mean() + 1e-8
-        inv_freq = 1.0 / (f0_mean ** (torch.arange(start=0, end=self.dim, step=2, device=device, dtype=dtype) / self.dim))
+        inv_freq = 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000 
         self.inv_freq.data.copy_(inv_freq)
         self.theta.data.copy_(f0_mean)
 
@@ -398,13 +398,11 @@ class rotary(nn.Module):
         t = torch.arange(ctx, device=device, dtype=dtype)
 
         if f0 is not None:
-            f0_mean = f0.mean()
-            theta = f0_mean + 1e-8
-            freqs = 1.0 / (theta ** (torch.arange(0, self.dim, 2, device=device, dtype=dtype)[:(self.dim // 2)].float() / self.dim))
+            freqs = self.inv_freq
             if "rotary1" in self.debug:
                 print(f"{layer}: {theta:.2f} : {f0_mean:.2f} : {ctx} ")
         else:
-            freqs = self.freqs
+            freqs = self.inv_freq
         freqs = t[:, None] * freqs[None, :]
         if self.radii:
             if f0 is not None:
