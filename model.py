@@ -35,7 +35,6 @@ dtype = torch.float32
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
-
 extractor = None
 tokenizer = None
 optimizer = None
@@ -373,9 +372,9 @@ class rotary(nn.Module):
                 print(f"Radius[end]: {radius[-1][:5].cpu().numpy()}")  
             
             print(f"Final freqs shape: {freqs.shape}")
-            print(f"Freqs[0]: {freqs[0][:5].cpu().numpy()}")
-            print(f"Freqs[mid]: {freqs[ctx//2][:5].cpu().numpy()}")
-            print(f"Freqs[end]: {freqs[-1][:5].cpu().numpy()}")
+            print(f"Freqs[0]: {freqs[0][:5].cpu().detach().numpy()}")
+            print(f"Freqs[mid]: {freqs[ctx//2][:5].cpu().detach().numpy()}")
+            print(f"Freqs[end]: {freqs[-1][:5].cpu().detach().numpy()}")
             print("================================\n")      
         
         self._counter += 1
@@ -393,7 +392,6 @@ class rotary(nn.Module):
         x1 = torch.view_as_real(x1).flatten(-2)
         x1 = x1.view(orig_shape)
         return torch.cat([x1.type_as(x), x2], dim=-1)
-
 
 # class FocusA(nn.Module):
 #     def __init__(self, dims, head, max_dist=None, win_size=32, max_span=32, temp_scale=0.01, iterations=2):
@@ -1821,6 +1819,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
