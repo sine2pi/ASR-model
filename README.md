@@ -1,7 +1,7 @@
 
-### Echo - NLP/ASR model with acoustic variable radii relative position embedding (vRoPE) that maps pitch to token.  And some other stuff...
+### NLP/ASR model with acoustic variable radii relative position embedding (vRoPE) that maps pitch to token.  And some other stuff...
 ----
-#### The Magic of Domain-Specific Knowledge in ML.. 
+#### Domain-Specific ASR model. 
 
 #### freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
 ----
