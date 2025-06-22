@@ -274,13 +274,6 @@ class rotary(nn.Module):
         inv_freq = (theta / 140.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
         self.inv_freq = nn.Parameter(torch.tensor(inv_freq, device=device, dtype=dtype), requires_grad=True)
 
-    def update_base(self, f0):
-        f0 = f0.squeeze(0).to(device, dtype)
-        theta = f0.mean() + 1e-8
-        inv_freq = (theta / 140.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
-        self.inv_freq.data.copy_(inv_freq)
-        self.theta.data.copy_(theta)    
-
     def return_f0(self, f0=None):
         if f0 is not None:
             self.f0 = f0
@@ -288,6 +281,13 @@ class rotary(nn.Module):
         elif hasattr(self, 'f0') and self.f0 is not None:
             return self.f0.squeeze(0).to(device, dtype)
         return None
+    
+    def update_base(self, f0):
+        f0 = self.return_f0()
+        theta = f0.mean() + 1e-8
+        inv_freq = (theta / 140.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+        self.inv_freq.data.copy_(inv_freq)
+        self.theta.data.copy_(theta)    
 
     def get_pitch_bias(self, f0):
         if f0 is None:
@@ -1053,12 +1053,10 @@ class Echo(nn.Module):
     def update_base(self, f0):
         for name, module in self.encoder.named_modules():
             if isinstance(module, (rotary)):
-                module.update_base(f0)
                 module.return_f0(f0)
 
         for name, module in self.decoder.named_modules():
             if isinstance(module, (rotary)):
-                module.update_base(f0)
                 module.return_f0(f0)
    
     def set_alignment_head(self, dump: bytes):
