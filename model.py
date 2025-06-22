@@ -271,7 +271,7 @@ class rotary(nn.Module):
         theta = torch.tensor(theta, device=device, dtype=dtype)
         self.theta = nn.Parameter(torch.tensor(theta, device=device, dtype=dtype), requires_grad=True)
         self.radius = nn.Parameter(torch.ones(radius, device=device, dtype=dtype), requires_grad=True)
-        inv_freq = (theta / 140.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+        inv_freq = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
         self.inv_freq = nn.Parameter(torch.tensor(inv_freq, device=device, dtype=dtype), requires_grad=True)
 
     def return_f0(self, f0=None):
@@ -285,7 +285,7 @@ class rotary(nn.Module):
     def update_base(self, f0):
         f0 = self.return_f0()
         theta = f0.mean() + 1e-8
-        inv_freq = (theta / 140.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+        inv_freq = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
         self.inv_freq.data.copy_(inv_freq)
         self.theta.data.copy_(theta)    
 
