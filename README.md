@@ -1,8 +1,12 @@
 
-## Echo - NLP/ASR model with acoustic variable radii relative position embedding (vRoPE) that maps pitch to token.  And some other stuff...
+### Echo - NLP/ASR model with acoustic variable radii relative position embedding (vRoPE) that maps pitch to token.  And some other stuff...
+----
+#### The Magic of Domain-Specific Knowledge in ML.. 
+
+#### freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+----
 
 
-Experimental - research model. Some of the modules and functions in the code are not part of the active model just yet. 
 
 Pitch-Aware Processing: Integrates F0/pitch information throughout the processing pipeline, making the model sensitive to prosodic features of speech.
 
@@ -22,7 +26,7 @@ To highlight the relationship between pitch and rotary embeddings echo implement
 <img width="470" alt="rhg" src="https://github.com/user-attachments/assets/ddfad0c5-21b5-4f1d-879f-ae41411444a8" />
 
 
-Whisper: STEP 1000 • WER:91.89% • Loss:7.8292 • LR:0.00098035
+
 
 By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model to pay attention to the acoustic features relate to sequence position in a way that's proportional to the voice characteristics.  This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
 
