@@ -19,7 +19,7 @@ To highlight the relationship between pitch and rotary embeddings echo implement
 
 1000 steps with f0 / theta substitutions:
 
-<img width="470" alt="3213" src="https://github.com/user-attachments/assets/2932117f-c1ac-4772-8d9a-622edd9c5e07" />
+<img width="470" alt="rhg" src="https://github.com/user-attachments/assets/ddfad0c5-21b5-4f1d-879f-ae41411444a8" />
 
 
 Whisper: STEP 1000 • WER:91.89% • Loss:7.8292 • LR:0.00098035
@@ -36,7 +36,7 @@ Narrow bands: More focus on nearby positions (good for local patterns)
 
 <img width="470" alt="cc" src="https://github.com/user-attachments/assets/28d00fc5-2676-41ed-a971-e4d857af43f8"  />
 <img width="470" alt="cc2" src="https://github.com/user-attachments/assets/9089e806-966b-41aa-8793-bee03a6e6be1"  />
-<img width="470" alt="rhg" src="https://github.com/user-attachments/assets/ddfad0c5-21b5-4f1d-879f-ae41411444a8" />
+
 
 Static 10k theta is perfectly fine for a text model but probably not for a NLP ai.
 
