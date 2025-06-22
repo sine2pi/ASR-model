@@ -93,11 +93,3 @@ The theoretical foundation:
 --- 
 
 <img width="470" alt="cc2" src="https://github.com/user-attachments/assets/d52a48b1-8717-4d29-9452-cfdf43c92fe8"  />
-
-## The F0-Conditioned Rotation Mechanism
-
-The high gate usage validates the fundamental frequency conditioning approach:
-
-- Pitch-adaptive rotary embeddings are providing meaningful signal that the gates are actively utilizing
-- The decoder is learning to selectively attend to pitch-relevant patterns
-- The gates are functioning as a kind of "pitch-aware filter" that determines which information should flow through the network
