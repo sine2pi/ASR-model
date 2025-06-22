@@ -349,17 +349,17 @@ class rotary(nn.Module):
 
         if self.radii:
             radius = self.align_f0(ctx)
-            if "rotary2" in self.debug:
+            if "rotary2" in self.debug and self._counter == 5:
                 print(f"{layer} radius: {radius} ctx: {ctx}")
         else:
             radius = freqs
         freqs = torch.polar(torch.ones_like(radius), freqs)
 
-        if "rotary3" in self.debug:
+        if "rotary3" in self.debug and self._counter == 5:
             print(f"{layer} count {self._counter} f0: {f0.shape if f0 is not None else None} freqs: {freqs.shape}  radius: {radius.shape} ctx: {ctx}")
             print(f"freqs mean: {freqs.mean():.2f} inv_freq mean: {self.inv_freq.mean():.2f} theta: {self.theta.item():.2f} radius mean: {radius.mean():.2f} radius shape: {radius.shape} ctx: {ctx}")
 
-        if "rotary_detail" in self.debug:
+        if "rotary_detail" in self.debug and self._counter == 5:
             print(f"\n==== Detailed RoPE Analysis ====")
             print(f"Layer: {layer}, Context Length: {ctx}")
             print(f"F0 stats: mean={self.theta.item():.2f}")
