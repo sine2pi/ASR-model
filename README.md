@@ -28,6 +28,9 @@ To highlight the relationship between pitch and rotary embeddings echo implement
 
 https://huggingface.co/Sin2pi/Echo17/tensorboard?params=scalars#frame
 
+<img width="470" alt="4345" src="https://github.com/user-attachments/assets/b918fa73-fde0-40ca-9f09-bfc4e97e1ddf" />
+
+
 By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model to pay attention to the acoustic features relate to sequence position in a way that's proportional to the voice characteristics.  This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
 
 
