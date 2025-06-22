@@ -36,6 +36,7 @@ Narrow bands: More focus on nearby positions (good for local patterns)
 
 <img width="470" alt="cc" src="https://github.com/user-attachments/assets/28d00fc5-2676-41ed-a971-e4d857af43f8"  />
 <img width="470" alt="cc2" src="https://github.com/user-attachments/assets/9089e806-966b-41aa-8793-bee03a6e6be1"  />
+<img width="470" alt="rhg" src="https://github.com/user-attachments/assets/ddfad0c5-21b5-4f1d-879f-ae41411444a8" />
 
 Static 10k theta is perfectly fine for a text model but probably not for a NLP ai.
 
