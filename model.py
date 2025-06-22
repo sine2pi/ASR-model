@@ -285,7 +285,7 @@ class rotary(nn.Module):
     def update_base(self, f0):
         f0 = self.return_f0()
         theta = f0.mean() + 1e-8
-        inv_freq = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+        inv_freq = (theta / 200.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
         self.inv_freq.data.copy_(inv_freq)
         self.theta.data.copy_(theta)    
 
@@ -1054,11 +1054,13 @@ class Echo(nn.Module):
         for name, module in self.encoder.named_modules():
             if isinstance(module, (rotary)):
                 module.return_f0(f0)
+                module.update_base(f0)
 
         for name, module in self.decoder.named_modules():
             if isinstance(module, (rotary)):
                 module.return_f0(f0)
-   
+                module.update_base(f0)
+                
     def set_alignment_head(self, dump: bytes):
         array = np.frombuffer(
             gzip.decompress(base64.b85decode(dump)), dtype=bool).copy()
