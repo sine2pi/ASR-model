@@ -411,6 +411,23 @@ class rotary(nn.Module):
             idx = (idx * frames).long().clamp(0, length - 1)
             return f0[idx, :]
 
+    # def orthogonal(self, dims, i, j, theta):
+    #     R = torch.eye(dims).to(theta.device)
+    #     R[i, i] = torch.cos(theta)
+    #     R[i, j] = -torch.sin(theta)
+    #     R[j, i] = torch.sin(theta)
+    #     R[j, j] = torch.cos(theta)
+    #     R = torch.eye(dims).to(theta.device) - 2 * torch.outer(R, R) / torch.dot(R, R)
+    #     return R
+
+    # def orthogonal_regularization_term(self):
+    #     loss = torch.tensor(0.0, device=self.r_matrix.device)
+    #     if self.r_matrix.requires_grad:
+    #         product = torch.matmul(self.r_matrix, self.r_matrix.t())
+    #         identity = torch.eye(self.r_matrix.size(0)).to(self.r_matrix.device)
+    #         loss = ((product - identity) ** 2).sum()
+    #     return self.orthogonal_reg_weight * loss
+
     def forward(self, x=None, enc=None, layer=None, input_type="audio") -> Tensor:
         f0 = enc.get("f0", None) if enc is not None else None
 
@@ -427,13 +444,16 @@ class rotary(nn.Module):
             freqs = self.inv_freq
             f0_mean = f0.mean()
             theta = f0_mean + 1e-8
-            freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+            freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
 
             if "rotary1" in self.debug:
                 print(f"{layer}: {theta:.2f} : {f0_mean:.2f} : {ctx} ")
         else:
             freqs = self.inv_freq
         freqs = t[:, None] * freqs[None, :]
+
+        # sinusoid_inp = torch.einsum('i, j -> i j', torch.arange(end=seq_len, device=x.device), self.inv_freq.to(device=x.device))
+
         if self.radii:
             if f0 is not None:
                 radius = self.align_f0(f0, ctx)
