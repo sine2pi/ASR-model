@@ -1063,10 +1063,10 @@ class Echo(nn.Module):
         return {
             "logits": logits,
             "loss": loss,
-            "labels": labels,
-            "input_ids": input_ids,
-            "decoder_input_ids": decoder_input_ids,
-            "encoder_output": encoder_outputs,
+            # "labels": labels,
+            # "input_ids": input_ids,
+            # "decoder_input_ids": decoder_input_ids,
+            # "encoder_output": encoder_outputs,
             } 
 
     @property
