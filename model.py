@@ -1706,7 +1706,7 @@ def main():
         "waveforms": False,
         "pitch": False,
         "downsamples": False,
-        "frequency": True,
+        "frequency": False,
         "hilbert": False,
         "hop_length": 128,
         "fmin": 150,
