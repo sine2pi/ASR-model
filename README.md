@@ -1,5 +1,5 @@
 
-### NLP/ASR model with acoustic variable radii relative position embedding (vRoPE) that maps pitch to token. 
+### NLP/ASR multimodal pitch aware model. 
 ----
 ![3tings](https://github.com/user-attachments/assets/4158ead2-75f4-42e2-84f8-7b39b6984026)
 
