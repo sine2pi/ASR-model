@@ -1389,7 +1389,7 @@ def extract_features(batch, tokenizer, spectrogram, waveforms, pitch, frequency=
                     frame_period=hop_length/sampling_rate*1000)
         f0 = pw.stonemask(wav_np, f0, t, sampling_rate)
         f0 = torch.from_numpy(f0)
-        batch["pitch"] = f0
+        batch["pitch"] = f0.unsqueeze(0)
         
     if frequency:
         wav_np = wav.numpy().astype(np.float64)  
