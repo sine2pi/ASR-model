@@ -59,8 +59,6 @@ These visualizations help confirm that:
 <img width="470" alt="65356" src="https://github.com/user-attachments/assets/84624fc4-5def-4e9f-9cdd-c350b80ec348" />
 
 
-<img width="470" alt="4345" src="https://github.com/user-attachments/assets/b918fa73-fde0-40ca-9f09-bfc4e97e1ddf" />
-
 ----
 
 The patterns below show how positions "see" each other in relation to theta and f0. 
