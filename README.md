@@ -56,9 +56,8 @@ These visualizations help confirm that:
 
 1000 steps with f0 / theta substitutions:
 
-<img width="470" alt="rhg" src="https://github.com/user-attachments/assets/ddfad0c5-21b5-4f1d-879f-ae41411444a8" />
+<img width="470" alt="65356" src="https://github.com/user-attachments/assets/84624fc4-5def-4e9f-9cdd-c350b80ec348" />
 
-https://huggingface.co/Sin2pi/Echo17/tensorboard?params=scalars#frame
 
 <img width="470" alt="4345" src="https://github.com/user-attachments/assets/b918fa73-fde0-40ca-9f09-bfc4e97e1ddf" />
 
