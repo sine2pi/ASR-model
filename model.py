@@ -249,30 +249,32 @@ def sinusoids(length, num_chan, max=10000):
     s_time = torch.arange(length)[:, np.newaxis] * inv_time[np.newaxis, :]
     return torch.cat([torch.sin(s_time), torch.cos(s_time)], dim=1)
 
-class rotary(nn.Module):
-    def __init__(self, dims, head, max_ctx=1500, theta=10000, radii=False, debug: List[str] = [], 
-                 use_pbias=False, spec_shape=None):
-        super().__init__()
 
+class rotary(nn.Module):
+    def __init__(self, dims, head, max_ctx=1500, theta=10000, radii=False, debug: List[str] = [], use_pbias=False, spec_shape=None):
+        super(rotary, self).__init__()
+
+        self.pitch_scale = 0.1
         self.use_pbias = use_pbias
-        self.last_f0_theta = None
-        self.debug = debug
-        self._counter = 0
+        self.spec_shape = spec_shape
         self.dims = dims
         self.head = head
         self.head_dim = dims // head
-        self.max_ctx = max_ctx
         self.radii = radii
-        self.learned_adaptation: bool = False
-        radius = 1
+        self.theta = theta
+        self.max_ctx = max_ctx
+        self.debug = debug
+        self.counter = 0
+        self.last_theta = None
         dim = self.head_dim
         self.dim = dim
 
-        theta = torch.tensor(theta, device=device, dtype=dtype)
+        self.f0_proj = nn.Linear(1, self.head_dim // 2) if radii else None
         self.theta = nn.Parameter(torch.tensor(theta, device=device, dtype=dtype), requires_grad=True)
-        self.radius = nn.Parameter(torch.ones(radius, device=device, dtype=dtype), requires_grad=True)
-        inv_freq = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
-        self.inv_freq = nn.Parameter(torch.tensor(inv_freq, device=device, dtype=dtype), requires_grad=True)
+        self.base_radius = nn.Parameter(torch.ones(1))
+
+        freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+        self.freqs = nn.Parameter(torch.tensor(freqs, device=device, dtype=dtype), requires_grad=True)        
 
     def return_f0(self, f0=None):
         if f0 is not None:
@@ -281,13 +283,13 @@ class rotary(nn.Module):
         elif hasattr(self, 'f0') and self.f0 is not None:
             return self.f0.squeeze(0).to(device, dtype)
         return None
-    
+
     def update_base(self, f0):
-        f0 = self.return_f0()
+        f0 = f0.squeeze(0).to(device, dtype)
         theta = f0.mean() + 1e-8
-        inv_freq = (theta / 200.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
-        self.inv_freq.data.copy_(inv_freq)
-        self.theta.data.copy_(theta)    
+        freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+        self.freqs.data.copy_(freqs)
+        self.theta.data.copy_(theta)
 
     def get_pitch_bias(self, f0):
         if f0 is None:
@@ -303,14 +305,26 @@ class rotary(nn.Module):
             f0 = f0.squeeze(0)
         self.f0_proj = nn.Linear(1, self.head_dim // 2, device=device, dtype=dtype)
         f0 = f0.to(device, dtype)
-        f0 = self.f0_proj(f0.unsqueeze(-1))  
+        f0 = self.f0_proj(f0.unsqueeze(-1))
         if f0.ndim == 3:
             f0 = f0.squeeze(0)
         return f0.to(device=device, dtype=dtype)
 
-    def align_f0(self, ctx):
-        f0 = self.return_f0()
+    def synth_f0(self, f0, ctx):
         f0 = self.f0proj(f0)
+        print(f"Aligning f0 with context: {ctx}, f0 shape: {f0}")
+        if f0.dim() == 1:
+            length = f0.shape[0]
+            if length == ctx:
+                return f0
+            frames = length / ctx
+            idx = torch.arange(ctx, device=f0.device)
+            # return torch.arange(1, ctx+1, device=f0.device, dtype=torch.float)
+            return f0[id]
+
+    def align_f0(self, ctx, f0):
+        # f0 = self.return_f0()
+        # f0 = self.f0proj(f0)
         if f0.dim() == 3:
             batch, length, dims = f0.shape
             if length == ctx:
@@ -330,13 +344,15 @@ class rotary(nn.Module):
         else:
             length, dims = f0.shape
             if length == ctx:
-                return f0 
+                return f0
             frames = length / ctx
             idx = torch.arange(ctx, device=f0.device)
             idx = (idx * frames).long().clamp(0, length - 1)
             return f0[idx, :]
-       
-    def forward(self, x=None, f0=None, enc=None, layer=None, input_type="audio") -> Tensor:
+
+    def forward(self, x=None, enc=None, layer=None, input_type="audio") -> Tensor:
+        f0 = default(enc.get("pitch"), enc.get("f0")) if enc is not None else None
+
         if isinstance(x, int):
             ctx = x
         elif isinstance(x, torch.Tensor) and x.ndim == 3:
@@ -344,7 +360,15 @@ class rotary(nn.Module):
         else:
             batch, head, ctx, head_dim = x.shape
         t = torch.arange(ctx, device=device, dtype=dtype)
-        freqs = self.inv_freq
+        if f0 is not None:
+            f0_mean = f0.mean()
+            theta = f0_mean + 1e-8
+        else:
+            theta = self.theta  
+
+        freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), 
+                self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+        
         freqs = t[:, None] * freqs[None, :]
 
         if self.radii:
