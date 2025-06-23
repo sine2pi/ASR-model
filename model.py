@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import torch.nn.init as init
 from torch import nn, Tensor
 import numpy as np
+from einops import rearrange
 import matplotlib.pyplot as plt
 from typing import Optional, Dict, Union, List, Tuple, Any
 from functools import partial
@@ -249,24 +250,20 @@ def sinusoids(length, channels, max_timescale=10000):
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
 class rotary(nn.Module):
-    def __init__(self, dims, head, max_ctx=1500, theta=10000, radii=False, debug: List[str] = [], use_pbias=False, spec_shape=None):
+    def __init__(self, dims, head, max_ctx=1500, theta=10000, radii=False, debug: List[str] = [], use_pbias=False):
         super(rotary, self).__init__()
 
+        self.use_pbias = use_pbias
         self.dims = dims
         self.head = head
         self.head_dim = dims // head
-        self.dim = self.head_dim  
-        self.max_ctx = max_ctx
-        self.theta = theta
         self.radii = radii
-        self.pitch_scale = 0.1
-        self.use_pbias = use_pbias
-        self.spec_shape = spec_shape
+        self.dim = self.head_dim
         self.debug = debug
         self.counter = 0
         self.last_theta = None
 
-        # self.f0_proj = nn.Linear(1, self.head_dim // 2) if radii else None
+        self.f0_proj = nn.Linear(1, self.head_dim // 2) if radii else None
         self.theta = nn.Parameter(torch.tensor(theta, device=device, dtype=dtype), requires_grad=True)
         freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
         self.freqs = nn.Parameter(torch.tensor(freqs, device=device, dtype=dtype), requires_grad=True)        
@@ -287,7 +284,8 @@ class rotary(nn.Module):
         self.theta.data.copy_(theta)
 
     def get_pitch_bias(self, f0):
-        f0 = self.return_f0()
+        if f0 is None:
+            return None
         f0_flat = f0.squeeze().float()
         f0_norm = (f0_flat - f0_flat.mean()) / (f0_flat.std() + 1e-8)
         f0_sim = torch.exp(-torch.cdist(f0_norm.unsqueeze(1), 
@@ -317,8 +315,6 @@ class rotary(nn.Module):
             return f0[idx]
 
     def align_f0(self, ctx, f0):
-        # f0 = self.return_f0()
-        # f0 = self.f0proj(f0)
         if f0.dim() == 3:
             batch, length, dims = f0.shape
             if length == ctx:
@@ -345,24 +341,23 @@ class rotary(nn.Module):
             return f0[idx, :]
 
     def forward(self, x=None, enc=None, layer=None, input_type="audio") -> Tensor:
-        f0 = default(enc.get("pitch"), enc.get("f0")) if enc is not None else None
-        if f0 is not None and f0.dim() == 2:
-            if f0.shape[0] == 1: 
-                f0 = f0.squeeze(0)  
-            else:
-                f0 = f0.view(-1) 
-
-        if "rot1" in self.debug and self.counter % 100 == 0:
-            print(f"Rotary forward: {x if x is not None else None}, f0: {f0.shape if f0 is not None else None}")
-
         if isinstance(x, int):
             ctx = x
+        elif isinstance(x, torch.Tensor) and x.ndim == 2:
+            batch, ctx = x.shape
         elif isinstance(x, torch.Tensor) and x.ndim == 3:
             batch, ctx, dims = x.shape
         else:
             batch, head, ctx, head_dim = x.shape
         t = torch.arange(ctx, device=device, dtype=dtype)
         
+        f0 = default(enc.get("pitch"), enc.get("f0")) if enc is not None else None
+        if f0 is not None and f0.dim() == 2:
+            if f0.shape[0] == 1: 
+                f0 = f0.squeeze(0)  
+            else:
+                f0 = f0.view(-1)        
+
         if f0 is not None:
             f0_mean = f0.mean()
             theta = f0_mean + self.theta
@@ -387,6 +382,9 @@ class rotary(nn.Module):
         else:
             radius = torch.ones_like(freqs) 
         freqs = torch.polar(radius, freqs)
+
+        if "rot1" in self.debug and self.counter % 100 == 0:
+            print(f"Rotary forward: {x if x is not None else None}, f0: {f0.shape if f0 is not None else None}")
 
         if "rot3" in self.debug and self.counter % 100 == 0:
             print(f" [Rotary] {layer}{self.counter} --- [f0] {f0.shape if f0 is not None else None} [Theta] {theta.item():.2f} [Freqs] {freqs.shape} {freqs.mean():.2f} [ctx] {ctx} [Radius] {radius.shape} {radius.mean():.2f}")
@@ -859,13 +857,11 @@ class AudioEncoder(nn.Module):
             ),
             "envelope": nn.ModuleList(
             [FEncoder(input_dims=mels, dims=dims, head=head, layer=layer, kernel_size=3, act=act_fn)] + 
-            [Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features, cgate=cgate) 
-            for _ in range(layer)] if "envelope" in features else None
+            [Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features, cgate=cgate) for _ in range(layer)] if "envelope" in features else None
             ),
             "phase": nn.ModuleList(
             [FEncoder(input_dims=mels, dims=dims, head=head, layer=layer, kernel_size=3, act=act_fn)] + 
-            [Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features, cgate=cgate) 
-            for _ in range(layer)] if "phase" in features else None
+            [Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features, cgate=cgate) for _ in range(layer)] if "phase" in features else None
             )
         })
 
@@ -899,7 +895,7 @@ class AudioEncoder(nn.Module):
 
 class TextDecoder(nn.Module):
     def __init__(self, vocab: int, ctx: int, dims: int, head: int, layer: int, cross_attn: bool, 
-                debug: List[str], features: List[str], sequential=False): 
+                debug: List[str], features: List[str]): 
         super(TextDecoder, self).__init__()
 
         self.ctx = ctx     
@@ -909,7 +905,6 @@ class TextDecoder(nn.Module):
         self.debug = debug
         self.counter = 0
         self.dropout = 0.01
-        self.sequential = sequential
         self.features = features
 
         self.token = nn.Embedding(num_embeddings=vocab, embedding_dim=dims)
@@ -931,7 +926,7 @@ class TextDecoder(nn.Module):
         mask = torch.tril(torch.ones(ctx, ctx), diagonal=0)        
         self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x, enc, order=None, layer='decoder') -> Tensor:
+    def forward(self, x, enc, order=None, layer='decoder', sequential=False) -> Tensor:
         enc = dict_to(enc, device, dtype)
         x = x.to(device)
         bln = self.blend
@@ -943,17 +938,25 @@ class TextDecoder(nn.Module):
         x = self.token(x) + self.positional[:x.shape[1]]
         x = F.dropout(x, p=self.dropout, training=self.training)
         
+        # ctx = x.shape[1]
+        # freqs = self.rotary(ctx)
+        # x = self.rotary.apply_rotary(x, freqs)
+
         for block in self.block:
             x = block(x, xa=None, mask=mask, enc=enc, layer=layer)
 
         for f in order:
             if f in enc:
+                seq = x
                 xa = enc[f]
                 for block in self.blocks[f]:
                     out = block(x=x, xa=xa, mask=None, enc=enc, layer=layer)
 
-                a = torch.sigmoid(bln[f])
-                x = a * out + (1 - a) * x
+                if sequential:
+                    x = seq
+                else:
+                    a = torch.sigmoid(bln[f])
+                    x = a * out + (1 - a) * x
                         
         if "decoder" in self.debug and self.counter % 100 == 0:
             print(f"Step {self.counter}: Decoder output shape: {x.shape}, enc keys: {list(enc.keys())}, order: {order}")
@@ -1019,19 +1022,16 @@ class Echo(nn.Module):
         return self.decoder(input_ids, encoder_output)
         
     def forward(self,
-        decoder_input_ids=None,
         labels=None,
         waveform: Optional[torch.Tensor]=None,
         input_ids=None,
         spectrogram: torch.Tensor=None,
         pitch: Optional[torch.Tensor]=None,
         f0: Optional[torch.Tensor]=None,
-        f0d: Optional[torch.Tensor]=None,
         envelope: Optional[torch.Tensor]=None,
         phase: Optional[torch.Tensor]=None,
         ) -> Dict[str, torch.Tensor]:
 
-        decoder_input_ids = input_ids
         encoder_inputs = {}
         if spectrogram is not None:
             encoder_inputs["spectrogram"] = spectrogram
@@ -1046,11 +1046,6 @@ class Echo(nn.Module):
         if f0 is not None:
             encoder_inputs["f0"] = f0
 
-            
-        # if f0 is not None:
-        #     f0 = f0.squeeze(0)
-        #     self.update_base(f0)
-
         encoder_outputs = self.encoder(encoder_inputs)
         logits = self.decoder(input_ids, encoder_outputs)
 
@@ -1063,10 +1058,6 @@ class Echo(nn.Module):
         return {
             "logits": logits,
             "loss": loss,
-            # "labels": labels,
-            # "input_ids": input_ids,
-            # "decoder_input_ids": decoder_input_ids,
-            # "encoder_output": encoder_outputs,
             } 
 
     @property
@@ -1617,9 +1608,9 @@ def get_training_args(
         per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
         gradient_accumulation_steps=1,
-        eval_accumulation_steps=1,
+        eval_accumulation_steps=None,
         eval_strategy="steps",
-        save_strategy="steps",
+        save_strategy="no",
         max_steps=max_steps,
         save_steps=save_steps,
         eval_steps=eval_steps,
@@ -1703,7 +1694,7 @@ def main():
     training_args = sanity(sanity_check)
     dataset_config = {
         "spectrogram": True,
-        "waveforms": False,
+        "waveforms": True,
         "pitch": False,
         "downsamples": False,
         "frequency": False,
@@ -1752,6 +1743,10 @@ def main():
 if __name__ == "__main__":
     main()
 
-
-
+# from tensorboard import program
+# log_dir = "./output/logs" 
+# tb = program.TensorBoard()
+# tb.configure(argv=[None, '--logdir', log_dir])
+# url = tb.launch()
+# print(f"TensorBoard started at {url}")
 
