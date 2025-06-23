@@ -1,6 +1,7 @@
 
 ### NLP/ASR model with acoustic variable radii relative position embedding (vRoPE) that maps pitch to token. 
 ----
+![3tings](https://github.com/user-attachments/assets/4158ead2-75f4-42e2-84f8-7b39b6984026)
 
 Pitch-Aware Processing: Integrates F0/pitch information throughout the processing pipeline, making the model sensitive to prosodic features of speech.
 
@@ -89,4 +90,4 @@ The theoretical foundation:
 
 --- 
 
-<img width="470" alt="cc2" src="https://github.com/user-attachments/assets/d52a48b1-8717-4d29-9452-cfdf43c92fe8"  />
+
