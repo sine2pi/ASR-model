@@ -351,7 +351,7 @@ class rotary(nn.Module):
             batch, head, ctx, head_dim = x.shape
         t = torch.arange(ctx, device=device, dtype=dtype)
         
-        f0 = default(enc.get("pitch"), enc.get("f0")) if enc is not None else None
+        f0 = enc.get("f0") if enc is not None else None   
         if f0 is not None and f0.dim() == 2:
             if f0.shape[0] == 1: 
                 f0 = f0.squeeze(0)  
