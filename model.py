@@ -943,7 +943,7 @@ class TextDecoder(nn.Module):
         # x = self.rotary.apply_rotary(x, freqs)
 
         for block in self.block:
-            x = block(x, xa=None, mask=mask, enc=enc, layer=layer)
+            x = block(x, xa=None, mask=mask, enc=None, layer=layer)
 
         for f in order:
             if f in enc:
