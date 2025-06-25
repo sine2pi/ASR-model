@@ -271,6 +271,7 @@ class rotary(nn.Module):
     def return_f0(self, f0=None):
         if f0 is not None:
             self.f0 = f0
+            self.update_base(f0)
             return f0.squeeze(0).to(device, dtype)
         elif hasattr(self, 'f0') and self.f0 is not None:
             return self.f0.squeeze(0).to(device, dtype)
@@ -303,18 +304,17 @@ class rotary(nn.Module):
         return f0.to(device=device, dtype=dtype)
 
     def synth_f0(self, f0, ctx):
-        f0 = self.f0proj(f0)
-
+        # f0 = self.f0proj(f0)
         if f0.dim() == 1:
             length = f0.shape[0]
             if length == ctx:
                 return f0
             frames = length / ctx
             idx = torch.arange(ctx, device=f0.device)
-            # return torch.arange(1, ctx+1, device=f0.device, dtype=torch.float)
             return f0[idx]
 
     def align_f0(self, ctx, f0):
+        f0 = self.f0proj(f0)
         if f0.dim() == 3:
             batch, length, dims = f0.shape
             if length == ctx:
@@ -341,6 +341,7 @@ class rotary(nn.Module):
             return f0[idx, :]
 
     def forward(self, x=None, enc=None, layer=None, input_type="audio") -> Tensor:
+        f0 = enc.get("f0") if enc is not None else None 
         if isinstance(x, int):
             ctx = x
         elif isinstance(x, torch.Tensor) and x.ndim == 2:
@@ -350,8 +351,8 @@ class rotary(nn.Module):
         else:
             batch, head, ctx, head_dim = x.shape
         t = torch.arange(ctx, device=device, dtype=dtype)
-        
-        f0 = enc.get("f0") if enc is not None else None   
+
+        f0 = enc.get("f0") if enc is not None else None
         if f0 is not None and f0.dim() == 2:
             if f0.shape[0] == 1: 
                 f0 = f0.squeeze(0)  
@@ -362,7 +363,7 @@ class rotary(nn.Module):
             f0_mean = f0.mean()
             theta = f0_mean + self.theta
         else:
-            theta = self.theta  
+            theta = 10000.0  
         freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), 
                 self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
 
@@ -378,13 +379,21 @@ class rotary(nn.Module):
                 idx = torch.arange(ctx, device=f0.device)
                 idx = (idx * F).long().clamp(0, L - 1)
                 radius = radius[idx]
+                rad = radius
             radius = radius.unsqueeze(-1).expand(-1, freqs.shape[-1])
+            radius = torch.sigmoid(radius)
         else:
             radius = torch.ones_like(freqs) 
         freqs = torch.polar(radius, freqs)
 
-        if "rot1" in self.debug and self.counter % 100 == 0:
-            print(f"Rotary forward: {x if x is not None else None}, f0: {f0.shape if f0 is not None else None}")
+        if "radius" in self.debug and self.counter % 100 == 0:
+            theta_value = theta.item() if isinstance(theta, torch.Tensor) else theta
+            print(f"  [{layer}] [Radius] {radius.shape} {radius.mean():.2f} [Theta] {theta_value:.2f} [f0] {f0.shape if f0 is not None else None}")
+
+        if "rot3" in self.debug and self.counter % 100 == 0:
+            theta_value = theta.item() if isinstance(theta, torch.Tensor) else theta
+            print(f" [{layer}] [f0] {f0.shape if f0 is not None else None} [Theta] {theta_value:.2f} [Freqs] {freqs.shape} {freqs.mean():.2f} [ctx] {ctx} [Radius] {radius.shape} {radius.mean():.2f}")
+
 
         if "rot3" in self.debug and self.counter % 100 == 0:
             print(f" [Rotary] {layer}{self.counter} --- [f0] {f0.shape if f0 is not None else None} [Theta] {theta.item():.2f} [Freqs] {freqs.shape} {freqs.mean():.2f} [ctx] {ctx} [Radius] {radius.shape} {radius.mean():.2f}")
@@ -396,6 +405,19 @@ class rotary(nn.Module):
 
         self.counter += 1
         return freqs.unsqueeze(0)
+
+    @staticmethod
+    def apply_rotary(x, freqs):
+        x1 = x[..., :freqs.shape[-1]*2]
+        x2 = x[..., freqs.shape[-1]*2:]
+        orig_shape = x1.shape
+        if x1.ndim == 2:
+            x1 = x1.unsqueeze(0)
+        x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
+        x1 = torch.view_as_complex(x1) * freqs
+        x1 = torch.view_as_real(x1).flatten(-2)
+        x1 = x1.view(orig_shape)
+        return torch.cat([x1.type_as(x), x2], dim=-1)
 
     @staticmethod
     def apply_rotary(x, freqs):
