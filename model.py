@@ -972,7 +972,7 @@ class TextDecoder(nn.Module):
                 seq = x
                 xa = enc[f]
                 for block in self.blocks[f]:
-                    out = block(x=x, xa=xa, mask=None, enc=enc, layer=layer)
+                    out = block(x=x, xa=xa, mask=None, enc=None, layer=layer)
 
                 if sequential:
                     x = seq
