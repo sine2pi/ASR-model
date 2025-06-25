@@ -50,16 +50,8 @@ These visualizations help confirm that:
 #### freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
 
 #### Static frequency's are perfectly fine for text models but not for NLP.
------
 
-1000 steps no f0:
-
-<img width="470" alt="123" src="https://github.com/user-attachments/assets/1b3ca1e8-0b7d-47dd-802b-5eda9537ae13" />
-
-1000 steps with f0 / theta substitutions:
-
-<img width="470" alt="65356" src="https://github.com/user-attachments/assets/84624fc4-5def-4e9f-9cdd-c350b80ec348" />
-
+(https://huggingface.co/Sin2pi/Echo17/tensorboard?params=scalars)
 
 ----
 
