@@ -959,23 +959,19 @@ class TextDecoder(nn.Module):
         mask = self.mask[:x.shape[1], :x.shape[1]]
         x = self.token(x) + self.positional[:x.shape[1]]
         x = F.dropout(x, p=self.dropout, training=self.training)
-        
-        # ctx = x.shape[1]
-        # freqs = self.rotary(ctx)
-        # x = self.rotary.apply_rotary(x, freqs)
 
         for block in self.block:
             x = block(x, xa=None, mask=mask, enc=None, layer=layer)
 
         for f in order:
             if f in enc:
-                seq = x
+
                 xa = enc[f]
                 for block in self.blocks[f]:
                     out = block(x=x, xa=xa, mask=None, enc=None, layer=layer)
 
                 if sequential:
-                    x = seq
+                    x = out
                 else:
                     a = torch.sigmoid(bln[f])
                     x = a * out + (1 - a) * x
