@@ -284,9 +284,10 @@ class rotary(nn.Module):
         self.freqs.data.copy_(freqs)
         self.theta.data.copy_(theta)
 
-    def get_pitch_bias(self, f0):
+    def get_bias(self, f0, ctx):
         if f0 is None:
             return None
+        f0 = self.align_f0a(f0, ctx)
         f0_flat = f0.squeeze().float()
         f0_norm = (f0_flat - f0_flat.mean()) / (f0_flat.std() + 1e-8)
         f0_sim = torch.exp(-torch.cdist(f0_norm.unsqueeze(1), 
@@ -313,6 +314,38 @@ class rotary(nn.Module):
             idx = torch.arange(ctx, device=f0.device)
             return f0[idx]
 
+    def align_f0a(self, f0, ctx):
+        if f0.dim() == 3:
+            batch, length, dims = f0.shape
+            if length == ctx:
+                f0 = f0
+            else:
+                frames = length / ctx
+                idx = torch.arange(ctx, device=f0.device)
+                idx = (idx * frames).long().clamp(0, length - 1)
+                f0 = f0[:, idx, :]
+            f0 = f0.mean(dim=(0, -1))
+            return f0
+        if f0.dim() == 2:
+            length, dims = f0.shape
+            if length == ctx:
+                f0 = f0
+            else:
+                frames = length / ctx
+                idx = torch.arange(ctx, device=f0.device)
+                idx = (idx * frames).long().clamp(0, length - 1)
+                f0 = f0[idx, :]
+            f0 = f0.mean(dim=-1)
+            return f0
+        if f0.dim() == 1:
+            length = f0.shape[0]
+            if length == ctx:
+                return f0
+            frames = length / ctx
+            idx = torch.arange(ctx, device=f0.device)
+            idx = (idx * frames).long().clamp(0, length - 1)
+            return f0[idx]
+    
     def align_f0(self, ctx, f0):
         f0 = self.f0proj(f0)
         if f0.dim() == 3:
@@ -359,7 +392,7 @@ class rotary(nn.Module):
             else:
                 f0 = f0.view(-1)        
 
-        if f0 is not None:
+        if f0 is not None and layer == "encoder": #rethink this
             f0_mean = f0.mean()
             theta = f0_mean + self.theta
         else:
@@ -371,7 +404,7 @@ class rotary(nn.Module):
             print(f" [Rotary] {layer}{self.counter} --- [f0] {f0.shape if f0 is not None else None} [Theta] {theta.item():.2f} [Freqs] {freqs.shape} {freqs.mean():.2f} [ctx] {ctx}")
         
         freqs = t[:, None] * freqs[None, :]
-        if self.radii and f0 is not None:
+        if self.radii and f0 is not None and layer == "encoder": #this too
             radius = f0.to(device, dtype)
             L = radius.shape[0]
             if L != ctx:
@@ -463,7 +496,8 @@ class MultiheadA(nn.Module):
                 dims=dims,
                 head=head,
                 debug=debug,
-                radii=False,
+                radii=True if "radii" in debug else False,
+                use_pbias=True if "pbias" in debug else False,
                 )
         else:
             self.rope = None
@@ -515,10 +549,11 @@ class MultiheadA(nn.Module):
         
         qk = (q * scale) @ (k * scale).transpose(-1, -2)
         if self.rope.use_pbias:
-            f0 = enc.get("f0", None) if enc is not None else None
-            pbias = self.rope.use_pbias(f0)
+            f0 = enc.get("f0", None) if enc is not None else None                     
+            pbias = self.rope.get_bias(f0, q2)
             if pbias is not None:
-                qk = qk + pbias[:,:,:q.shape[2],:q.shape[2]]
+                # print(f"pbias shape: {pbias.shape}, qk shape: {qk.shape}")
+                qk = qk + pbias
         token_ids = k[:, :, :, 0]
         zscale = torch.ones_like(token_ids)
         fzero = torch.clamp(F.softplus(self.fzero), self.minz, self.maxz)
@@ -961,7 +996,7 @@ class TextDecoder(nn.Module):
         x = F.dropout(x, p=self.dropout, training=self.training)
 
         for block in self.block:
-            x = block(x, xa=None, mask=mask, enc=None, layer=layer)
+            x = block(x, xa=None, mask=mask, enc=enc, layer=layer)
 
         for f in order:
             if f in enc:
