@@ -296,10 +296,10 @@ class rotary(nn.Module):
             idx = (idx * frames).long().clamp(0, length - 1)
             f0 = f0[idx]
         f0_norm = (f0 - f0.mean()) / (f0.std() + 1e-8)
-        # f0_sim = torch.exp(-torch.cdist(f0_norm.unsqueeze(1),
-        #                             f0_norm.unsqueeze(1)))
-        diff = f0_norm[:, None] - f0_norm[None, :]
-        f0_sim = torch.exp(-diff.pow(2))                         
+        f0_sim = torch.exp(-torch.cdist(f0_norm.unsqueeze(1),
+                                    f0_norm.unsqueeze(1)))
+        # diff = f0_norm[:, None] - f0_norm[None, :]
+        # f0_sim = torch.exp(-diff.pow(2))                         
         return f0_sim.unsqueeze(0).unsqueeze(0)
 
     def f0proj(self, f0):
