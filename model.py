@@ -287,11 +287,19 @@ class rotary(nn.Module):
     def get_bias(self, f0, ctx):
         if f0 is None:
             return None
-        f0 = self.align_f0a(f0, ctx)
-        f0_flat = f0.squeeze().float()
-        f0_norm = (f0_flat - f0_flat.mean()) / (f0_flat.std() + 1e-8)
-        f0_sim = torch.exp(-torch.cdist(f0_norm.unsqueeze(1), 
-                                    f0_norm.unsqueeze(1)))
+        if f0.dim() == 1:
+            length = f0.shape[0]
+            if length == ctx:
+                return f0
+            frames = length / ctx
+            idx = torch.arange(ctx, device=f0.device)
+            idx = (idx * frames).long().clamp(0, length - 1)
+            f0 = f0[idx]
+        f0_norm = (f0 - f0.mean()) / (f0.std() + 1e-8)
+        # f0_sim = torch.exp(-torch.cdist(f0_norm.unsqueeze(1),
+        #                             f0_norm.unsqueeze(1)))
+        diff = f0_norm[:, None] - f0_norm[None, :]
+        f0_sim = torch.exp(-diff.pow(2))                         
         return f0_sim.unsqueeze(0).unsqueeze(0)
 
     def f0proj(self, f0):
@@ -312,38 +320,6 @@ class rotary(nn.Module):
                 return f0
             frames = length / ctx
             idx = torch.arange(ctx, device=f0.device)
-            return f0[idx]
-
-    def align_f0a(self, f0, ctx):
-        if f0.dim() == 3:
-            batch, length, dims = f0.shape
-            if length == ctx:
-                f0 = f0
-            else:
-                frames = length / ctx
-                idx = torch.arange(ctx, device=f0.device)
-                idx = (idx * frames).long().clamp(0, length - 1)
-                f0 = f0[:, idx, :]
-            f0 = f0.mean(dim=(0, -1))
-            return f0
-        if f0.dim() == 2:
-            length, dims = f0.shape
-            if length == ctx:
-                f0 = f0
-            else:
-                frames = length / ctx
-                idx = torch.arange(ctx, device=f0.device)
-                idx = (idx * frames).long().clamp(0, length - 1)
-                f0 = f0[idx, :]
-            f0 = f0.mean(dim=-1)
-            return f0
-        if f0.dim() == 1:
-            length = f0.shape[0]
-            if length == ctx:
-                return f0
-            frames = length / ctx
-            idx = torch.arange(ctx, device=f0.device)
-            idx = (idx * frames).long().clamp(0, length - 1)
             return f0[idx]
     
     def align_f0(self, ctx, f0):
@@ -404,7 +380,7 @@ class rotary(nn.Module):
             print(f" [Rotary] {layer}{self.counter} --- [f0] {f0.shape if f0 is not None else None} [Theta] {theta.item():.2f} [Freqs] {freqs.shape} {freqs.mean():.2f} [ctx] {ctx}")
         
         freqs = t[:, None] * freqs[None, :]
-        if self.radii and f0 is not None and layer == "encoder": #this too
+        if self.radii and f0 is not None and layer == "encoder":
             radius = f0.to(device, dtype)
             L = radius.shape[0]
             if L != ctx:
@@ -552,7 +528,6 @@ class MultiheadA(nn.Module):
             f0 = enc.get("f0", None) if enc is not None else None                     
             pbias = self.rope.get_bias(f0, q2)
             if pbias is not None:
-                # print(f"pbias shape: {pbias.shape}, qk shape: {qk.shape}")
                 qk = qk + pbias
         token_ids = k[:, :, :, 0]
         zscale = torch.ones_like(token_ids)
