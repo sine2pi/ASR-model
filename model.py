@@ -392,7 +392,7 @@ class rotary(nn.Module):
             else:
                 f0 = f0.view(-1)        
 
-        if f0 is not None and layer == "encoder": #rethink this
+        if f0 is not None: 
             f0_mean = f0.mean()
             theta = f0_mean + self.theta
         else:
