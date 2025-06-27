@@ -1,7 +1,7 @@
 
-import pyworld as pw
 import os
 import math
+import pyworld as pw
 import warnings
 import logging
 import gzip
@@ -12,7 +12,6 @@ import torch.nn.functional as F
 import torch.nn.init as init
 from torch import nn, Tensor
 import numpy as np
-from einops import rearrange
 import matplotlib.pyplot as plt
 from typing import Optional, Dict, Union, List, Tuple, Any
 from functools import partial
@@ -23,7 +22,7 @@ from transformers.training_args_seq2seq import Seq2SeqTrainingArguments
 import transformers
 import evaluate
 from dataclasses import dataclass
-
+import aiohttp    
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
@@ -34,6 +33,21 @@ dtype = torch.float32
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
+
+# from rich.traceback import install
+# install(show_locals=True)
+
+# import pretty_errors
+# pretty_errors.configure(
+#     separator_character = '*',
+#     filename_display    = pretty_errors.FILENAME_EXTENDED,
+#     line_number_first   = True,
+#     display_link        = True,
+#     lines_before        = 5,
+#     lines_after         = 2,
+#     line_color          = pretty_errors.RED + '> ' + pretty_errors.default_config.line_color,
+#     code_color          = '  ' + pretty_errors.default_config.line_color,
+# )
 
 extractor = None
 tokenizer = None
@@ -249,6 +263,19 @@ def sinusoids(length, channels, max_timescale=10000):
     scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
+def inverse_mel_scale_scalar(mel_freq: float) -> float:
+    return 700.0 * (math.exp(mel_freq / 1127.0) - 1.0)
+
+def inverse_mel_scale(mel_freq: Tensor) -> Tensor:
+    return 700.0 * ((mel_freq / 1127.0).exp() - 1.0)
+
+def mel_scale_scalar(freq: float) -> float:
+    return 1127.0 * math.log(1.0 + freq / 700.0)
+
+def mel_scale(freq: Tensor) -> Tensor:
+    return 1127.0 * (1.0 + freq / 700.0).log()
+
+
 class rotary(nn.Module):
     def __init__(self, dims, head, max_ctx=1500, theta=10000, radii=False, debug: List[str] = [], use_pbias=False):
         super(rotary, self).__init__()
@@ -263,10 +290,12 @@ class rotary(nn.Module):
         self.counter = 0
         self.last_theta = None
 
-        self.f0_proj = nn.Linear(1, self.head_dim // 2) if radii else None
         self.theta = nn.Parameter(torch.tensor(theta, device=device, dtype=dtype), requires_grad=True)
-        freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
-        self.freqs = nn.Parameter(torch.tensor(freqs, device=device, dtype=dtype), requires_grad=True)        
+
+    def theta_freqs(self, theta):
+        freq = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+        freqs = nn.Parameter(torch.tensor(freq, device=device, dtype=dtype), requires_grad=True)        
+        return freqs
 
     def return_f0(self, f0=None):
         if f0 is not None:
@@ -277,29 +306,20 @@ class rotary(nn.Module):
             return self.f0.squeeze(0).to(device, dtype)
         return None
 
-    def update_base(self, f0):
-        f0 = f0.squeeze(0).to(device, dtype)
-        theta = f0.mean() + 1e-8
-        freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
-        self.freqs.data.copy_(freqs)
-        self.theta.data.copy_(theta)
+    # def update_base(self, f0):
+    #     f0 = f0.squeeze(0).to(device, dtype)
+    #     theta = f0.mean() + 1e-8
+    #     freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+    #     self.freqs.data.copy_(freqs)
+    #     self.theta.data.copy_(theta)
 
-    def get_bias(self, f0, ctx):
+    def get_pbias(self, f0):
         if f0 is None:
             return None
-        if f0.dim() == 1:
-            length = f0.shape[0]
-            if length == ctx:
-                return f0
-            frames = length / ctx
-            idx = torch.arange(ctx, device=f0.device)
-            idx = (idx * frames).long().clamp(0, length - 1)
-            f0 = f0[idx]
-        f0_norm = (f0 - f0.mean()) / (f0.std() + 1e-8)
-        f0_sim = torch.exp(-torch.cdist(f0_norm.unsqueeze(1),
+        f0_flat = f0.squeeze().float()
+        f0_norm = (f0_flat - f0_flat.mean()) / (f0_flat.std() + 1e-8)
+        f0_sim = torch.exp(-torch.cdist(f0_norm.unsqueeze(1), 
                                     f0_norm.unsqueeze(1)))
-        # diff = f0_norm[:, None] - f0_norm[None, :]
-        # f0_sim = torch.exp(-diff.pow(2))                         
         return f0_sim.unsqueeze(0).unsqueeze(0)
 
     def f0proj(self, f0):
@@ -320,8 +340,9 @@ class rotary(nn.Module):
                 return f0
             frames = length / ctx
             idx = torch.arange(ctx, device=f0.device)
+            # return torch.arange(1, ctx+1, device=f0.device, dtype=torch.float)
             return f0[idx]
-    
+
     def align_f0(self, ctx, f0):
         f0 = self.f0proj(f0)
         if f0.dim() == 3:
@@ -361,26 +382,21 @@ class rotary(nn.Module):
             batch, head, ctx, head_dim = x.shape
         t = torch.arange(ctx, device=device, dtype=dtype)
 
-        f0 = enc.get("f0") if enc is not None else None
         if f0 is not None and f0.dim() == 2:
             if f0.shape[0] == 1: 
                 f0 = f0.squeeze(0)  
             else:
                 f0 = f0.view(-1)        
 
-        if f0 is not None: 
+        if f0 is not None and layer == "encoder": # temporary until i can figure out a better mapping method
             f0_mean = f0.mean()
             theta = f0_mean + self.theta
         else:
-            theta = 10000.0  
-        freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), 
-                self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+            theta = self.theta 
+        freqs = self.theta_freqs(theta)
 
-        if "rot2" in self.debug and self.counter % 100 == 0:
-            print(f" [Rotary] {layer}{self.counter} --- [f0] {f0.shape if f0 is not None else None} [Theta] {theta.item():.2f} [Freqs] {freqs.shape} {freqs.mean():.2f} [ctx] {ctx}")
-        
         freqs = t[:, None] * freqs[None, :]
-        if self.radii and f0 is not None and layer == "encoder":
+        if self.radii and f0 is not None:
             radius = f0.to(device, dtype)
             L = radius.shape[0]
             if L != ctx:
@@ -399,14 +415,6 @@ class rotary(nn.Module):
             theta_value = theta.item() if isinstance(theta, torch.Tensor) else theta
             print(f"  [{layer}] [Radius] {radius.shape} {radius.mean():.2f} [Theta] {theta_value:.2f} [f0] {f0.shape if f0 is not None else None}")
 
-        if "rot3" in self.debug and self.counter % 100 == 0:
-            theta_value = theta.item() if isinstance(theta, torch.Tensor) else theta
-            print(f" [{layer}] [f0] {f0.shape if f0 is not None else None} [Theta] {theta_value:.2f} [Freqs] {freqs.shape} {freqs.mean():.2f} [ctx] {ctx} [Radius] {radius.shape} {radius.mean():.2f}")
-
-
-        if "rot3" in self.debug and self.counter % 100 == 0:
-            print(f" [Rotary] {layer}{self.counter} --- [f0] {f0.shape if f0 is not None else None} [Theta] {theta.item():.2f} [Freqs] {freqs.shape} {freqs.mean():.2f} [ctx] {ctx} [Radius] {radius.shape} {radius.mean():.2f}")
-        
         if "theta" in self.debug and self.counter % 100 == 0:
             if self.last_theta is None or abs(self.last_theta - theta.item()) > 1.0:
                 self.last_theta = theta.item()
@@ -423,20 +431,7 @@ class rotary(nn.Module):
         if x1.ndim == 2:
             x1 = x1.unsqueeze(0)
         x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
-        x1 = torch.view_as_complex(x1) * freqs
-        x1 = torch.view_as_real(x1).flatten(-2)
-        x1 = x1.view(orig_shape)
-        return torch.cat([x1.type_as(x), x2], dim=-1)
-
-    @staticmethod
-    def apply_rotary(x, freqs):
-        x1 = x[..., :freqs.shape[-1]*2]
-        x2 = x[..., freqs.shape[-1]*2:]
-        orig_shape = x1.shape
-        if x1.ndim == 2:
-            x1 = x1.unsqueeze(0)
-        x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
-        x1 = torch.view_as_complex(x1) * freqs
+        x1 = torch.view_as_complex(x1) * freqs # must not be estimations
         x1 = torch.view_as_real(x1).flatten(-2)
         x1 = x1.view(orig_shape)
         return torch.cat([x1.type_as(x), x2], dim=-1)
@@ -472,13 +467,12 @@ class MultiheadA(nn.Module):
                 dims=dims,
                 head=head,
                 debug=debug,
-                radii=True if "radii" in debug else False,
-                use_pbias=True if "pbias" in debug else False,
+                radii=True,
                 )
         else:
             self.rope = None
 
-    def enhanced_attention_scores(self, q, k, rbf_sigma=1.0, rbf_ratio=0.0):
+    def rbf_scores(self, q, k, rbf_sigma=1.0, rbf_ratio=0.0):
         scale = (self.dims // self.head) ** -0.25
         dot_scores = torch.matmul(q, k.transpose(-1, -2)) * scale
         if rbf_ratio <= 0.0:
@@ -494,26 +488,24 @@ class MultiheadA(nn.Module):
         x = x.to(device, dtype)
         if xa is not None:
             xa = xa.to(device, dtype)
-            
-        batch, ctx, dims = x.shape
         scale = (self.dims // self.head) ** -0.25
         
         z = default(xa, x).to(device, dtype)
         q = self.q(x)
         k = self.k(z)
         v = self.v(z)
-        qlen = q.shape[1]
-        klen = k.shape[1]
+        q1 = q.shape[1]
+        k1 = k.shape[1]
 
         if self.rotary_emb:   
             q = q.view(*q.shape[:2], self.head, -1).permute(0, 2, 1, 3)
             k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
             v = v.view(*v.shape[:2], self.head, -1).permute(0, 2, 1, 3)
-            qlen = q.shape[2]
-            klen = k.shape[2]
+            q2 = q.shape[2]
+            k2 = k.shape[2]
 
-            q = self.rope.apply_rotary(q, (self.rope(qlen, enc=enc, layer=layer)))
-            k = self.rope.apply_rotary(k, (self.rope(klen, enc=enc, layer=layer)))
+            q = self.rope.apply_rotary(q, (self.rope(q2, enc=enc, layer=layer)))
+            k = self.rope.apply_rotary(k, (self.rope(k2, enc=enc, layer=layer)))
         else:
             q = q.view(*q.shape[:2], self.head, -1).permute(0, 2, 1, 3)
             k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
@@ -521,21 +513,22 @@ class MultiheadA(nn.Module):
             batch, head, ctx, head_dim = q.shape
         
         if self.rbf:
-            qk = self.enhanced_attention_scores(q * scale, k * scale, rbf_sigma=1.0, rbf_ratio=0.3)
+            qk = self.rbf_scores(q * scale, k * scale, rbf_sigma=1.0, rbf_ratio=0.3)
         
         qk = (q * scale) @ (k * scale).transpose(-1, -2)
         if self.rope.use_pbias:
-            f0 = enc.get("f0", None) if enc is not None else None                     
-            pbias = self.rope.get_bias(f0, q2)
+            f0 = enc.get("f0", None) if enc is not None else None
+            pbias = self.rope.get_pbias(f0)
             if pbias is not None:
-                qk = qk + pbias
+                # qk = qk + pbias
+                qk = qk + pbias[:,:,:q2,:q2] #not good
         token_ids = k[:, :, :, 0]
         zscale = torch.ones_like(token_ids)
         fzero = torch.clamp(F.softplus(self.fzero), self.minz, self.maxz)
         zscale[token_ids.float() == self.pad_token] = fzero
         
         if mask is not None:
-            mask = mask[:q.shape[2], :q.shape[2]]
+            mask = mask[:q2, :q2]
             qk = qk + mask.unsqueeze(0).unsqueeze(0) * zscale.unsqueeze(-2).expand(qk.shape)
         qk = qk * zscale.unsqueeze(-2)
         w = F.softmax(qk, dim=-1).to(q.dtype)
@@ -619,6 +612,9 @@ class Residual(nn.Module):
         self.t_gate = tgate
         self.m_gate = mgate
         self.c_gate = cgate
+        self.skip_gates=False
+
+        # self.skip_gates = any([tgate, mgate, cgate])
         
         self.blend = nn.Parameter(torch.tensor(0.5))
         
@@ -660,25 +656,30 @@ class Residual(nn.Module):
         
         normx = self.lnc(x)
         mlp_out = self.mlp(normx)
-        
-        if self.t_gate:
-            gate = self.t_gate(normx)
-            x = x + gate * mlp_out
-               
-        elif self.m_gate:
-            gate = self.m_gate(normx)
-            x = x + gate * mlp_out
-        
-        elif self.c_gate:
-            gate_output = self.c_gate(normx, self.features)
-            x = x + gate_output
 
+        if self.skip_gates:
+            x = x + mlp_out
+            
         else:
-            if hasattr(self, 'mlp_gate'):
-                mlp_gate = self.mlp_gate(normx)
-                x = x + mlp_gate * mlp_out
+
+            if self.t_gate:
+                gate = self.t_gate(normx)
+                x = x + gate * mlp_out
+                
+            elif self.m_gate:
+                gate = self.m_gate(normx)
+                x = x + gate * mlp_out
+            
+            elif self.c_gate:
+                gate_output = self.c_gate(normx, self.features)
+                x = x + gate_output
+
             else:
-                x = x + mlp_out
+                if hasattr(self, 'mlp_gate'):
+                    mlp_gate = self.mlp_gate(normx)
+                    x = x + mlp_gate * mlp_out
+                else:
+                    x = x + mlp_out
                 
         if "residual" in self.debug and self.counter % 100 == 0:
             print(f"Step {self.counter}: Residual block output shape: {x.shape}, xa shape: {xa.shape if xa is not None else None}")        
@@ -897,7 +898,7 @@ class AudioEncoder(nn.Module):
             )
         })
 
-    def forward(self, enc, order=None, layer="encoder"):
+    def forward(self, enc, layer="encoder"):
         enc = dict_to(enc, device, dtype)
         
         if self.counter < 1:
@@ -906,13 +907,10 @@ class AudioEncoder(nn.Module):
             p = default(enc.get("pitch"), enc.get("f0"))
             plot_waveform(x=s, w=w, p=p, hop_length=128)
 
-        if order is None:
-            order = self.features
-
         out = {}
         out.update(enc)
 
-        for f in order:
+        for f in self.features:
             if f in enc and f in self.blocks:
                 x = enc[f]
                 for block in self.blocks[f]:
@@ -921,7 +919,7 @@ class AudioEncoder(nn.Module):
                         
         if "encoder" in self.debug and self.counter % 100 == 0:
             shapes = {k: v.shape for k, v in enc.items()}
-            print(f"Step {self.counter}: mode: {list(enc.keys()) }: shapes: {shapes}, order: {order}")
+            print(f"Step {self.counter}: mode: {list(enc.keys()) }: shapes: {shapes}")
         self.counter += 1
         return out
 
@@ -969,13 +967,16 @@ class TextDecoder(nn.Module):
         mask = self.mask[:x.shape[1], :x.shape[1]]
         x = self.token(x) + self.positional[:x.shape[1]]
         x = F.dropout(x, p=self.dropout, training=self.training)
+        
+        # ctx = x.shape[1]
+        # freqs = self.rotary(ctx)
+        # x = self.rotary.apply_rotary(x, freqs)
 
         for block in self.block:
-            x = block(x, xa=None, mask=mask, enc=enc, layer=layer)
+            x = block(x, xa=None, mask=mask, enc=None, layer=layer)
 
         for f in order:
             if f in enc:
-
                 xa = enc[f]
                 for block in self.blocks[f]:
                     out = block(x=x, xa=xa, mask=None, enc=None, layer=layer)
@@ -1025,16 +1026,16 @@ class Echo(nn.Module):
         all_head[self.param.text_idx // 2 :] = True
         self.register_buffer("alignment_head", all_head.to_sparse(), persistent=False)
 
-    def update_base(self, f0):
-        for name, module in self.encoder.named_modules():
-            if isinstance(module, (rotary)):
-                module.update_base(f0)
-                module.return_f0(f0)
+    # def update_base(self, f0):
+    #     for name, module in self.encoder.named_modules():
+    #         if isinstance(module, (rotary)):
+    #             module.update_base(f0)
+    #             # module.return_f0(f0)
 
-        for name, module in self.decoder.named_modules():
-            if isinstance(module, (rotary)):
-                module.update_base(f0)
-                module.return_f0(f0)
+    #     for name, module in self.decoder.named_modules():
+    #         if isinstance(module, (rotary)):
+    #             module.update_base(f0)
+    #             # module.return_f0(f0)
 
     def set_alignment_head(self, dump: bytes):
         array = np.frombuffer(
@@ -1050,16 +1051,19 @@ class Echo(nn.Module):
         return self.decoder(input_ids, encoder_output)
         
     def forward(self,
+        decoder_input_ids=None,
         labels=None,
         waveform: Optional[torch.Tensor]=None,
         input_ids=None,
         spectrogram: torch.Tensor=None,
         pitch: Optional[torch.Tensor]=None,
         f0: Optional[torch.Tensor]=None,
+        # f0d: Optional[torch.Tensor]=None,
         envelope: Optional[torch.Tensor]=None,
         phase: Optional[torch.Tensor]=None,
         ) -> Dict[str, torch.Tensor]:
 
+        decoder_input_ids = input_ids
         encoder_inputs = {}
         if spectrogram is not None:
             encoder_inputs["spectrogram"] = spectrogram
@@ -1073,6 +1077,12 @@ class Echo(nn.Module):
             encoder_inputs["phase"] = phase
         if f0 is not None:
             encoder_inputs["f0"] = f0
+        # if f0d is not None:
+        #     encoder_inputs["f0d"] = f0d
+            
+        # if f0 is not None:
+        #     f0 = f0.squeeze(0)
+        #     self.update_base(f0)
 
         encoder_outputs = self.encoder(encoder_inputs)
         logits = self.decoder(input_ids, encoder_outputs)
@@ -1347,8 +1357,8 @@ def load_wave(wave_data, sample_rate):
     else:
         raise TypeError("Invalid wave_data format.")
     
-    if waveform.dim() == 1:
-        waveform = waveform.unsqueeze(0)
+    # if waveform.dim() == 1:
+    #     waveform = waveform.unsqueeze(0)
     
     if sr != sample_rate:
         original_length = waveform.shape[1]
@@ -1357,7 +1367,61 @@ def load_wave(wave_data, sample_rate):
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sample_rate)
         waveform = resampler(waveform)
         
-    return waveform.flatten()
+    return waveform
+
+# class SpectrogramUpsampler(nn.Module):
+
+#     def __init__(self):
+#         super().__init__()
+#         self.conv1 = nn.ConvTranspose2d(1, 1, (3, 32), stride=(1, 16), padding=(1, 8))
+#         self.conv2 = nn.ConvTranspose2d(1, 1, (3, 32), stride=(1, 16), padding=(1, 8))
+
+#     def forward(self, x):
+
+#         x = torch.unsqueeze(x, 1)
+#         x = self.conv1(x)
+#         x = F.leaky_relu(x, 0.4)
+#         x = self.conv2(x)
+#         x = F.leaky_relu(x, 0.4)
+#         x = torch.squeeze(x, 1)
+#         return x
+
+
+#     def mel_spectogram(
+#         sample_rate,
+#         hop_length,
+#         win_length,
+#         n_fft,
+#         n_mels,
+#         f_min,
+#         f_max,
+#         power,
+#         normalized,
+#         norm,
+#         mel_scale,
+#         audio,
+#     ):
+
+#         audio_to_mel = torchaudio.transforms.MelSpectrogram(
+#             sample_rate=sample_rate,
+#             hop_length=hop_length,
+#             win_length=win_length,
+#             n_fft=n_fft,
+#             n_mels=n_mels,
+#             f_min=f_min,
+#             f_max=f_max,
+#             power=power,
+#             normalized=normalized,
+#             norm=norm,
+#             mel_scale=mel_scale,
+#         ).to(audio.device)
+
+#         mel = audio_to_mel(torch.clamp(audio, -1.0, 1.0))
+#         mel = 20 * torch.log10(torch.clamp(mel, min=1e-5)) - 20
+#         mel = torch.clamp((mel + 100) / 100, 0.0, 1.0) 
+#         return mel
+
+
 
 def extract_features(batch, tokenizer, spectrogram, waveforms, pitch, frequency=False,
                      hop_length=128, fmin=0, fmax=8000, n_mels=128, n_fft=1024, sampling_rate=16000,
@@ -1370,6 +1434,7 @@ def extract_features(batch, tokenizer, spectrogram, waveforms, pitch, frequency=
     sampling_rate = audio["sampling_rate"]
     sr = audio["sampling_rate"]
     wav = load_wave(wave_data=audio, sample_rate=sr)
+
 
     if spectrogram:
         transform = torchaudio.transforms.MelSpectrogram(
@@ -1392,6 +1457,10 @@ def extract_features(batch, tokenizer, spectrogram, waveforms, pitch, frequency=
         log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
         spec = (log_mel + 4.0) / 4.0
         spec = torch.tensor(spec)
+
+        # spec_upsampler = SpectrogramUpsampler()
+        # upsampled_mel = spec_upsampler(spec)
+
         batch["spectrogram"] = spec
         
     if hilbert:
@@ -1474,8 +1543,8 @@ def compute_metrics(eval_pred, compute_result: bool = True,
         for i in range(min(num_samples, len(pred_str))):
             print(f"Preds: {pred_str[i]}")
             print(f"Label: {label_str[i]}")
-            print(f"preds: {pred_ids[i]}")
-            print(f"label: {label_ids[i]}")
+            # print(f"preds: {pred_ids[i]}")
+            # print(f"label: {label_ids[i]}")
             print("--------------------------------")  
     
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
@@ -1509,6 +1578,9 @@ def compute_metrics(eval_pred, compute_result: bool = True,
     }
     
     return metrics
+
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -1566,14 +1638,18 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
             "n_fft": 1024,
             "sampling_rate": 16000,
         }
-    
+
     dataset = load_dataset(
-        "google/fleurs", 
-        "en_us", 
-        token=token, 
+        "./librispeech_asr.py",
+        "clean",
+        "train.100",
+        storage_options={'client_kwargs': {'timeout': aiohttp.ClientTimeout(total=3600)}},
+        token=token,
         trust_remote_code=True,
-        streaming=False)
-    
+        streaming=False
+    )
+
+    dataset = dataset.rename_column("text", "transcription")
     dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000)).select_columns(["audio", "transcription"])
     
     if sanity_check:
@@ -1596,25 +1672,19 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
                    len(x["audio"]["array"]) < 1500 * 160)
         
         dataset = dataset.filter(filter_func).shuffle(seed=4)
-        logger.info(f"Dataset size: {dataset['train'].num_rows}, {dataset['test'].num_rows}")
-        print(f"Dataset size: {dataset['train'].num_rows}, {dataset['test'].num_rows}")
+        logger.info(f"Dataset size: {dataset['train.100'].num_rows}, {dataset['test'].num_rows}")
+        print(f"Dataset size: {dataset['train.100'].num_rows}, {dataset['test'].num_rows}")
         prepare_fn = partial(extract_features, tokenizer=tokenizer, **dataset_config)
-        columns_to_remove = list(next(iter(dataset.values())).features)
-        train_dataset = dataset["train"]
-        test_dataset = dataset["test"].take(50)
+        # columns_to_remove = list(next(iter(dataset.values())).features)
+        train_dataset = dataset['train.100']
+        test_dataset = dataset['test']
         logger.info(f"Train dataset size: {train_dataset.num_rows}, Test dataset size: {test_dataset.num_rows}")
         
-        train_dataset = train_dataset.map(
-            function=prepare_fn, 
-            remove_columns=columns_to_remove
-        ).with_format(type="torch")
-        
-        test_dataset = test_dataset.map(
-            function=prepare_fn, 
-            remove_columns=columns_to_remove
-        ).with_format(type="torch")
+        train_dataset = train_dataset.map(function=prepare_fn, remove_columns=["audio", "transcription"]).with_format(type="torch")
+        test_dataset = test_dataset.map(function=prepare_fn, remove_columns=["audio", "transcription"]).with_format(type="torch")
     
     return train_dataset, test_dataset
+
 
 def get_training_args(
     log_dir: str,
@@ -1653,6 +1723,9 @@ def get_training_args(
         save_total_limit=1,
         label_names=["labels"],
         optim="adamw_torch",
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_epsilon=1e-8,
         lr_scheduler_type="cosine",
         learning_rate=learning_rate,
         weight_decay=weight_decay,
@@ -1683,19 +1756,21 @@ def main():
             eval_on_start = False,
             learning_rate = 5e-6,
             weight_decay = 0.01,
+            max_grad_norm = 0.6,
             )
         else:
             training_args = get_training_args(
             log_dir,
             batch_eval_metrics = False,
-            max_steps = 1000,
-            save_steps = 1005,
-            eval_steps = 100,   
-            warmup_steps = 100,
-            logging_steps = 10,
+            max_steps = 20000,
+            save_steps = 10000,
+            eval_steps = 1000,   
+            warmup_steps = 1000,
+            logging_steps = 100,
             eval_on_start = False,
             learning_rate = 2.5e-4,
             weight_decay = 0.01,
+            max_grad_norm = 0.6,
             )
 
         return training_args
@@ -1714,7 +1789,7 @@ def main():
         act="swish",
         debug={},
         cross_attn=True,
-        features = ["spectrogram"]
+        features = ["spectrogram"],#, "pitch", "envelope", "phase"
         )
 
     sanity_check = False
@@ -1722,10 +1797,10 @@ def main():
     training_args = sanity(sanity_check)
     dataset_config = {
         "spectrogram": True,
-        "waveforms": True,
+        "waveforms": False,
         "pitch": False,
         "downsamples": False,
-        "frequency": False,
+        "frequency": True,
         "hilbert": False,
         "hop_length": 128,
         "fmin": 150,
@@ -1746,7 +1821,7 @@ def main():
     global global_model
     global_model = model
     
-    metrics_fn = partial(compute_metrics, print_pred=False, num_samples=5, 
+    metrics_fn = partial(compute_metrics, print_pred=True, num_samples=1, 
                     tokenizer=tokenizer, model=model)
     
     print(f"{'Sanity check' if sanity_check else 'Training'} mode")
@@ -1770,11 +1845,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# from tensorboard import program
-# log_dir = "./output/logs" 
-# tb = program.TensorBoard()
-# tb.configure(argv=[None, '--logdir', log_dir])
-# url = tb.launch()
-# print(f"TensorBoard started at {url}")
 
