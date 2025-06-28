@@ -1,24 +1,3 @@
----
-license: apache-2.0
-datasets:
-- google/fleurs
-metrics:
-- wer
-- accuracy
-- cer
-pipeline_tag: automatic-speech-recognition
-tags:
-- pitch
-- f0
-- echo
-- whiper
-- waveform
-- spectrogram
-- hilbert
-- asr
-- nlp
-- new
----
 
 
 NLP/ASR multimodal pitch aware model. 
