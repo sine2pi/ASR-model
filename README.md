@@ -1,7 +1,9 @@
 
 
 NLP/ASR multimodal pitch aware model. 
+
 <img width="670" alt="cc5" src="https://github.com/user-attachments/assets/ce9417de-a892-4811-b151-da612f31c0fb"  />
+
 **This plot illustrates the pattern similiarity of pitch and spectrogram. (librispeech)
 
 To highlight the relationship between pitch and rotary embeddings the model implements three complementary pitch-based enhancements:
