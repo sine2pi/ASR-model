@@ -1,26 +1,39 @@
+---
+license: apache-2.0
+datasets:
+- google/fleurs
+metrics:
+- wer
+- accuracy
+- cer
+pipeline_tag: automatic-speech-recognition
+tags:
+- pitch
+- f0
+- echo
+- whiper
+- waveform
+- spectrogram
+- hilbert
+- asr
+- nlp
+- new
+---
 
-### NLP/ASR multimodal pitch aware model. 
-----
-![123123](https://github.com/user-attachments/assets/ce9417de-a892-4811-b151-da612f31c0fb)
-This plot illusrates the pattern similiarity of pitch and spectrogram. (librispeech)
 
-https://huggingface.co/Sin2pi/Echo17/tensorboard?params=scalars
+NLP/ASR multimodal pitch aware model. 
+<img width="670" alt="cc5" src="https://github.com/user-attachments/assets/ce9417de-a892-4811-b151-da612f31c0fb"  />
+**This plot illustrates the pattern similiarity of pitch and spectrogram. (librispeech)
 
-Pitch-Aware Processing: Integrates F0/pitch information throughout the processing pipeline, making the model sensitive to prosodic features of speech.
-
-To highlight the relationship between pitch and rotary embeddings echo implements two complementary pitch-based enhancements:
+To highlight the relationship between pitch and rotary embeddings the model implements three complementary pitch-based enhancements:
 
 1. The first uses pitch to modify theta (rotary frequency)*
 2. The second adds direct similarity bias to attention
-3. Variable radii added in place of unit circle radius(1.0) associated with torch.polar. The frequencies (f0) are time aligned with tokens creating acoustically-weighted positional encodings where the "loudness" of each position in the embedding space reflects the acoustic prominence in the original speech.
+3. Variable radii added in place of unit circle radius(1.0) of torch.polar. The frequencies (f0) are time aligned with tokens creating acoustically-weighted positional encodings where the "loudness" of each position in the embedding space reflects the acoustic prominence in the original speech.
 
 By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model to pay attention to the acoustic features relate to sequence position in a way that's proportional to the voice characteristics.  This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
 
-![rotpatterns](https://github.com/user-attachments/assets/165a3f18-659a-4e2e-a154-a3456b667bae)
-
-
-These visualizations show how F0 (fundamental frequency/pitch) information affects the model's rotary position embeddings (RoPE)
-
+<img width="670" alt="cc4" src="https://github.com/user-attachments/assets/165a3f18-659a-4e2e-a154-a3456b667bae"  />
 
 Each figure shows 4 subplots (one for each of the first 4 dimensions of your embeddings in the test run). These visualizations show how pitch information modifies position encoding patterns in the model.
 
@@ -40,22 +53,10 @@ In each subplot:
 
 4. **Position-specific variations**: In standard RoPE, frequency decreases with dimension index, but F0 adaptation modify this pattern.
 
+```python
 
-These visualizations help confirm that:
-- F0 information is being properly integrated into the model
-- The adaptation creates meaningful variations in the position encodings
-- The signal is strong enough to potentially help the model understand pitch-sensitive aspects of speech
-  
-----
-#### Domain-Specific ASR model. 
-
-#### freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
-
-#### Static frequency's are perfectly fine for text models but not for NLP.
-
-(https://huggingface.co/Sin2pi/Echo17/tensorboard?params=scalars)
-
-----
+ freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+```
 
 The patterns below show how positions "see" each other in relation to theta and f0. 
 
@@ -63,26 +64,10 @@ Bright diagonal line: Each position matches itself perfectly.
 Wider bright bands: Positions can "see" farther (good for long dependencies) but can be noisy.
 Narrow bands: More focus on nearby positions (good for local patterns)
 
-<img width="470" alt="cc" src="https://github.com/user-attachments/assets/28d00fc5-2676-41ed-a971-e4d857af43f8"  />
-<img width="470" alt="cc2" src="https://github.com/user-attachments/assets/9089e806-966b-41aa-8793-bee03a6e6be1"  />
+<img width="670" alt="cc" src="https://github.com/user-attachments/assets/28d00fc5-2676-41ed-a971-e4d857af43f8"  />
+<img width="670" alt="cc2" src="https://github.com/user-attachments/assets/9089e806-966b-41aa-8793-bee03a6e6be1"  />
 
 
-Echos rotary implementation maps the perceptual properties of audio to the mathematical properties of the rotary embeddings, creating a more adaptive and context-aware representation system. Pitch is optionally extracted from audio in the data processing pipeline and can be used for an additional feature along with spectrograms and or used to inform the rotary and or pitch bias.
-
-Pitch bias
-
-The pitch bias implementation creates an attention bias matrix:
-This makes tokens with similar pitch attend to each other more, which helps:
-
-- Track speaker consistency
-- Maintain coherent pitch patterns
-- Group harmonically related segments
-
-The theoretical foundation:
-- Both position and pitch can be represented as frequencies
-- Speech has inherent rhythmic and tonal patterns that correlate with semantic content
-- Varying the rotation frequency based on pitch creates a more speech-aware positional encoding
-
---- 
+The models rotary implementation maps the perceptual properties of audio to the mathematical properties of the rotary embeddings, creating a more adaptive and context-aware representation system. Pitch is optionally extracted from audio in the data processing pipeline and can be used for an additional feature along with spectrograms and or used to inform the rotary and or pitch bias.
 
 
