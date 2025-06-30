@@ -48,34 +48,13 @@ Narrow bands: More focus on nearby positions (good for local patterns)
 
 ```python
 
-class rotary(nn.Module):
-    def __init__(self, dims, head, max_ctx=1500, theta=10000, radii=False, debug: List[str] = [], use_pbias=False):
-        super(rotary, self).__init__()
 
-        self.use_pbias = use_pbias
-        self.dims = dims
-        self.head = head
-        self.head_dim = dims // head
-        self.radii = radii
-        self.dim = self.head_dim
-        self.debug = debug
-        self.counter = 0
-        self.last_theta = None
-        self.theta = nn.Parameter(torch.tensor(theta, device=device, dtype=dtype), requires_grad=True)
+def theta_freqs(self, theta):
+    freq = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device,               dtype=dtype) / 2595) - 1) / 1000
+    freqs = nn.Parameter(torch.tensor(freq, device=device, dtype=dtype), requires_grad=True)        
+    return freqs
 
-    def theta_freqs(self, theta):
-        freq = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device,               dtype=dtype) / 2595) - 1) / 1000
-        freqs = nn.Parameter(torch.tensor(freq, device=device, dtype=dtype), requires_grad=True)        
-        return freqs
-
-    def get_pitch_bias(self, f0):
-        if f0 is None:
-            return None
-        f0_flat = f0.squeeze().float()
-        f0_norm = (f0_flat - f0_flat.mean()) / (f0_flat.std() + 1e-8)
-        f0_sim = torch.exp(-torch.cdist(f0_norm.unsqueeze(1), 
-                                    f0_norm.unsqueeze(1)))
-        return f0_sim.unsqueeze(0).unsqueeze(0)
+### then theta is updated in the forward:
 
     def forward(self, x=None, enc=None, layer=None, feature_type="audio") -> Tensor:
         f0 = enc.get("f0") if enc is not None else None 
@@ -95,7 +74,7 @@ class rotary(nn.Module):
             else:
                 f0 = f0.view(-1)        
 
-        if f0 is not None and layer == "encoder":
+        if f0 is not None: # take the mean of f0 for theta since it's a scalar anyway.
             f0_mean = f0.mean()
             theta = f0_mean + self.theta
         else:
@@ -103,7 +82,7 @@ class rotary(nn.Module):
         freqs = self.theta_freqs(theta)
 
         freqs = t[:, None] * freqs[None, :]
-        if self.radii and f0 is not None and layer == "encoder":
+        if self.radii and f0 is not None: # Here we need to maintain the pitch chracteristics across dimensions.
             radius = f0.to(device, dtype)
             L = radius.shape[0]
             if L != ctx:
