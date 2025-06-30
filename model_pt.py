@@ -1478,57 +1478,50 @@ def setup_tokenizer(token: str, local_tokenizer_path: str = "D:/newmodel/model/t
     return tokenizer
 
 def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_config: Optional[Dict] = None) -> Tuple[any, any]:
+    if dataset_config is None:
+        dataset_config = {
+            "spectrogram": True,
+            "waveforms": True,
+            "pitch": True,
+            "frequency": True,
+            "downsamples": True,
+            "hop_length": 128,
+            "fmin": 50,
+            "fmax": 2000,
+            "n_mels": 128,
+            "n_fft": 1024,
+            "sampling_rate": 16000,
+        }
+    
+    dataset = load_dataset(  
+        "google/fleurs", 
+        "en_us", 
+        token=token, 
+        trust_remote_code=True,
+        streaming=False)
 
+        # cache_dir = "./processed_datasets"
+        # os.makedirs(cache_dir, exist_ok=True)
+        # cache_file_train = os.path.join(cache_dir, "train.arrow")
+        # cache_file_test = os.path.join(cache_dir, "test.arrow")
+
+        # if os.path.exists(cache_file_train) and os.path.exists(cache_file_test):
+        #     from datasets import Dataset
+        #     train_dataset = Dataset.load_from_disk(cache_file_train)
+        #     test_dataset = Dataset.load_from_disk(cache_file_test)
+        #     return train_dataset, test_dataset   
+
+
+    dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000)).select_columns(["audio", "transcription"])
+    
     if sanity_check:
-        dataset = load_dataset(
-            "./librispeech_asr.py", "clean", "train.100",
-            storage_options={'client_kwargs': {'timeout': aiohttp.ClientTimeout(total=3600)}},
-            token=token, trust_remote_code=True, streaming=False)
-
-        dataset = dataset.rename_column("text", "transcription")
-        dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000)).select_columns(["audio", "transcription"])
-
-        dataset = dataset["test"].take(10)
+        dataset = dataset["test"]
         dataset = dataset.select_columns(["audio", "transcription"])
         prepare_fn = partial(extract_features, tokenizer=tokenizer, **dataset_config)
         dataset = dataset.map(function=prepare_fn, remove_columns=["audio", "transcription"]).with_format(type="torch")
         train_dataset = dataset
         test_dataset = dataset
     else:
-        cache_dir = "./processed_datasets"
-        os.makedirs(cache_dir, exist_ok=True)
-        cache_file_train = os.path.join(cache_dir, "train.arrow")
-        cache_file_test = os.path.join(cache_dir, "test.arrow")
-
-        if os.path.exists(cache_file_train) and os.path.exists(cache_file_test):
-            from datasets import Dataset
-            train_dataset = Dataset.load_from_disk(cache_file_train)
-            test_dataset = Dataset.load_from_disk(cache_file_test)
-            return train_dataset, test_dataset   
-    
-        if dataset_config is None:
-            dataset_config = {
-                "spectrogram": True,
-                "waveforms": False,
-                "pitch": False,
-                "frequency": True,
-                "downsamples": False,
-                "hop_length": 128,
-                "fmin": 50,
-                "fmax": 2000,
-                "n_mels": 128,
-                "n_fft": 1024,
-                "sampling_rate": 16000,
-            }
-
-        dataset = load_dataset(
-            "./librispeech_asr.py", "clean", "train.100",
-            storage_options={'client_kwargs': {'timeout': aiohttp.ClientTimeout(total=3600)}},
-            token=token, trust_remote_code=True, streaming=False)
-
-        dataset = dataset.rename_column("text", "transcription")
-        dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000)).select_columns(["audio", "transcription"])
-
         def filter_func(x):
             return (0 < len(x["transcription"]) < 512 and
                    len(x["audio"]["array"]) > 0 and
@@ -1536,9 +1529,10 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
         
         dataset = dataset.filter(filter_func)
         prepare_fn = partial(extract_features, tokenizer=tokenizer, **dataset_config)
+        # columns_to_remove = list(next(iter(dataset.values())).features)
+        train_dataset = dataset["train"].take(1000)
+        test_dataset = dataset["test"].take(100)
 
-        train_dataset = dataset["train.100"].take(10000)
-        test_dataset = dataset["test"].take(1000)
         train_dataset = train_dataset.map(
             function=prepare_fn, 
             remove_columns=["audio", "transcription"]
@@ -1548,10 +1542,7 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
             function=prepare_fn, 
             remove_columns=["audio", "transcription"]
         ).with_format(type="torch")
-
-        train_dataset.save_to_disk(cache_file_train)
-        test_dataset.save_to_disk(cache_file_test)
-
+        
     return train_dataset, test_dataset
 
 @dataclass
