@@ -1,6 +1,6 @@
 
 
-NLP/ASR multimodal pitch aware model. 
+NLP/ASR multimodal pitch aware model. Research model.
 
 <img width="780" alt="cc5" src="https://github.com/user-attachments/assets/ce9417de-a892-4811-b151-da612f31c0fb"  />
 
