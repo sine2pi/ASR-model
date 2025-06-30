@@ -42,72 +42,7 @@ Narrow bands: More focus on nearby positions (good for local patterns)
 <img width="780" alt="cc" src="https://github.com/user-attachments/assets/28d00fc5-2676-41ed-a971-e4d857af43f8"  />
 <img width="780" alt="cc2" src="https://github.com/user-attachments/assets/9089e806-966b-41aa-8793-bee03a6e6be1"  />
 
+Diagnostic test run where 1 epoch = 1000 steps = 1000 samples as a standardized metric:
 
-```python
+<img width="780" alt="1555" src="https://github.com/user-attachments/assets/5bed0421-e32f-4234-ab55-51d64eb927ef" />
 
-
-def theta_freqs(self, theta):
-    freq = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device,               dtype=dtype) / 2595) - 1) / 1000
-    freqs = nn.Parameter(torch.tensor(freq, device=device, dtype=dtype), requires_grad=True)        
-    return freqs
-
-### then theta is updated in the forward:
-
-    def forward(self, x=None, enc=None, layer=None, feature_type="audio") -> Tensor:
-        f0 = enc.get("f0") if enc is not None else None 
-        if isinstance(x, int):
-            ctx = x
-        elif isinstance(x, torch.Tensor) and x.ndim == 2:
-            batch, ctx = x.shape
-        elif isinstance(x, torch.Tensor) and x.ndim == 3:
-            batch, ctx, dims = x.shape
-        else:
-            batch, head, ctx, head_dim = x.shape
-        t = torch.arange(ctx, device=device, dtype=dtype)
-
-        if f0 is not None and f0.dim() == 2:
-            if f0.shape[0] == 1: 
-                f0 = f0.squeeze(0)  
-            else:
-                f0 = f0.view(-1)        
-
-        if f0 is not None: # take the mean of f0 for theta since it's a scalar anyway.
-            f0_mean = f0.mean()
-            theta = f0_mean + self.theta
-        else:
-            theta = self.theta 
-        freqs = self.theta_freqs(theta)
-
-        freqs = t[:, None] * freqs[None, :]
-        if self.radii and f0 is not None: # Here we need to maintain the pitch chracteristics across dimensions.
-            radius = f0.to(device, dtype)
-            L = radius.shape[0]
-            if L != ctx:
-                F = L / ctx
-                idx = torch.arange(ctx, device=f0.device)
-                idx = (idx * F).long().clamp(0, L - 1)
-                radius = radius[idx]
-                rad = radius
-            radius = radius.unsqueeze(-1).expand(-1, freqs.shape[-1])
-            radius = torch.sigmoid(radius)
-        else:
-            radius = torch.ones_like(freqs) 
-        freqs = torch.polar(radius, freqs)
-
-        self.counter += 1
-        return freqs.unsqueeze(0)
-
-    @staticmethod
-    def apply_rotary(x, freqs):
-        x1 = x[..., :freqs.shape[-1]*2]
-        x2 = x[..., freqs.shape[-1]*2:]
-        orig_shape = x1.shape
-        if x1.ndim == 2:
-            x1 = x1.unsqueeze(0)
-        x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
-        x1 = torch.view_as_complex(x1) * freqs
-        x1 = torch.view_as_real(x1).flatten(-2)
-        x1 = x1.view(orig_shape)
-        return torch.cat([x1.type_as(x), x2], dim=-1)
-
-```
