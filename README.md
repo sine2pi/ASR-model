@@ -10,11 +10,15 @@ Hypotheses
 
 By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model to pay attention to the acoustic features relate to sequence position in a way that's proportional to the voice characteristics.  This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
 
-To highlight the relationship between pitch and rotary embeddings the model implements three complementary pitch-based enhancements:
 
-1. The first uses pitch to modify theta (rotary frequency)*
-2. The second adds direct similarity bias to attention
-3. The third replaces the unit circle radius (1.0) in the torch.polar calculation with variable radii derived from f0. The frequencies (f0) create acoustically-weighted positional encodings, so each position in the embedding space reflects the acoustic prominence in the original speech. This approach essentially adds phase information without significant computational overhead.
+To highlight the relationship between pitch and rotary embeddings, the model implements three complementary pitch-based enhancements:
+
+1. **Pitch-modulated theta:** Pitch (f0) is used to modify the theta parameter, dynamically adjusting the rotary frequency.
+2. **Direct similarity bias:** A pitch-based similarity bias is added directly to the attention mechanism.
+3. **Variable radii in torch.polar:** The unit circle radius (1.0) in the `torch.polar` calculation is replaced with variable radii derived from f0. This creates acoustically-weighted positional encodings, so each position in the embedding space reflects the acoustic prominence in the original speech. This approach effectively adds phase information without significant computational overhead.
+
+
+This accurately describes the mechanisms in your code and their intended effects.
 
 <img width="780" alt="cc4" src="https://github.com/user-attachments/assets/165a3f18-659a-4e2e-a154-a3456b667bae"  />
 
