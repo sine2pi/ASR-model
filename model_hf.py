@@ -1564,8 +1564,8 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
         
         dataset = dataset.filter(filter_func)
         prepare_fn = partial(extract_features, tokenizer=tokenizer, **dataset_config)
-        train_dataset = dataset["train"].take(10000)
-        test_dataset = dataset["test"].take(1000)
+        train_dataset = dataset["train"].take(1000)
+        test_dataset = dataset["test"].take(100)
 
         train_dataset = train_dataset.map(
             function=prepare_fn, 
