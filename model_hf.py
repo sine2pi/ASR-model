@@ -1547,6 +1547,18 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
         trust_remote_code=True,
         streaming=False)
 
+        # cache_dir = "./processed_datasets"
+        # os.makedirs(cache_dir, exist_ok=True)
+        # cache_file_train = os.path.join(cache_dir, "train.arrow")
+        # cache_file_test = os.path.join(cache_dir, "test.arrow")
+
+        # if os.path.exists(cache_file_train) and os.path.exists(cache_file_test):
+        #     from datasets import Dataset
+        #     train_dataset = Dataset.load_from_disk(cache_file_train)
+        #     test_dataset = Dataset.load_from_disk(cache_file_test)
+        #     return train_dataset, test_dataset   
+
+
     dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000)).select_columns(["audio", "transcription"])
     
     if sanity_check:
@@ -1564,6 +1576,7 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
         
         dataset = dataset.filter(filter_func)
         prepare_fn = partial(extract_features, tokenizer=tokenizer, **dataset_config)
+        # columns_to_remove = list(next(iter(dataset.values())).features)
         train_dataset = dataset["train"].take(1000)
         test_dataset = dataset["test"].take(100)
 
@@ -1578,6 +1591,7 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
         ).with_format(type="torch")
         
     return train_dataset, test_dataset
+
 
 def get_training_args(
     log_dir: str,
