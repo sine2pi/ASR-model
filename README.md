@@ -14,7 +14,7 @@ To highlight the relationship between pitch and rotary embeddings the model impl
 
 1. The first uses pitch to modify theta (rotary frequency)*
 2. The second adds direct similarity bias to attention
-3. Variable radii are added in place of the unit circle radius (1.0) in torch.polar. The frequencies (f0) create acoustically-weighted positional encodings, so each position in the embedding space reflects the acoustic prominence in the original speech. This approach essentially adds phase information without significant computational overhead.
+3. The third replaces the unit circle radius (1.0) in the torch.polar calculation with variable radii derived from f0. The frequencies (f0) create acoustically-weighted positional encodings, so each position in the embedding space reflects the acoustic prominence in the original speech. This approach essentially adds phase information without significant computational overhead.
 
 <img width="780" alt="cc4" src="https://github.com/user-attachments/assets/165a3f18-659a-4e2e-a154-a3456b667bae"  />
 
