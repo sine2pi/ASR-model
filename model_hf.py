@@ -567,6 +567,7 @@ class c_gate(nn.Module):
         comb = torch.cat([s, w, p, e, ph], dim=-1)
         return self.integ(comb)
 
+
 class Residual(nn.Module):
     _seen = set()  
     def __init__(self, ctx, dims, head, act, cross_attn=True, debug: List[str] = [], 
@@ -586,10 +587,10 @@ class Residual(nn.Module):
         self.t_gate = tgate
         self.m_gate = mgate
         self.c_gate = cgate
-        self.skip_gates=True
-        
-        self.blend = nn.Parameter(torch.tensor(0.5))
-        
+        self.do_blend = "no_blend" not in self.debug
+        self.blend = nn.Parameter(torch.tensor(0.5)) 
+        self.skip_gates = True if "skip_gates" in self.debug else False
+            
         act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), 
                   "tanh": nn.Tanh(), "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), 
                   "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), 
@@ -618,21 +619,21 @@ class Residual(nn.Module):
         if xa is not None:
             xa = xa.to(device, dtype)
 
-        bln = self.blend
+        blend = self.blend
         x = x + self.attna(self.lna(x), xa=None, mask=mask, enc=enc, layer=layer)[0]
-        
+        xb = x
         if self.attnb and xa is not None:
-            c = self.attnb(self.lnb(x), xa=xa, mask=None, enc=enc, layer=layer)[0]
-            b = torch.sigmoid(bln)
-            x = b * x + (1 - b) * c
-        
-        normx = self.lnc(x)
-        mlp_out = self.mlp(normx)
-
-        if self.skip_gates:
-            x = x + mlp_out
+            x = x + self.attnb(self.lnb(x), xa=xa, mask=None, enc=enc, layer=layer)[0]
             
+            if self.do_blend:
+                b = torch.sigmoid(blend)
+                x = b * xb + (1 - b) * x
+        
+        if self.skip_gates:
+            x = x + self.mlp(self.lnc(x))
         else:
+            normx = self.lnc(x)
+            mlp_out = self.mlp(normx)
 
             if self.t_gate:
                 gate = self.t_gate(normx)
@@ -664,8 +665,8 @@ class Residual(nn.Module):
             else:
                 print(f"Step {self.counter}: Using MLP gate: {self.mlp_gate if hasattr(self, 'mlp_gate') else None}")
         self.counter += 1      
-                  
         return x
+
 
 class FEncoder(nn.Module):
     def __init__(self, input_dims, dims, head, layer, kernel_size, act, stride=1, use_rope=False, spec_shape=None):
