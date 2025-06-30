@@ -4,12 +4,7 @@ NLP/ASR multimodal pitch aware model. Research model.
 
 <img width="780" alt="cc5" src="https://github.com/user-attachments/assets/ce9417de-a892-4811-b151-da612f31c0fb"  />
 
-**This plot illustrates the pattern similiarity of pitch and spectrogram. (librispeech)
-
-Hypotheses 
-
-By modulating the RoPE frequencies based on pitch (F0), we are essentially telling the model to pay attention to the acoustic features relate to sequence position in a way that's proportional to the voice characteristics.  This approach creates a more speech-aware positional representation that helps the model better understand the relationship between acoustic features and text.
-
+**This plot illustrates the pattern similiarity of pitch and spectrogram. (librispeech
 
 To highlight the relationship between pitch and rotary embeddings, the model implements three complementary pitch-based enhancements:
 
