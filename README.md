@@ -4,11 +4,7 @@ NLP/ASR multimodal pitch aware model. Research model.
 
 <img width="780" alt="cc5" src="https://github.com/user-attachments/assets/ce9417de-a892-4811-b151-da612f31c0fb"  />
 
-**This plot illustrates the pattern similiarity of pitch and spectrogram. (librispeech - clean). It also clearly identifies this as a heavily processed / "clean" dataset.
-
-<img width="680" alt="1555" src="https://github.com/user-attachments/assets/14276b99-cf96-4022-9a16-4ac8ed1f6404" />
-
-**This dataset has gone through fewer processing / "cleaning" steps as can be seen with the spectrogram. The pitch isn't effected. 
+**This plot illustrates the pattern similiarity of pitch and spectrogram. (librispeech - clean).
 
 To highlight the relationship between pitch and rotary embeddings, the model implements three complementary pitch-based enhancements:
 
