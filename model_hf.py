@@ -1518,7 +1518,7 @@ def create_model(param: Dimensions) -> Echo:
     
     return model
 
-def setup_tokenizer(token: str, local_tokenizer_path: str = "D:/newmodel/model/tokenn/"):
+def setup_tokenizer(token: str, local_tokenizer_path: str = "./"):
     from tokenizers import Tokenizer
     tokenizer = Tokenizer.from_file(f"{local_tokenizer_path}/tokenizer.json")
     orig_encode = tokenizer.encode
