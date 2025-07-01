@@ -1,7 +1,4 @@
 import os
-PATH = 'E:/hf'
-os.environ['HF_HOME'] = PATH
-os.environ['HF_DATASETS_CACHE'] = PATH
 import pyworld as pw
 import math
 import warnings
@@ -25,7 +22,9 @@ from transformers.training_args_seq2seq import Seq2SeqTrainingArguments
 import transformers
 import evaluate
 from dataclasses import dataclass
-import aiohttp    
+import pretty_errors
+from rich.traceback import install
+
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
@@ -36,6 +35,25 @@ dtype = torch.float32
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
+install(show_locals=True)
+
+pretty_errors.configure(
+    separator_character = '*',
+    filename_display    = pretty_errors.FILENAME_EXTENDED,
+    line_number_first   = True,
+    display_link        = True,
+    lines_before        = 5,
+    lines_after         = 2,
+    line_color          = pretty_errors.RED + '> ' + pretty_errors.default_config.line_color,
+    code_color          = '  ' + pretty_errors.default_config.line_color,
+)
+
+PATH = 'E:/hf'
+os.environ['HF_HOME'] = PATH
+os.environ['HF_DATASETS_CACHE'] = PATH
+os.environ['TORCH_HOME'] = PATH
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 @dataclass
 class Dimensions:
@@ -306,14 +324,12 @@ class rotary(nn.Module):
         return f0.to(device=device, dtype=dtype)
 
     def synth_f0(self, f0, ctx):
-        # f0 = self.f0proj(f0)
         if f0.dim() == 1:
             length = f0.shape[0]
             if length == ctx:
                 return f0
             frames = length / ctx
             idx = torch.arange(ctx, device=f0.device)
-            # return torch.arange(1, ctx+1, device=f0.device, dtype=torch.float)
             return f0[idx]
 
     def align_f0(self, ctx, f0):
@@ -367,7 +383,6 @@ class rotary(nn.Module):
         else:
             theta = self.theta 
         freqs = self.theta_freqs(theta)
-
         freqs = t[:, None] * freqs[None, :]
         if self.radii and f0 is not None and layer == "encoder":
             radius = f0.to(device, dtype)
@@ -377,7 +392,7 @@ class rotary(nn.Module):
                 idx = torch.arange(ctx, device=f0.device)
                 idx = (idx * F).long().clamp(0, L - 1)
                 radius = radius[idx]
-                rad = radius
+
             radius = radius.unsqueeze(-1).expand(-1, freqs.shape[-1])
             radius = torch.sigmoid(radius)
         else:
@@ -445,7 +460,7 @@ class MultiheadA(nn.Module):
         else:
             self.rope = None
 
-    def enhanced_attention_scores(self, q, k, rbf_sigma=1.0, rbf_ratio=0.0):
+    def rbf_scores(self, q, k, rbf_sigma=1.0, rbf_ratio=0.0):
         scale = (self.dims // self.head) ** -0.25
         dot_scores = torch.matmul(q, k.transpose(-1, -2)) * scale
         if rbf_ratio <= 0.0:
@@ -457,30 +472,27 @@ class MultiheadA(nn.Module):
         rbf_scores = torch.exp(-dist_sq / (2 * rbf_sigma**2))
         return (1 - rbf_ratio) * dot_scores + rbf_ratio * rbf_scores
           
-    def forward(self, x: Tensor, xa: Tensor = None, mask: Tensor = None, enc = None, layer = None, feature_type="audio") -> tuple:
+    def forward(self, x: Tensor, xa: Tensor = None, mask: Tensor = None, enc = None, layer = None, feature_type="audio", need_weights=True) -> tuple:
+
         x = x.to(device, dtype)
         if xa is not None:
             xa = xa.to(device, dtype)
-            
-        batch, ctx, dims = x.shape
         scale = (self.dims // self.head) ** -0.25
         
         z = default(xa, x).to(device, dtype)
         q = self.q(x)
         k = self.k(z)
         v = self.v(z)
-        qlen = q.shape[1]
-        klen = k.shape[1]
 
         if self.rotary_emb:   
             q = q.view(*q.shape[:2], self.head, -1).permute(0, 2, 1, 3)
             k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
             v = v.view(*v.shape[:2], self.head, -1).permute(0, 2, 1, 3)
-            qlen = q.shape[2]
-            klen = k.shape[2]
+            q2 = q.shape[2]
+            k2 = k.shape[2]
 
-            q = self.rope.apply_rotary(q, (self.rope(qlen, enc=enc, layer=layer)))
-            k = self.rope.apply_rotary(k, (self.rope(klen, enc=enc, layer=layer)))
+            q = self.rope.apply_rotary(q, (self.rope(q2, enc=enc, layer=layer)))
+            k = self.rope.apply_rotary(k, (self.rope(k2, enc=enc, layer=layer)))
         else:
             q = q.view(*q.shape[:2], self.head, -1).permute(0, 2, 1, 3)
             k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
@@ -488,21 +500,21 @@ class MultiheadA(nn.Module):
             batch, head, ctx, head_dim = q.shape
         
         if self.rbf:
-            qk = self.enhanced_attention_scores(q * scale, k * scale, rbf_sigma=1.0, rbf_ratio=0.3)
+            qk = self.rbf_scores(q * scale, k * scale, rbf_sigma=1.0, rbf_ratio=0.3)
         
         qk = (q * scale) @ (k * scale).transpose(-1, -2)
         if self.rope.use_pbias:
             f0 = enc.get("f0", None) if enc is not None else None
             pbias = self.rope.use_pbias(f0)
             if pbias is not None:
-                qk = qk + pbias[:,:,:q.shape[2],:q.shape[2]]
+                qk = qk + pbias[:,:,:q2,:q2]
         token_ids = k[:, :, :, 0]
         zscale = torch.ones_like(token_ids)
         fzero = torch.clamp(F.softplus(self.fzero), self.minz, self.maxz)
         zscale[token_ids.float() == self.pad_token] = fzero
         
         if mask is not None:
-            mask = mask[:q.shape[2], :q.shape[2]]
+            mask = mask[:q2, :q2]
             qk = qk + mask.unsqueeze(0).unsqueeze(0) * zscale.unsqueeze(-2).expand(qk.shape)
         qk = qk * zscale.unsqueeze(-2)
         w = F.softmax(qk, dim=-1).to(q.dtype)
@@ -511,8 +523,129 @@ class MultiheadA(nn.Module):
         if "multihead" in self.debug and self.counter % 100 == 0:
             print(f"MHA: q={q.shape}, k={k.shape}, v={v.shape} - {qk.shape}, wv shape: {wv.shape}")
         self.counter += 1        
-        return self.o(wv), qk.detach()
+        return self.o(wv), qk
 
+class SpanPredictor(nn.Module):
+    def __init__(self, dims):
+        super().__init__()
+        self.linear = nn.Linear(in_features=dims, out_features=1)
+
+    def forward(self, global_out):
+        scale = torch.sigmoid(self.linear(global_out))
+        return scale
+
+class FocusA(nn.Module):
+    def __init__(self, base: int, dims: int, head: int, max_dist: int, sharpen: bool, 
+                 win_size: int = 32, max_span: int = 32, slid_win: int = 32, 
+                 temp_scale: float = 0.01, num_iterations: int = 3):
+
+        super().__init__()
+        self.base = base
+        self.dims = dims
+        self.head = head
+        self.max_dist = max_dist
+        self.sharpen = sharpen
+        self.win_size = win_size
+        self.max_span = max_span
+        self.slid_win = slid_win
+        self.temp_scale = temp_scale
+        self.num_iterations = num_iterations
+        self.span_predictor  = SpanPredictor(dims=dims)
+        self.span_scale_param = nn.Parameter(torch.tensor(1.0))
+
+        self.attn_local = nn.MultiheadAttention(embed_dim=dims, num_heads=head, batch_first=True)
+        self.attn_global = nn.MultiheadAttention(embed_dim=dims, num_heads=head, batch_first=True)
+
+        self.ln_local = nn.LayerNorm(normalized_shape=dims)
+        self.ln_global = nn.LayerNorm(normalized_shape=dims)
+        self.projection = nn.Linear(in_features=2 * dims, out_features=dims)
+
+    def _focus(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, span_scale: torch.Tensor) -> torch.Tensor:
+
+        max_iterations = 1
+        iteration = 0
+        prev_attn_out = torch.zeros_like(query)
+        base_threshold = 1e-4  
+        scaling_factor = 0.1 
+
+        while iteration < max_iterations:
+            span_len = int(self.max_span * span_scale.mean().item())
+            span_len = min(span_len, query.size(1), key.size(1), value.size(1))
+            eff_span = min(span_len, self.max_dist)
+
+            q_span = query[:, :eff_span, :]
+            k_span = key[:, :eff_span, :]
+            v_span = value[:, :eff_span, :]
+
+            batch, ctx, dims = q_span.size()
+            scale_factor = (dims // self.head) ** -0.25
+
+            q = q_span.view(batch, ctx, self.head, -1).permute(0, 2, 1, 3)
+            k = k_span.view(batch, ctx, self.head, -1).permute(0, 2, 1, 3)
+            v = v_span.view(batch, ctx, self.head, -1).permute(0, 2, 1, 3)
+
+            if self.sharpen:
+                temperature = 1.0 + self.temp_scale * (1.0 - span_scale.mean().item())
+            else:
+                temperature = 0.5 + self.temp_scale * span_scale.mean().item()
+
+            attn_scores = torch.matmul(q, k.transpose(-2, -1))
+            attn_weights = torch.softmax((attn_scores / temperature) * scale_factor, dim=-1)
+            attn_out = torch.matmul(attn_weights, v)
+
+            attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(batch, ctx, -1)
+
+            diff = torch.abs(attn_out - prev_attn_out).mean()
+            dynamic_threshold = base_threshold + scaling_factor * diff
+
+            if diff < dynamic_threshold:
+                break
+
+            prev_attn_out = attn_out
+            query = query + attn_out
+            iteration += 1
+
+        return attn_out, attn_weights
+
+    def _window(self, x: torch.Tensor, win_size: int, span_len: int, span_scale: torch.Tensor) -> torch.Tensor:
+
+        batch, ctx, dims = x.size()
+        num_windows = (ctx + win_size - 1) // win_size
+
+        output = torch.zeros_like(x, device=x.device)
+
+        for i in range(num_windows):
+            start_idx = i * win_size
+            end_idx = min((i + 1) * win_size, ctx)
+            query = x[:, start_idx:end_idx, :]
+
+            key_start = max(0, start_idx - span_len + win_size)
+            key_end = min(start_idx + span_len, ctx)
+            key = x[:, key_start:key_end, :]
+            value = x[:, key_start:key_end, :]
+
+            attn_out = self._focus(query, key, value, span_scale)
+            output[:, start_idx:end_idx, :] = attn_out
+
+        return output
+
+    def forward(self, x, xa=None, mask=None, kv_cache=None) -> torch.Tensor:
+        span_scale = self.span_predictor(x)
+        span_scale = torch.sigmoid(span_scale)
+
+        local_attn_out = self.attn_local(x, x, x)
+        local_attn_out = self.ln_local(local_attn_out)
+
+        global_attn_out = self.attn_global(x, x, x)
+        global_attn_out = self.ln_global(global_attn_out)
+
+        attn_out = torch.cat((local_attn_out, global_attn_out), dim=-1)
+        attn_out = self.projection(attn_out)
+
+        windowed_attn_out = self._window(attn_out, self.win_size, self.max_span, span_scale)
+        focused_attn_out = self._focus(windowed_attn_out, windowed_attn_out, windowed_attn_out, span_scale)
+        return focused_attn_out
+    
 class t_gate(nn.Module):
     def __init__(self, dims, num_types=4):
         super().__init__()
@@ -566,7 +699,6 @@ class c_gate(nn.Module):
         ph = self.ph_gate(x) * ph_feat
         comb = torch.cat([s, w, p, e, ph], dim=-1)
         return self.integ(comb)
-
 
 class Residual(nn.Module):
     _seen = set()  
@@ -666,7 +798,6 @@ class Residual(nn.Module):
                 print(f"Step {self.counter}: Using MLP gate: {self.mlp_gate if hasattr(self, 'mlp_gate') else None}")
         self.counter += 1      
         return x
-
 
 class FEncoder(nn.Module):
     def __init__(self, input_dims, dims, head, layer, kernel_size, act, stride=1, use_rope=False, spec_shape=None):
@@ -1030,7 +1161,6 @@ class Echo(nn.Module):
         phase: Optional[torch.Tensor]=None,
         ) -> Dict[str, torch.Tensor]:
 
-        decoder_input_ids = input_ids
         encoder_inputs = {}
         if spectrogram is not None:
             encoder_inputs["spectrogram"] = spectrogram
@@ -1142,120 +1272,51 @@ class Echo(nn.Module):
         print("Counter reset to 0.")
 
 metric = evaluate.load(path="wer")
-    
+
 @dataclass
 class DataCollator:
     tokenizer: Any
+
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        pad_token_id = tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else 0
-        bos_token_id = tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else 1
-        
+        all_keys = set()
+        for f in features:
+            all_keys.update(f.keys())
         batch = {}
+        pad_token_id = getattr(self.tokenizer, 'pad_token_id', 0)
+        bos_token_id = getattr(self.tokenizer, 'bos_token_id', 1)
+        eos_token_id = getattr(self.tokenizer, 'eos_token_id', 2)
 
-        if "spectrogram" in features[0] and features[0]["spectrogram"] is not None:
-            spectrogram_list = [f["spectrogram"] for f in features]
-            max_len_feat = max(f.shape[-1] for f in spectrogram_list)
-            pad_spectrogram = []
-            for feat in spectrogram_list:                
-                current_len = feat.shape[-1]
-                padding = max_len_feat - current_len
-                if padding > 0:
-                    pad_feat = F.pad(feat, (0, padding), mode='constant', value=pad_token_id)
-                else:
-                    pad_feat = feat
-                pad_spectrogram.append(pad_feat)
-            batch["spectrogram"] = torch.stack(pad_spectrogram)
-            
-        if "waveform" in features[0] and features[0]["waveform"] is not None:
-            waveform_list = [f["waveform"] for f in features]
-            max_len_wav = max(w.shape[-1] for w in waveform_list)
-            pad_waveforms = []
-            for wav in waveform_list:
-                current_len = wav.shape[-1]
-                padding = max_len_wav - current_len
-                if padding > 0:
-                    if wav.ndim == 1:
-                        wav = wav.unsqueeze(0)
-                    pad_wav = F.pad(wav, (0, padding), mode='constant', value=pad_token_id)
-                else:
-                    pad_wav = wav
-                pad_waveforms.append(pad_wav)
-            batch["waveform"] = torch.stack(pad_waveforms)
-
-        if "label" in features[0] and features[0]["label"] is not None:
-            labels_list = [f["label"] for f in features]
-            max_len = max(len(l) for l in labels_list)
-            all_ids = []
-            all_labels = []
-
-            for label in labels_list:
-                label_list = label.tolist() if isinstance(label, torch.Tensor) else label
-                decoder_input = [bos_token_id] + label_list                
-                label_eos = label_list + [pad_token_id]  
-                input_len = max_len + 1 - len(decoder_input)
-                label_len = max_len + 1 - len(label_eos)                
-                padded_input = decoder_input + [pad_token_id] * input_len
-                padded_labels = label_eos + [pad_token_id] * label_len                
-                all_ids.append(padded_input)
-                all_labels.append(padded_labels)            
-            batch["input_ids"] = torch.tensor(all_ids, dtype=torch.long)
-            batch["labels"] = torch.tensor(all_labels, dtype=torch.long)
-
-        if "pitch" in features[0] and features[0]["pitch"] is not None:
-            pitch_list = [f["pitch"] for f in features]
-            max_len_pitch = max(e.shape[-1] for e in pitch_list)
-            pad_pitch = []
-            for pitch in pitch_list:
-                current_len = pitch.shape[-1]
-                padding = max_len_pitch - current_len
-                if padding > 0:
-                    pad_pitch_item = F.pad(pitch, (0, padding), mode='constant', value=pad_token_id)
-                else:
-                    pad_pitch_item = pitch
-                pad_pitch.append(pad_pitch_item)
-            batch["pitch"] = torch.stack(pad_pitch)
-      
-        if "f0" in features[0] and features[0]["f0"] is not None:
-            f0_list = [f["f0"] for f in features]
-            max_len_f0 = max(f.shape[-1] for f in f0_list)
-            pad_f0 = []
-            for f0 in f0_list:
-                current_len = f0.shape[-1]
-                padding = max_len_f0 - current_len
-                if padding > 0:
-                    pad_f0_item = F.pad(f0, (0, padding), mode='constant', value=pad_token_id)
-                else:
-                    pad_f0_item = f0
-                pad_f0.append(pad_f0_item)
-            batch["f0"] = torch.stack(pad_f0)
-
-        if "envelope" in features[0] and features[0]["envelope"] is not None:
-            env_list = [f["envelope"] for f in features]
-            max_len = max(f.shape[-1] for f in env_list)
-            pad_env = []
-            for feat in env_list:                
-                current_len = feat.shape[-1]
-                padding = max_len - current_len
-                if padding > 0:
-                    pad_feat = F.pad(feat, (0, padding), mode='constant', value=pad_token_id)
-                else:
-                    pad_feat = feat
-                pad_env.append(pad_feat)
-            batch["envelope"] = torch.stack(pad_env)
-
-        if "phase" in features[0] and features[0]["phase"] is not None:
-            ph_list = [f["phase"] for f in features]
-            max_len = max(f.shape[-1] for f in ph_list)
-            pad_ph = []
-            for feat in ph_list:                
-                current_len = feat.shape[-1]
-                padding = max_len - current_len
-                if padding > 0:
-                    pad_feat = F.pad(feat, (0, padding), mode='constant', value=pad_token_id)
-                else:
-                    pad_feat = feat
-                pad_ph.append(pad_feat)
-            batch["phase"] = torch.stack(pad_ph) 
+        for key in all_keys:
+            if key == "label":
+                labels_list = [f["label"] for f in features]
+                max_len = max(len(l) for l in labels_list)
+                all_ids, all_labels = [], []
+                for label in labels_list:
+                    label_list = label.tolist() if isinstance(label, torch.Tensor) else label
+                    decoder_input = [bos_token_id] + label_list
+                    label_eos = label_list + [eos_token_id]
+                    input_len = max_len + 1 - len(decoder_input)
+                    label_len = max_len + 1 - len(label_eos)
+                    padded_input = decoder_input + [pad_token_id] * input_len
+                    padded_labels = label_eos + [pad_token_id] * label_len
+                    all_ids.append(padded_input)
+                    all_labels.append(padded_labels)
+                batch["input_ids"] = torch.tensor(all_ids, dtype=torch.long)
+                batch["labels"] = torch.tensor(all_labels, dtype=torch.long)
+            elif key in ["spectrogram", "waveform", "pitch", "f0", "env", "phase"]:
+                items = [f[key] for f in features if key in f]
+                max_len = max(item.shape[-1] for item in items)
+                padded = []
+                for item in items:
+                    pad_width = max_len - item.shape[-1]
+                    if pad_width > 0:
+                        pad_item = F.pad(item, (0, pad_width), mode='constant', value=pad_token_id)
+                    else:
+                        pad_item = item
+                    padded.append(pad_item)
+                batch[key] = torch.stack(padded)
+                if key == "spectrogram":
+                    batch["spectrogram"] = batch[key]
         return batch
 
 def hilbert_transform(x):
@@ -1335,8 +1396,6 @@ def extract_features(batch, tokenizer, spectrogram, waveforms, pitch, frequency=
                      pad_mode="constant", center=True, power=2.0, window_fn=torch.hann_window, mel_scale="htk", 
                      norm=None, normalized=False, downsamples=False, period=False, hilbert=False):
 
-    dtype = torch.float32
-    device = torch.device("cuda:0")
     audio = batch["audio"]
     sampling_rate = audio["sampling_rate"]
     sr = audio["sampling_rate"]
@@ -1414,75 +1473,37 @@ def extract_features(batch, tokenizer, spectrogram, waveforms, pitch, frequency=
     batch["label"] = tokenizer.encode(batch["transcription"], add_special_tokens=False)
     return batch
 
-def compute_metrics(eval_pred, compute_result: bool = True, 
-                    print_pred: bool = False, num_samples: int = 0, tokenizer=None, model=None):
+def compute_metrics(pred, compute_result: bool = True, print_pred: bool = False, num_samples: int = 0, tokenizer = None, model = None):
 
-    pred_logits = eval_pred.predictions
-    label_ids = eval_pred.label_ids
+    pred_ids = pred.predictions
+    label_ids = pred.label_ids
 
-    if hasattr(pred_logits, "cpu"):
-        pred_logits = pred_logits.cpu()
+    if isinstance(pred_ids, tuple):
+        pred_ids = pred_ids[0]
     else:
-        pred_logits = torch.tensor(pred_logits).cpu()
-    if hasattr(label_ids, "cpu"):
-        label_ids = label_ids.cpu()
-    else:
-        label_ids = torch.tensor(label_ids).cpu()
+        pred_ids = pred_ids
 
-    if isinstance(pred_logits, tuple):
-        pred_ids = pred_logits[0]
-    else:
-        pred_ids = pred_logits
-    if hasattr(pred_ids, "ndim") and pred_ids.ndim == 3:
-        if not isinstance(pred_ids, torch.Tensor):
-            pred_ids = torch.tensor(pred_ids)
+    if pred_ids.ndim == 3:
         pred_ids = pred_ids.argmax(dim=-1)
-        pred_ids = pred_ids.tolist()
-            
-    if hasattr(label_ids, "tolist"):
-        label_ids = label_ids.tolist()
-        
-    label_ids = [[0 if token == -100 else token for token in seq] for seq in label_ids]
-    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=False)
-    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=False)
+
+    pred_ids = pred_ids.tolist()
+    label_ids = label_ids.tolist()
 
     if print_pred:
+        pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=False)
+        label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=False)
         for i in range(min(num_samples, len(pred_str))):
             print(f"Preds: {pred_str[i]}")
             print(f"Label: {label_str[i]}")
+            print(f"Preds: {pred_ids[i]}")
+            print(f"Label: {label_ids[i]}")
             print("--------------------------------")  
     
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
     wer = 100 * metric.compute(predictions=pred_str, references=label_str)
 
-    if model is None:
-        global global_model
-        if 'global_model' in globals():
-            model = global_model
-    
-    if model is not None:
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000
-        if trainable_params > 0:
-            efficiency_score = (100 - wer) / trainable_params
-        else:
-            print("Warning: Zero trainable parameters detected")
-            efficiency_score = 0.0
-    else:
-        print("Warning: Model not available for parameter counting")
-        trainable_params = 0.0
-        efficiency_score = 0.0
-    
-    if hasattr(wer, "item"):
-        wer = wer.item()
-    
-    metrics = {
-        "wer": float(wer),
-        "trainable_params_M": float(trainable_params),
-        "efficiency_score": float(efficiency_score),
-    }
-    
-    return metrics
+    return {"wer": wer}
 
 logger = logging.getLogger(__name__)
 
@@ -1548,18 +1569,6 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
         trust_remote_code=True,
         streaming=False)
 
-        # cache_dir = "./processed_datasets"
-        # os.makedirs(cache_dir, exist_ok=True)
-        # cache_file_train = os.path.join(cache_dir, "train.arrow")
-        # cache_file_test = os.path.join(cache_dir, "test.arrow")
-
-        # if os.path.exists(cache_file_train) and os.path.exists(cache_file_test):
-        #     from datasets import Dataset
-        #     train_dataset = Dataset.load_from_disk(cache_file_train)
-        #     test_dataset = Dataset.load_from_disk(cache_file_test)
-        #     return train_dataset, test_dataset   
-
-
     dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000)).select_columns(["audio", "transcription"])
     
     if sanity_check:
@@ -1577,9 +1586,8 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
         
         dataset = dataset.filter(filter_func)
         prepare_fn = partial(extract_features, tokenizer=tokenizer, **dataset_config)
-        # columns_to_remove = list(next(iter(dataset.values())).features)
-        train_dataset = dataset["train"].take(1000)
-        test_dataset = dataset["test"].take(100)
+        train_dataset = dataset["train"]
+        test_dataset = dataset["test"]
 
         train_dataset = train_dataset.map(
             function=prepare_fn, 
@@ -1592,7 +1600,6 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
         ).with_format(type="torch")
         
     return train_dataset, test_dataset
-
 
 def get_training_args(
     log_dir: str,
@@ -1612,7 +1619,7 @@ def get_training_args(
     return Seq2SeqTrainingArguments(
         output_dir=log_dir,
         per_device_train_batch_size=1,
-        per_device_eval_batch_size=2,
+        per_device_eval_batch_size=1,
         gradient_accumulation_steps=1,
         eval_accumulation_steps=4,
         eval_strategy="steps",
@@ -1670,11 +1677,11 @@ def main():
             training_args = get_training_args(
             log_dir,
             batch_eval_metrics = False,
-            max_steps = 10000,   
+            max_steps = 1000,   
             save_steps = 1005,
-            eval_steps = 1000,   
-            warmup_steps = 1000,
-            logging_steps = 100,
+            eval_steps = 100,   
+            warmup_steps = 100,
+            logging_steps = 10,
             eval_on_start = False,
             learning_rate = 2.5e-4,
             weight_decay = 0.01,
