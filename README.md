@@ -12,6 +12,39 @@ To highlight the relationship between pitch and rotary embeddings, the model imp
 2. **Direct similarity bias:** A pitch-based similarity bias is added directly to the attention mechanism.
 3. **Variable radii in torch.polar:** The unit circle radius (1.0) in the `torch.polar` calculation is replaced with variable radii derived from f0. This creates acoustically-weighted positional encodings, so each position in the embedding space reflects the acoustic prominence in the original speech. This approach effectively adds phase information without significant computational overhead.
 
+The function `torch.polar` constructs a complex tensor from polar coordinates:
+
+````python
+# torch.polar(magnitude, angle) returns:
+result = magnitude * (torch.cos(angle) + 1j * torch.sin(angle))
+````
+
+So, for each element:
+- **magnitude** is the modulus (radius, r)
+- **angle** is the phase (theta, in radians)
+- The result is: `r * exp(i * theta) = r * (cos(theta) + i * sin(theta))`
+
+Reference: [PyTorch Documentation - torch.polar](https://pytorch.org/docs/stable/generated/torch.polar.html)
+
+Here are the abbreviated steps for replacing theta and radius in the rotary forward:
+
+```python
+f0 = f0.to(device, dtype) # feature extracted during processing
+f0_mean = f0.mean() # mean only used as theta in freqs calculation
+theta = f0_mean + self.theta
+freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+freqs = t[:, None] * freqs[None, :]
+
+radius = f0.to(device, dtype) # we want to avoid using the mean of f0 (or any stat or interpolation)
+if radius.shape[0] != x.shape[0]: # encoder outputs will already be the correct length
+    F = radius.shape[0] / x.shape[0]
+    idx = torch.arange(x.shape[0], device=f0.device)
+    idx = (idx * F).long().clamp(0, radius.shape[0] - 1)
+    radius = radius[idx] # it's the best method i know of that retains f0 character 
+radius = radius.unsqueeze(-1).expand(-1, freqs.shape[-1])
+radius = torch.sigmoid(radius)
+freqs = torch.polar(radius, freqs)
+```
 
 <img width="780" alt="cc4" src="https://github.com/user-attachments/assets/165a3f18-659a-4e2e-a154-a3456b667bae"  />
 
