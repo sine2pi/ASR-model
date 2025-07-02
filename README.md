@@ -40,7 +40,7 @@ freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.lo
 ## This seems to give superior results compared to the standard freqs = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim)).
 ## I thought a mel-scale version might be more perceptually meaningful for audio.. Hovering around 220.0 seems to be a sweet spot but I imagine this depends on dataset specifics
 
-freqs = t[:, None] * freqs[None, :]
+freqs = t[:, None] * freqs[None, :] # dont repeat or use some other method here 
 
 radius = f0.to(device, dtype) # we want to avoid using the mean of f0 (or any stat or interpolation)
 if radius.shape[0] != x.shape[0]: # encoder outputs will already be the correct length
