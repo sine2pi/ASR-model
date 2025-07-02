@@ -6,7 +6,7 @@ NLP/ASR multimodal modal with f0-modulated relative positional embeddings. For r
 
 **This plot illustrates the pattern similiarity of pitch and spectrogram. (librispeech - clean).
 
-To highlight the relationship between pitch and rotary embeddings, the model implements three complementary pitch-based enhancements:
+To explore the relationship between pitch and rotary embeddings, the model implements three complementary pitch-based enhancements:
 
 1. Pitch-modulated theta Pitch (f0) is used to modify the theta parameter, dynamically adjusting the rotary frequency.
 2. Direct similarity bias: A pitch-based similarity bias is added directly to the attention mechanism.
