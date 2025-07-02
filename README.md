@@ -32,6 +32,9 @@ Here are the abbreviated steps for replacing theta and radius in the rotary forw
 f0 = f0.to(device, dtype) # feature extracted during processing
 f0_mean = f0.mean() # mean only used as theta in freqs calculation
 theta = f0_mean + self.theta # this can be just f0_mean and probably should for voice audio. I have no idea why they picked 10,000 in the original implimentation of rope but I assume it was for a good reason?.
+## In text, theta=10,000 sets the base frequency for positional encoding, ensuring a wide range of periodicities for long sequences.
+## For audio, especially speech, the relevant periodicities are determined by the pitch (f0), so using f0_mean (or even better, the local f0 per frame) is more meaningful.
+
 freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2) / 2595) - 1) / 1000
 freqs = t[:, None] * freqs[None, :]
 
@@ -46,6 +49,8 @@ radius = torch.sigmoid(radius)
 freqs = torch.polar(radius, freqs)
 
 ```
+
+
 Approximation methods like using cos/sin projections or fixed rotation matrices typically assume a unit circle (radius=1.0) or only rotate, not scale. When we introduce a variable radius, those approximations break down and can't represent the scaling effect, only the rotation. When using a variable radius, we should use true complex multiplication to get correct results. Approximations that ignore the radius or scale after the rotation don't seem to capture the intended effect, leading to degraded or incorrect representations from my tests so far.
 
 ```python
