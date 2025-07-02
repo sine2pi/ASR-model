@@ -51,7 +51,11 @@ Approximation methods like using cos/sin projections or fixed rotation matrices 
 ```python
 
 ### Do not approximate:
-    @staticmethod
+#     radius = radius.unsqueeze(-1).expand_as(x_rotated[..., ::2])
+#     x_rotated[..., ::2] = x_rotated[..., ::2] * radius
+#     x_rotated[..., 1::2] = x_rotated[..., 1::2] * radius
+
+### 
     def apply_rotary(x, freqs):
         x1 = x[..., :freqs.shape[-1]*2]
         x2 = x[..., freqs.shape[-1]*2:]
