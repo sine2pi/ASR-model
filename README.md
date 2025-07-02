@@ -37,7 +37,8 @@ theta = f0_mean + self.theta
 ## For audio, especially speech, the relevant periodicities are determined by the pitch (f0), so using f0_mean (or even better, the local f0 per frame) might be more meaningful. 
 
 freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2) / 2595) - 1) / 1000
-## I thought a mel-scale version might be more perceptually meaningful for audio.. it seems to give superior results compared to the standard freqs = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim)).
+## This seems to give superior results compared to the standard freqs = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim)).
+## I thought a mel-scale version might be more perceptually meaningful for audio.. Hovering around 220.0 seems to be a sweet spot but I imagine this depends on dataset specifics
 
 freqs = t[:, None] * freqs[None, :]
 
