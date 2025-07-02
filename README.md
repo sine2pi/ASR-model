@@ -8,9 +8,9 @@ NLP/ASR multimodal modal with f0-modulated relative positional embeddings. For r
 
 To highlight the relationship between pitch and rotary embeddings, the model implements three complementary pitch-based enhancements:
 
-1. **Pitch-modulated theta:** Pitch (f0) is used to modify the theta parameter, dynamically adjusting the rotary frequency.
-2. **Direct similarity bias:** A pitch-based similarity bias is added directly to the attention mechanism.
-3. **Variable radii in torch.polar:** The unit circle radius (1.0) in the `torch.polar` calculation is replaced with variable radii derived from f0. This creates acoustically-weighted positional encodings, so each position in the embedding space reflects the acoustic prominence in the original speech. This approach effectively adds phase information without significant computational overhead.
+1. Pitch-modulated theta Pitch (f0) is used to modify the theta parameter, dynamically adjusting the rotary frequency.
+2. Direct similarity bias: A pitch-based similarity bias is added directly to the attention mechanism.
+3. Variable radii in torch.polar: The unit circle radius (1.0) in the torch.polar calculation is replaced with variable radii derived from f0. This creates acoustically-weighted positional encodings, so each position in the embedding space reflects the acoustic prominence in the original speech. This approach effectively adds phase information without significant computational overhead.
 
 The function `torch.polar` constructs a complex tensor from polar coordinates:
 
@@ -44,6 +44,11 @@ if radius.shape[0] != x.shape[0]: # encoder outputs will already be the correct 
 radius = radius.unsqueeze(-1).expand(-1, freqs.shape[-1])
 radius = torch.sigmoid(radius)
 freqs = torch.polar(radius, freqs)
+
+```
+Approximation methods like using cos/sin projections or fixed rotation matrices typically assume a unit circle (radius=1.0) or only rotate, not scale. When we introduce a variable radius (amplitude modulation), those approximations break down and can't represent the scaling effect, only the rotation.
+
+```python
 
 ### Do not approximate!:
 
