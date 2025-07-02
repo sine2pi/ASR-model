@@ -394,7 +394,7 @@ class rotary(nn.Module):
                 radius = radius[idx]
 
             radius = radius.unsqueeze(-1).expand(-1, freqs.shape[-1])
-            radius = torch.sigmoid(radius)
+            # radius = torch.sigmoid(radius)
         else:
             radius = torch.ones_like(freqs) 
         freqs = torch.polar(radius, freqs)
