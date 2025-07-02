@@ -44,6 +44,21 @@ if radius.shape[0] != x.shape[0]: # encoder outputs will already be the correct 
 radius = radius.unsqueeze(-1).expand(-1, freqs.shape[-1])
 radius = torch.sigmoid(radius)
 freqs = torch.polar(radius, freqs)
+
+### Do not approximate!:
+
+    @staticmethod
+    def apply_rotary(x, freqs):
+        x1 = x[..., :freqs.shape[-1]*2]
+        x2 = x[..., freqs.shape[-1]*2:]
+        orig_shape = x1.shape
+        if x1.ndim == 2:
+            x1 = x1.unsqueeze(0)
+        x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
+        x1 = torch.view_as_complex(x1) * freqs
+        x1 = torch.view_as_real(x1).flatten(-2)
+        x1 = x1.view(orig_shape)
+        return torch.cat([x1.type_as(x), x2], dim=-1)
 ```
 
 <img width="780" alt="cc4" src="https://github.com/user-attachments/assets/165a3f18-659a-4e2e-a154-a3456b667bae"  />
