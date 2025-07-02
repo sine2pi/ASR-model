@@ -38,7 +38,7 @@ theta = f0_mean + self.theta
 
 freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2) / 2595) - 1) / 1000
 ## This seems to give superior results compared to the standard freqs = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim)).
-## I thought a mel-scale version might be more perceptually meaningful for audio.. Hovering around 220.0 seems to be a sweet spot but I imagine this depends on dataset specifics. Whale sounds will be dif.
+## I thought a mel-scale version might be more perceptually meaningful for audio.. Hovering around 220.0 seems to be a sweet spot but I imagine this depends on dataset specifics. Whale speech might be different.
 
 freqs = t[:, None] * freqs[None, :] # dont repeat or use some other method here 
 
