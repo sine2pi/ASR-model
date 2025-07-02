@@ -50,8 +50,7 @@ Approximation methods like using cos/sin projections or fixed rotation matrices 
 
 ```python
 
-### Do not approximate!:
-
+### Do not approximate:
     @staticmethod
     def apply_rotary(x, freqs):
         x1 = x[..., :freqs.shape[-1]*2]
