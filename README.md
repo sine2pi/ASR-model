@@ -46,7 +46,7 @@ radius = torch.sigmoid(radius)
 freqs = torch.polar(radius, freqs)
 
 ```
-Approximation methods like using cos/sin projections or fixed rotation matrices typically assume a unit circle (radius=1.0) or only rotate, not scale. When we introduce a variable radius (amplitude modulation), those approximations break down and can't represent the scaling effect, only the rotation.
+Approximation methods like using cos/sin projections or fixed rotation matrices typically assume a unit circle (radius=1.0) or only rotate, not scale. When we introduce a variable radius (amplitude modulation), those approximations break down and can't represent the scaling effect, only the rotation. When using a variable radius, we must use true complex multiplication to get correct results. Approximations that ignore the radius will not capture the intended effect, leading to degraded or incorrect representations.
 
 ```python
 
@@ -64,6 +64,7 @@ Approximation methods like using cos/sin projections or fixed rotation matrices 
         x1 = x1.view(orig_shape)
         return torch.cat([x1.type_as(x), x2], dim=-1)
 ```
+This approach respects both the rotation (phase) and the scaling (radius) for each token/head, so the rotary embedding is applied when the radius varies.
 
 <img width="780" alt="cc4" src="https://github.com/user-attachments/assets/165a3f18-659a-4e2e-a154-a3456b667bae"  />
 
