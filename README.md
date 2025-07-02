@@ -49,7 +49,6 @@ if radius.shape[0] != x.shape[0]: # encoder outputs will already be the correct 
     idx = (idx * F).long().clamp(0, radius.shape[0] - 1)
     radius = radius[idx] # it's the best method i know of that retains f0 character 
 radius = radius.unsqueeze(-1).expand(-1, freqs.shape[-1])
-radius = torch.sigmoid(radius)
 freqs = torch.polar(radius, freqs)
 
 ```
