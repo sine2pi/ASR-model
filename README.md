@@ -42,14 +42,16 @@ freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.lo
 
 freqs = t[:, None] * freqs[None, :] # dont repeat or use some other method here 
 
-radius = f0.to(device, dtype) # we want to avoid using the mean of f0 (or any stat or interpolation)
-if radius.shape[0] != x.shape[0]: # encoder outputs will already be the correct length
-    F = radius.shape[0] / x.shape[0]
-    idx = torch.arange(x.shape[0], device=f0.device)
-    idx = (idx * F).long().clamp(0, radius.shape[0] - 1)
-    radius = radius[idx] # it's the best method i know of that retains f0 character 
-radius = radius.unsqueeze(-1).expand(-1, freqs.shape[-1])
-freqs = torch.polar(radius, freqs)
+if self.radii and f0 is not None:
+    radius = f0.to(device, dtype) # we want to avoid using the mean of f0 (or any stat or interpolation)
+    if radius.shape[0] != x.shape[0]: # encoder outputs will already be the correct length
+        F = radius.shape[0] / x.shape[0]
+        idx = torch.arange(x.shape[0], device=f0.device)
+        idx = (idx * F).long().clamp(0, radius.shape[0] - 1)
+        radius = radius[idx]
+    freqs = torch.polar(radius.unsqueeze(-1).expand_as(freqs), freqs)
+else:
+    freqs = torch.polar(torch.ones_like(freqs), freqs)
 
 ```
 
