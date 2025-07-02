@@ -82,7 +82,8 @@ Narrow bands: More focus on nearby positions (good for local patterns)
 
 <img width="480" alt="321321" src="https://github.com/user-attachments/assets/d043c13f-a64a-48ad-9809-904f445ea507" />
 
-<img width="680" alt="1555" src="https://github.com/user-attachments/assets/20838c83-aa7e-4556-b887-928a266355a2" />
+<img width="680" alt="1555" src="https://github.com/user-attachments/assets/c336ac19-1fdb-43e9-9722-6b3ef05efc74" />
+
 
 ----
 
