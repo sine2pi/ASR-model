@@ -31,8 +31,8 @@ Here are the abbreviated steps for replacing theta and radius in the rotary forw
 ```python
 f0 = f0.to(device, dtype) # feature extracted during processing
 f0_mean = f0.mean() # mean only used as theta in freqs calculation
-theta = f0_mean + self.theta
-freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+theta = f0_mean + self.theta # this can be just f0_mean and probably should for voice audio. I have no idea why they picked 10,000 in the original implimentation of rope but I assume it was for a good reason?.
+freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2) / 2595) - 1) / 1000
 freqs = t[:, None] * freqs[None, :]
 
 radius = f0.to(device, dtype) # we want to avoid using the mean of f0 (or any stat or interpolation)
