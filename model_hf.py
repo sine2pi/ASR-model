@@ -377,14 +377,15 @@ class rotary(nn.Module):
             else:
                 f0 = f0.view(-1)        
 
-        if f0 is not None and layer == "encoder":
+        if f0 is not None:
             f0_mean = f0.mean()
             theta = f0_mean + self.theta
         else:
             theta = self.theta 
         freqs = self.theta_freqs(theta)
         freqs = t[:, None] * freqs[None, :]
-        if self.radii and f0 is not None and layer == "encoder":
+
+        if self.radii and f0 is not None:
             radius = f0.to(device, dtype)
             L = radius.shape[0]
             if L != ctx:
@@ -392,12 +393,9 @@ class rotary(nn.Module):
                 idx = torch.arange(ctx, device=f0.device)
                 idx = (idx * F).long().clamp(0, L - 1)
                 radius = radius[idx]
-
-            radius = radius.unsqueeze(-1).expand(-1, freqs.shape[-1])
-            # radius = torch.sigmoid(radius)
+            freqs = torch.polar(radius.unsqueeze(-1).expand_as(freqs), freqs)
         else:
-            radius = torch.ones_like(freqs) 
-        freqs = torch.polar(radius, freqs)
+            freqs = torch.polar(torch.ones_like(freqs), freqs)
 
         if "radius" in self.debug and self.counter % 100 == 0:
             theta_value = theta.item() if isinstance(theta, torch.Tensor) else theta
