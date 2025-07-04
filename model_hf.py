@@ -16,22 +16,11 @@ from datetime import datetime
 from datasets import load_dataset, Audio
 from transformers.trainer_seq2seq import Seq2SeqTrainer
 from transformers.training_args_seq2seq import Seq2SeqTrainingArguments
-import transformers
-import evaluate
 from dataclasses import dataclass
 from opimizer import MaxFactor
 
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.set_float32_matmul_precision('high')
-transformers.utils.logging.set_verbosity_error()
-
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
-
-warnings.filterwarnings("ignore")
-logging.basicConfig(level=logging.ERROR)
-
 
 @dataclass
 class Dimensions:
@@ -49,7 +38,6 @@ class Dimensions:
     debug: List[str]
     cross_attn: bool
     features: List[str]
-
 
 def plot_waveform(x=None, w=None, p=None, per=None, sample_idx=0, sr=16000, hop_length=160, 
                                  title="", markers=None, marker_labels=None, 
@@ -240,7 +228,6 @@ def sinusoids(length, channels, max_tscale=10000):
     scaled_t = torch.arange(length)[:, np.newaxis] * inv_tscales[np.newaxis, :]
     return torch.cat([torch.sin(scaled_t), torch.cos(scaled_t)], dim=1)
 
-
 class rotary(nn.Module):
     def __init__(self, dims, head, max_ctx=1500, theta=10000, radii=True, debug: List[str] = [], use_pbias=False):
         super(rotary, self).__init__()
@@ -254,20 +241,12 @@ class rotary(nn.Module):
         self.debug = debug
         self.counter = 0
         self.last_theta = None
-
-        self.bias = nn.Parameter(torch.zeros(max_ctx, dims // 2))
         self.theta = nn.Parameter(torch.tensor(theta, device=device, dtype=dtype), requires_grad=True)
 
     def theta_freqs(self, theta):
         freq = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
         freqs = nn.Parameter(torch.tensor(freq, device=device, dtype=dtype), requires_grad=True)        
         return freqs
-
-    def inverse_mel_scale_scalar(mel_freq: float) -> float:
-        return 700.0 * (math.exp(mel_freq / 1127.0) - 1.0)
-
-    def inverse_mel_scale(mel_freq: Tensor) -> Tensor:
-        return 700.0 * ((mel_freq / 1127.0).exp() - 1.0)
 
     def mel_scale_scalar(freq: float) -> float:
         return 1127.0 * math.log(1.0 + freq / 700.0)
@@ -292,43 +271,6 @@ class rotary(nn.Module):
         f0_sim = torch.exp(-torch.cdist(f0_norm.unsqueeze(1), 
                                     f0_norm.unsqueeze(1)))
         return f0_sim.unsqueeze(0).unsqueeze(0)
-
-    def f0proj(self, f0):
-        if f0.ndim == 3:
-            f0 = f0.squeeze(0)
-        self.f0_proj = nn.Linear(1, self.head_dim // 2, device=device, dtype=dtype)
-        f0 = f0.to(device, dtype)
-        f0 = self.f0_proj(f0.unsqueeze(-1))
-        if f0.ndim == 3:
-            f0 = f0.squeeze(0)
-        return f0.to(device=device, dtype=dtype)
-
-    def align_f0(self, ctx, f0):
-        f0 = self.f0proj(f0)
-        if f0.dim() == 3:
-            batch, length, dims = f0.shape
-            if length == ctx:
-                return f0
-            frames = length / ctx
-            idx = torch.arange(ctx, device=f0.device)
-            idx = (idx * frames).long().clamp(0, length - 1)
-            return f0[:, idx, :]
-        if f0.dim() == 1:
-            length = f0.shape[0]
-            if length == ctx:
-                return f0
-            frames = length / ctx
-            idx = torch.arange(ctx, device=f0.device)
-            idx = (idx * frames).long().clamp(0, length - 1)
-            return f0[idx]
-        else:
-            length, dims = f0.shape
-            if length == ctx:
-                return f0
-            frames = length / ctx
-            idx = torch.arange(ctx, device=f0.device)
-            idx = (idx * frames).long().clamp(0, length - 1)
-            return f0[idx, :]
 
     def forward(self, x=None, enc=None, layer=None, feature_type="audio") -> Tensor:
         f0 = enc.get("f0") if enc is not None else None 
@@ -394,8 +336,6 @@ class rotary(nn.Module):
         x1 = torch.view_as_real(x1).flatten(-2)
         x1 = x1.view(orig_shape)
         return torch.cat([x1.type_as(x), x2], dim=-1)
-
-
 
 class MultiheadA(nn.Module):
     _seen = set()  
@@ -506,7 +446,6 @@ class MultiheadA(nn.Module):
             print(f"MHA: q={q.shape}, k={k.shape}, v={v.shape} - {qk.shape}, wv shape: {wv.shape}")
         self.counter += 1        
         return self.o(wv), qk
-
 
 class t_gate(nn.Module):
     def __init__(self, dims, num_types=4):
@@ -887,7 +826,6 @@ class AudioEncoder(nn.Module):
         self.counter += 1
         return out
 
-
 class TextDecoder(nn.Module):
     def __init__(self, vocab: int, ctx: int, dims: int, head: int, layer: int, cross_attn: bool, 
                 debug: List[str], features: List[str]): 
@@ -932,7 +870,6 @@ class TextDecoder(nn.Module):
         x = self.token(x) + self.positional[:x.shape[1]]
         x = F.dropout(x, p=self.dropout, training=self.training)
         
-
         for block in self.block:
             x = block(x, xa=None, mask=mask, enc=None, layer=layer)
 
@@ -955,7 +892,6 @@ class TextDecoder(nn.Module):
 
         x = self.ln_dec(x)   
         return x @ torch.transpose(self.token.weight.to(dtype), 0, 1).float()
-
 
 class Echo(nn.Module):
     def __init__(self, param: Dimensions):
@@ -1075,8 +1011,6 @@ class Echo(nn.Module):
             if count > 0:
                 print(f"{module_type}: {count}")
 
-metric = evaluate.load(path="wer")
-
 @dataclass
 class DataCollator:
     tokenizer: Any
@@ -1093,7 +1027,7 @@ class DataCollator:
         for key in all_keys:
             if key == "label":
                 labels_list = [f["label"] for f in features]
-                max_len = max(len(l) for l in labels_list)
+                max_len = max(len(l) for l in labels_list)  # noqa: E741
                 all_ids, all_labels = [], []
                 for label in labels_list:
                     label_list = label.tolist() if isinstance(label, torch.Tensor) else label
@@ -1188,7 +1122,7 @@ def load_wave(wave_data, sample_rate):
     
     if sr != sample_rate:
         original_length = waveform.shape[1]
-        target_length = int(original_length * (sample_rate / sr))
+        target_length = int(original_length * (sample_rate / sr))  # noqa: F841
         
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sample_rate)
         waveform = resampler(waveform)
@@ -1277,6 +1211,41 @@ def extract_features(batch, tokenizer, spectrogram, waveforms, pitch, frequency=
     batch["label"] = tokenizer.encode(batch["transcription"], add_special_tokens=False)
     return batch
 
+def calculate_wer(reference, hypothesis):
+    ref_words = reference.lower().split()
+    hyp_words = hypothesis.lower().split()
+    m, n = len(ref_words), len(hyp_words)
+    cost_matrix = [[0 for _ in range(n+1)] for _ in range(m+1)]
+    
+    for i in range(m+1):
+        cost_matrix[i][0] = i
+    for j in range(n+1):
+        cost_matrix[0][j] = j
+    
+    for i in range(1, m+1):
+        for j in range(1, n+1):
+            if ref_words[i-1] == hyp_words[j-1]:
+                cost_matrix[i][j] = cost_matrix[i-1][j-1]
+            else:
+                substitution = cost_matrix[i-1][j-1] + 1
+                insertion = cost_matrix[i][j-1] + 1
+                deletion = cost_matrix[i-1][j] + 1
+                cost_matrix[i][j] = min(substitution, insertion, deletion)
+    min_edit_distance = cost_matrix[m][n]
+    if len(ref_words) > 0:
+        wer = min_edit_distance / len(ref_words)
+    else:
+        wer = 0 if len(hyp_words) == 0 else 1
+    return wer * 100
+
+def compute_wer_batch(references, hypotheses):
+    if len(references) == 0:
+        return 0.0
+    total_wer = 0.0
+    for ref, hyp in zip(references, hypotheses):
+        total_wer += calculate_wer(ref, hyp)
+    return total_wer / len(references)
+
 def compute_metrics(pred, compute_result: bool = True, print_pred: bool = False, num_samples: int = 0, tokenizer = None, model = None):
 
     pred_ids = pred.predictions
@@ -1290,7 +1259,6 @@ def compute_metrics(pred, compute_result: bool = True, print_pred: bool = False,
         if not isinstance(pred_ids, torch.Tensor):
             pred_ids = torch.tensor(pred_ids)
         pred_ids = pred_ids.argmax(dim=-1)
-
 
     pred_ids = pred_ids.tolist()
     label_ids = label_ids.tolist()
@@ -1307,11 +1275,10 @@ def compute_metrics(pred, compute_result: bool = True, print_pred: bool = False,
             print(f"Preds: {pred_ids[i]}")
             print(f"Label: {label_ids[i]}")
             print("--------------------------------")  
-    
+
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-    wer = 100 * metric.compute(predictions=pred_str, references=label_str)
-
+    wer = compute_wer_batch(label_str, pred_str)
 
     if model is None:
         global global_model
@@ -1340,7 +1307,6 @@ def compute_metrics(pred, compute_result: bool = True, print_pred: bool = False,
     }
     return metrics
 
-
 logger = logging.getLogger(__name__)
 
 def create_model(param: Dimensions) -> Echo:
@@ -1364,7 +1330,6 @@ def setup_tokenizer(token: str, local_tokenizer_path: str = "./"):
             sp_ids = [tokenizer.token_to_id(t) for t in ["<PAD>", "<BOS>", "<EOS>"]]
             ids = [id for id in ids if id not in sp_ids]
         return ids
-
 
     def bdec(ids_list, skip_special_tokens=True):
         results = []
@@ -1400,14 +1365,17 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
             "n_fft": 1024,
             "sampling_rate": 16000,
         }
-    
+
     dataset = load_dataset(  
-        "google/fleurs", 
-        "en_us", 
+        # "google/fleurs", 
+        # "en_us", 
+        "mozilla-foundation/common_voice_17_0",
+        "en",        
         token=token, 
         trust_remote_code=True,
-        streaming=False)
+        streaming=True)
 
+    dataset = dataset.rename_column("sentence", "transcription")
     dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000)).select_columns(["audio", "transcription"])
     
     if sanity_check:
@@ -1425,8 +1393,8 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
         
         dataset = dataset.filter(filter_func)
         prepare_fn = partial(extract_features, tokenizer=tokenizer, **dataset_config)
-        train_dataset = dataset["train"]
-        test_dataset = dataset["test"]
+        train_dataset = dataset["train"].take(1000)
+        test_dataset = dataset["test"].take(100)
 
         train_dataset = train_dataset.map(
             function=prepare_fn, 
@@ -1571,13 +1539,7 @@ def main():
     optimizer = MaxFactor(model.parameters(), lr=0.025, beta2_decay=-0.8, eps=(1e-10, 1e-7), d=1.0, 
                  weight_decay=0.025, gamma=0.99, max=False)
 
-
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=training_args.max_steps,
-        eta_min=1e-7,
-        last_epoch=-1,
-    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000, eta_min=1e-7, last_epoch=-1)
 
     trainer = Seq2SeqTrainer(
         args=training_args,
@@ -1591,7 +1553,6 @@ def main():
        
     model.init_weights()
     trainer.train()
-
 
 if __name__ == "__main__":
     main()
