@@ -116,9 +116,3 @@ Narrow bands: More focus on nearby positions (good for local patterns)
 
 
 ----
-
-<img width="283" alt="f0" src="https://github.com/user-attachments/assets/00dba6f6-a943-4361-8160-5651b332034c" />
-
-<img width="84" alt="4" src="https://github.com/user-attachments/assets/6d2c640a-3e01-4632-9cc2-7ced3249f8c5" />
-
-------
