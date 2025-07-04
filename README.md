@@ -112,7 +112,8 @@ Narrow bands: More focus on nearby positions (good for local patterns)
 
 #### Diagnostic test run where 1 epoch = 1000 steps = 1000 samples:
 
-<img width="480" alt="1epoch" src="https://github.com/user-attachments/assets/b46a3118-f8d2-44e5-8b33-c66b843f7e85" />
+<img width="480" alt="1epoch" src="https://github.com/user-attachments/assets/95fcef65-f8ad-4126-98cc-3113ea0fb13b" />
+
 
 ----
 
