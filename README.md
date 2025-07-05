@@ -1,6 +1,7 @@
 
 
 NLP/ASR multimodal modal with f0 modulated relative positional embeddings. For research/testing.
+multi feature encoder, features = ["spectrogram", "waveform", "pitch", "phase", "envelope"]
 
 <img width="780" alt="cc5" src="https://github.com/user-attachments/assets/ce9417de-a892-4811-b151-da612f31c0fb"  />
 
