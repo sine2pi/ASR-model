@@ -7,7 +7,7 @@ multi feature encoder, features = ["spectrogram", "waveform", "pitch", "phase", 
 
 <img width="780" alt="cc5" src="https://github.com/user-attachments/assets/106ebe75-f1db-4f85-bdae-818b114fedd2"  />
 
-This plot illustrates the pattern similiarity of pitch and spectrogram. (librispeech - clean).
+This plot illustrates the pattern similiarity of pitch waveform and spectrogram. (librispeech - clean).
 
 To explore the relationship between pitch and rotary embeddings, the model implements three complementary pitch based enhancements:
 
