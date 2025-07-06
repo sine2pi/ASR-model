@@ -122,4 +122,8 @@ https://huggingface.co/Sin2pi/Echo17/tensorboard?params=scalars
 
 ----
 
+This model sometimes uses :
 
+https://github.com/sine2pi/Maxfactor
+
+MaxFactor is a custom PyTorch optimizer with adaptive learning rates and specialized handling for matrix parameters. I wrote it for the model in the asr_model repository. I needed something that performs well and has a light memory foot print since I do everything from my laptop.
