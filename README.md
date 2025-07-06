@@ -1,7 +1,10 @@
 NLP/ASR multimodal modal with f0 modulated relative positional embeddings. 
 For research/testing.
 
-Why? Because "more compute" is not the answer. (Neither is quantization)
+Why?
+
+Because a significant portion of current AI research is focused on optimizing existing methods instead of exploring new approaches.
+"more compute" is not the answer. (Neither is quantization).
 
 ----
 
