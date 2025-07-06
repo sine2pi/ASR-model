@@ -3,7 +3,6 @@
 NLP/ASR multimodal modal with f0 modulated relative positional embeddings. For research/testing.
 
 ----
-Why? because whisper kind of sucks...
 
 multi feature encoder, features = ["spectrogram", "waveform", "pitch", "phase", "envelope"]
 
@@ -118,3 +117,5 @@ Narrow bands: More focus on nearby positions (good for local patterns)
 https://huggingface.co/Sin2pi/Echo17/tensorboard?params=scalars
 
 ----
+
+Why work on this? because whisper kind of sucks...
