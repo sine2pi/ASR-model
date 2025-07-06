@@ -118,4 +118,4 @@ https://huggingface.co/Sin2pi/Echo17/tensorboard?params=scalars
 
 ----
 
-Why work on this? because whisper kind of sucks...
+
