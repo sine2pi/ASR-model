@@ -1,7 +1,7 @@
 NLP/ASR multimodal modal with f0 modulated relative positional embeddings. 
 For research/testing.
 
-Why? Because "more compute" is not the answer.
+Why? Because "more compute" is not the answer. (Neither is quantization)
 
 ----
 
