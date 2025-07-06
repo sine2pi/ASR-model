@@ -112,6 +112,7 @@ Narrow bands: More focus on nearby positions (good for local patterns)
 <img width="680" alt="cc2" src="https://github.com/user-attachments/assets/9089e806-966b-41aa-8793-bee03a6e6be1"  />
 
 ----
+https://huggingface.co/Sin2pi/Echo17/tensorboard?params=scalars
 
 #### Diagnostic test run where 1 epoch = 1000 steps = 1000 samples:
 
