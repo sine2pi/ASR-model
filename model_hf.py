@@ -16,11 +16,26 @@ from datetime import datetime
 from datasets import load_dataset, Audio
 from transformers.trainer_seq2seq import Seq2SeqTrainer
 from transformers.training_args_seq2seq import Seq2SeqTrainingArguments
+import transformers
 from dataclasses import dataclass
 from opimizer import MaxFactor
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
+transformers.utils.logging.set_verbosity_error()
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
+
+warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.ERROR)
+
+PATH = 'E:/hf'
+os.environ['HF_HOME'] = PATH
+os.environ['HF_DATASETS_CACHE'] = PATH
+os.environ['TORCH_HOME'] = PATH
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 @dataclass
 class Dimensions:
@@ -241,12 +256,20 @@ class rotary(nn.Module):
         self.debug = debug
         self.counter = 0
         self.last_theta = None
+
+        self.bias = nn.Parameter(torch.zeros(max_ctx, dims // 2))
         self.theta = nn.Parameter(torch.tensor(theta, device=device, dtype=dtype), requires_grad=True)
 
     def theta_freqs(self, theta):
         freq = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
         freqs = nn.Parameter(torch.tensor(freq, device=device, dtype=dtype), requires_grad=True)        
         return freqs
+
+    def inverse_mel_scale_scalar(mel_freq: float) -> float:
+        return 700.0 * (math.exp(mel_freq / 1127.0) - 1.0)
+
+    def inverse_mel_scale(mel_freq: Tensor) -> Tensor:
+        return 700.0 * ((mel_freq / 1127.0).exp() - 1.0)
 
     def mel_scale_scalar(freq: float) -> float:
         return 1127.0 * math.log(1.0 + freq / 700.0)
@@ -271,6 +294,43 @@ class rotary(nn.Module):
         f0_sim = torch.exp(-torch.cdist(f0_norm.unsqueeze(1), 
                                     f0_norm.unsqueeze(1)))
         return f0_sim.unsqueeze(0).unsqueeze(0)
+
+    def f0proj(self, f0):
+        if f0.ndim == 3:
+            f0 = f0.squeeze(0)
+        self.f0_proj = nn.Linear(1, self.head_dim // 2, device=device, dtype=dtype)
+        f0 = f0.to(device, dtype)
+        f0 = self.f0_proj(f0.unsqueeze(-1))
+        if f0.ndim == 3:
+            f0 = f0.squeeze(0)
+        return f0.to(device=device, dtype=dtype)
+
+    def align_f0(self, ctx, f0):
+        f0 = self.f0proj(f0)
+        if f0.dim() == 3:
+            batch, length, dims = f0.shape
+            if length == ctx:
+                return f0
+            frames = length / ctx
+            idx = torch.arange(ctx, device=f0.device)
+            idx = (idx * frames).long().clamp(0, length - 1)
+            return f0[:, idx, :]
+        if f0.dim() == 1:
+            length = f0.shape[0]
+            if length == ctx:
+                return f0
+            frames = length / ctx
+            idx = torch.arange(ctx, device=f0.device)
+            idx = (idx * frames).long().clamp(0, length - 1)
+            return f0[idx]
+        else:
+            length, dims = f0.shape
+            if length == ctx:
+                return f0
+            frames = length / ctx
+            idx = torch.arange(ctx, device=f0.device)
+            idx = (idx * frames).long().clamp(0, length - 1)
+            return f0[idx, :]
 
     def forward(self, x=None, enc=None, layer=None, feature_type="audio") -> Tensor:
         f0 = enc.get("f0") if enc is not None else None 
@@ -840,7 +900,7 @@ class TextDecoder(nn.Module):
         self.dropout = 0.01
         self.features = features
         self.do_blend = "no_blend" not in self.debug
-        self.sequential = False 
+        self.sequential = "sequential" in self.debug
 
         self.token = nn.Embedding(num_embeddings=vocab, embedding_dim=dims)
         with torch.no_grad():
@@ -921,14 +981,12 @@ class Echo(nn.Module):
             )
         
     def forward(self,
-        decoder_input_ids=None,
         labels=None,
-        waveform: Optional[torch.Tensor]=None,
         input_ids=None,
+        waveform: Optional[torch.Tensor]=None,
         spectrogram: torch.Tensor=None,
         pitch: Optional[torch.Tensor]=None,
         f0: Optional[torch.Tensor]=None,
-        f0d: Optional[torch.Tensor]=None,
         envelope: Optional[torch.Tensor]=None,
         phase: Optional[torch.Tensor]=None,
         ) -> Dict[str, torch.Tensor]:
@@ -1027,7 +1085,7 @@ class DataCollator:
         for key in all_keys:
             if key == "label":
                 labels_list = [f["label"] for f in features]
-                max_len = max(len(l) for l in labels_list)  # noqa: E741
+                max_len = max(len(l) for l in labels_list)
                 all_ids, all_labels = [], []
                 for label in labels_list:
                     label_list = label.tolist() if isinstance(label, torch.Tensor) else label
@@ -1041,7 +1099,7 @@ class DataCollator:
                     all_labels.append(padded_labels)
                 batch["input_ids"] = torch.tensor(all_ids, dtype=torch.long)
                 batch["labels"] = torch.tensor(all_labels, dtype=torch.long)
-            elif key in ["spectrogram", "waveform", "pitch", "f0", "env", "phase"]:
+            elif key in ["spectrogram", "waveform", "pitch", "f0", "envelope", "phase"]:
                 items = [f[key] for f in features if key in f]
                 max_len = max(item.shape[-1] for item in items)
                 padded = []
@@ -1122,7 +1180,7 @@ def load_wave(wave_data, sample_rate):
     
     if sr != sample_rate:
         original_length = waveform.shape[1]
-        target_length = int(original_length * (sample_rate / sr))  # noqa: F841
+        target_length = int(original_length * (sample_rate / sr))
         
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sample_rate)
         waveform = resampler(waveform)
@@ -1163,17 +1221,9 @@ def extract_features(batch, tokenizer, spectrogram, waveforms, pitch, frequency=
         batch["spectrogram"] = spec
         
     if hilbert:
-        envelope_list = []
-        phase_list = []
-        
-        for ch_idx in range(spec.shape[0]):
-            envelope, phase = process_spectrogram_with_hilbert(spec[ch_idx])
-            envelope_list.append(envelope)
-            phase_list.append(phase)
-            
-        batch["envelope"] = torch.stack(envelope_list)
-        batch["phase"] = torch.stack(phase_list)
-        
+        batch["envelope"] = process_spectrogram_with_hilbert(spec)[0]
+        batch["phase"] = process_spectrogram_with_hilbert(spec)[1]
+    
     wav_1d = wav.unsqueeze(0)
     
     if waveforms:
@@ -1211,40 +1261,38 @@ def extract_features(batch, tokenizer, spectrogram, waveforms, pitch, frequency=
     batch["label"] = tokenizer.encode(batch["transcription"], add_special_tokens=False)
     return batch
 
-def calculate_wer(reference, hypothesis):
-    ref_words = reference.lower().split()
-    hyp_words = hypothesis.lower().split()
-    m, n = len(ref_words), len(hyp_words)
-    cost_matrix = [[0 for _ in range(n+1)] for _ in range(m+1)]
+def levenshtein(reference_words, hypothesis_words):
+
+    m, n = len(reference_words), len(hypothesis_words)
+    dist_matrix = [[0 for _ in range(n+1)] for _ in range(m+1)]
     
     for i in range(m+1):
-        cost_matrix[i][0] = i
+        dist_matrix[i][0] = i
     for j in range(n+1):
-        cost_matrix[0][j] = j
+        dist_matrix[0][j] = j
     
     for i in range(1, m+1):
         for j in range(1, n+1):
-            if ref_words[i-1] == hyp_words[j-1]:
-                cost_matrix[i][j] = cost_matrix[i-1][j-1]
+            if reference_words[i-1] == hypothesis_words[j-1]:
+                dist_matrix[i][j] = dist_matrix[i-1][j-1]
             else:
-                substitution = cost_matrix[i-1][j-1] + 1
-                insertion = cost_matrix[i][j-1] + 1
-                deletion = cost_matrix[i-1][j] + 1
-                cost_matrix[i][j] = min(substitution, insertion, deletion)
-    min_edit_distance = cost_matrix[m][n]
-    if len(ref_words) > 0:
-        wer = min_edit_distance / len(ref_words)
-    else:
-        wer = 0 if len(hyp_words) == 0 else 1
-    return wer * 100
+                substitution = dist_matrix[i-1][j-1] + 1
+                insertion = dist_matrix[i][j-1] + 1
+                deletion = dist_matrix[i-1][j] + 1
+                dist_matrix[i][j] = min(substitution, insertion, deletion)
+    
+    return dist_matrix[m][n]
 
-def compute_wer_batch(references, hypotheses):
-    if len(references) == 0:
-        return 0.0
-    total_wer = 0.0
+def wer_batch(references, hypotheses):
+
+    total_errors = 0
+    total_words = 0
     for ref, hyp in zip(references, hypotheses):
-        total_wer += calculate_wer(ref, hyp)
-    return total_wer / len(references)
+        ref_words = ref.lower().split()
+        errors = levenshtein(ref_words, hyp.lower().split()) 
+        total_errors += errors
+        total_words += len(ref_words)
+    return (total_errors / total_words) * 100 if total_words > 0 else 0.0
 
 def compute_metrics(pred, compute_result: bool = True, print_pred: bool = False, num_samples: int = 0, tokenizer = None, model = None):
 
@@ -1278,7 +1326,7 @@ def compute_metrics(pred, compute_result: bool = True, print_pred: bool = False,
 
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-    wer = compute_wer_batch(label_str, pred_str)
+    wer = wer_batch(label_str, pred_str)
 
     if model is None:
         global global_model
@@ -1367,10 +1415,8 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
         }
 
     dataset = load_dataset(  
-        # "google/fleurs", 
-        # "en_us", 
         "mozilla-foundation/common_voice_17_0",
-        "en",        
+        "en",
         token=token, 
         trust_remote_code=True,
         streaming=True)
@@ -1380,12 +1426,12 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
     
     if sanity_check:
         dataset = dataset["test"].take(10)
-        dataset = dataset.select_columns(["audio", "transcription"])
         prepare_fn = partial(extract_features, tokenizer=tokenizer, **dataset_config)
         dataset = dataset.map(function=prepare_fn, remove_columns=["audio", "transcription"]).with_format(type="torch")
         train_dataset = dataset
         test_dataset = dataset
     else:
+
         def filter_func(x):
             return (0 < len(x["transcription"]) < 512 and
                    len(x["audio"]["array"]) > 0 and
@@ -1393,8 +1439,8 @@ def prepare_datasets(tokenizer, token: str, sanity_check: bool = False, dataset_
         
         dataset = dataset.filter(filter_func)
         prepare_fn = partial(extract_features, tokenizer=tokenizer, **dataset_config)
-        train_dataset = dataset["train"]
-        test_dataset = dataset["test"]
+        train_dataset = dataset["train"].take(10000).shuffle()
+        test_dataset = dataset["test"].take(1000).shuffle()
 
         train_dataset = train_dataset.map(
             function=prepare_fn, 
@@ -1418,6 +1464,9 @@ def get_training_args(
     num_train_epochs: int = 1,
     logging_steps: int = 1,
     eval_on_start: bool = False,
+    learning_rate: float = 1e-4,
+    weight_decay: float = 0.01,
+    max_grad_norm: float = 1.0,
 ) -> Seq2SeqTrainingArguments:
 
     return Seq2SeqTrainingArguments(
@@ -1441,9 +1490,17 @@ def get_training_args(
         disable_tqdm=False,
         save_total_limit=1,
         label_names=["labels"],
+        optim="adamw_torch",
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_epsilon=1e-8,
+        lr_scheduler_type="cosine",
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
         save_safetensors=False,
         eval_on_start=eval_on_start,
         batch_eval_metrics=batch_eval_metrics,
+        max_grad_norm=max_grad_norm,       
     )
 
 def main():
@@ -1465,17 +1522,23 @@ def main():
             warmup_steps = 0,
             logging_steps = 1,
             eval_on_start = True,
+            learning_rate = 5e-6,
+            weight_decay = 0.01,
+            max_grad_norm = 0.6,            
             )
         else:
             training_args = get_training_args(
             log_dir,
             batch_eval_metrics = False,
-            max_steps = 1000,   
-            save_steps = 1000,
-            eval_steps = 100,   
-            warmup_steps = 100,
-            logging_steps = 10,
+            max_steps = 10000,   
+            save_steps = 10000,
+            eval_steps = 1000,   
+            warmup_steps = 1000,
+            logging_steps = 100,
             eval_on_start = False,
+            learning_rate = 2.5e-4,
+            weight_decay = 0.01,
+            max_grad_norm = 0.6,            
             )
 
         return training_args
@@ -1492,7 +1555,7 @@ def main():
         text_dims=512,
         text_idx=4,
         act="swish",
-        debug={},
+        debug={"encoder"},
         cross_attn=True,
         features = ["spectrogram"],
         )
@@ -1526,7 +1589,7 @@ def main():
     global global_model
     global_model = model
     
-    metrics_fn = partial(compute_metrics, print_pred=False, num_samples=1, 
+    metrics_fn = partial(compute_metrics, print_pred=True, num_samples=1, 
                     tokenizer=tokenizer, model=model)
     
     print(f"{'Sanity check' if sanity_check else 'Training'} mode")
@@ -1536,10 +1599,13 @@ def main():
         sanity_check=sanity_check,
         dataset_config=dataset_config)
 
-    optimizer = MaxFactor(model.parameters(), lr=0.025, beta2_decay=-0.8, eps=(1e-10, 1e-7), d=1.0, 
-                 weight_decay=0.025, gamma=0.99, max=False)
+    # optimizer = MaxFactor(model.parameters(), lr=0.025, beta2_decay=-0.8, eps=(1e-10, 1e-7), d=1.0, 
+    # weight_decay=0.025, gamma=0.99, max=False)
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000, eta_min=1e-7, last_epoch=-1)
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=0.00025, eps=1e-8, weight_decay=0.025, betas=(0.9, 0.999), 
+    # amsgrad=False, foreach=False, fused=False, capturable=False, differentiable=False, maximize=False)
+    
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=training_args.max_steps, eta_min=0.0, last_epoch=-1)
 
     trainer = Seq2SeqTrainer(
         args=training_args,
@@ -1548,7 +1614,7 @@ def main():
         eval_dataset=test_dataset,
         data_collator=DataCollator(tokenizer=tokenizer),
         compute_metrics=metrics_fn,
-        optimizers=(optimizer, scheduler)
+            # optimizers=(optimizer, scheduler)    
         ) 
        
     model.init_weights()
