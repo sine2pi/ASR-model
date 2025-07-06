@@ -1,7 +1,7 @@
 
 
 NLP/ASR multimodal modal with f0 modulated relative positional embeddings. For research/testing.
-
+Why work on this? Because "more compute" is not the answer.
 ----
 
 multi feature encoder, features = ["spectrogram", "waveform", "pitch", "phase", "envelope"]
