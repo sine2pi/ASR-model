@@ -1,3 +1,5 @@
+ -- There's a leak somewhere and i can't find it.
+
 NLP/ASR multimodal modal with f0 modulated relative positional embeddings. 
 For research/testing.
 
