@@ -958,7 +958,7 @@ def setup_tokenizer(token, local_tokenizer_path: str = "./"):
                     ids = ids[:-1]
             results.append(tokenizer.decode(ids))
         return results
-      
+
     def save_pretrained(save_dir):
         os.makedirs(save_dir, exist_ok=True)
         tokenizer.save(f"{save_dir}/tokenizer.json")
@@ -970,132 +970,264 @@ def setup_tokenizer(token, local_tokenizer_path: str = "./"):
     tokenizer.eos_token_id = 2
     return tokenizer
 
-raw_dataset = load_dataset(
-    "google/fleurs",
-    "en_us",
-    token=token,
-    split="train[:1000]",
-    trust_remote_code=True,
-)
-raw_dataset = raw_dataset.cast_column("audio", Audio(sampling_rate=16000))
-
-class SimpleSpeechDataset(Dataset):
-    def __init__(self, hf_dataset):
-        self.samples = []
+class SpeechDataProcessor:
+    def __init__(self, hf_dataset, tokenizer, sample_rate=16000, n_mels=128, n_fft=1024, hop_length=256):
+        self.tokenizer = tokenizer
+        self.sample_rate = sample_rate
+        self.n_mels = n_mels
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        
         self.mel = torchaudio.transforms.MelSpectrogram(
-            sample_rate=16000, n_fft=1024, hop_length=256, n_mels=128
+            sample_rate=sample_rate, 
+            n_fft=n_fft, 
+            hop_length=hop_length, 
+            n_mels=n_mels
         )
+        
+        self.samples = self._process_dataset(hf_dataset)
+        
+    def _process_dataset(self, hf_dataset):
+        samples = []
         for item in hf_dataset:
             waveform = torch.tensor(item["audio"]["array"]).float()
             if waveform.dim() == 2:
                 waveform = waveform.mean(dim=0)
+            
             spec = self.mel(waveform)
+            
             wav_np = waveform.numpy().astype(np.float64)
-            f0, t = pw.dio(wav_np, 16000, frame_period=256/16000*1000)
-            f0 = pw.stonemask(wav_np, f0, t, 16000)
+            f0, t = pw.dio(wav_np, self.sample_rate, frame_period=self.hop_length/self.sample_rate*1000)
+            f0 = pw.stonemask(wav_np, f0, t, self.sample_rate)
             f0 = torch.from_numpy(f0).float()
-            self.samples.append({
+            
+            transcription = item.get("sentence", item.get("transcription", ""))
+            
+            samples.append({
                 "spectrogram": spec,
                 "f0": f0,
-                "transcription": item["sentence"] if "sentence" in item else item["transcription"]
+                "transcription": transcription
             })
+        return samples
+    
     def __len__(self):
         return len(self.samples)
+    
     def __getitem__(self, idx):
         return self.samples[idx]
-
-def simple_collate(batch):
-    specs = [item["spectrogram"] for item in batch]
-    f0s = [item["f0"] for item in batch]
-    labels = [item["transcription"] for item in batch]
-    max_spec_len = max(s.shape[-1] for s in specs)
-    max_f0_len = max(f0.shape[-1] for f0 in f0s)
-    padded_specs = torch.stack([
-        torch.nn.functional.pad(s, (0, max_spec_len - s.shape[-1])) for s in specs
-    ])
-    padded_f0s = torch.stack([
-        torch.nn.functional.pad(f0, (0, max_f0_len - f0.shape[-1])) for f0 in f0s
-    ])
-    return {"spectrogram": padded_specs, "f0": padded_f0s, "transcription": labels}
-
-dataset = SimpleSpeechDataset(raw_dataset)
-train_size = int(0.8 * len(dataset))
-test_size = len(dataset) - train_size
-train_set, test_set = random_split(dataset, [train_size, test_size])
-
-train_loader = DataLoader(train_set, batch_size=1, shuffle=True, collate_fn=simple_collate)
-test_loader = DataLoader(test_set, batch_size=1, shuffle=False, collate_fn=simple_collate)
-
-tokenizer = setup_tokenizer(token)
-
-model = Echo(param).to('cuda')
-max_steps = 10000
-optimizer = torch.optim.AdamW(
-    model.parameters(), lr=0.00025, eps=1e-8, weight_decay=0.025, betas=(0.9, 0.999),
-    amsgrad=False, foreach=False, fused=False, capturable=False, differentiable=False, maximize=False
-)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optimizer, T_max=max_steps, eta_min=0.0, last_epoch=-1
-)
-
-def wer(ref, hyp):
-    r = ref.split()
-    h = hyp.split()
-    d = np.zeros((len(r)+1, len(h)+1), dtype=np.uint8)
-    for i in range(len(r)+1):
-        d[i][0] = i
-    for j in range(len(h)+1):
-        d[0][j] = j
-    for i in range(1, len(r)+1):
-        for j in range(1, len(h)+1):
-            if r[i-1] == h[j-1]:
-                d[i][j] = d[i-1][j-1]
-            else:
-                substitution = d[i-1][j-1] + 1
-                insertion    = d[i][j-1] + 1
-                deletion     = d[i-1][j] + 1
-                d[i][j] = min(substitution, insertion, deletion)
-    wer_value = d[len(r)][len(h)] / float(len(r)) if len(r) > 0 else 0.0
-    return min(wer_value, 1.0)
-
-model.train()
-step = 0
-while step < max_steps:
-    for batch in train_loader:
-        if step >= max_steps:
-            break
-        x = batch["spectrogram"].to(model.device)
-        f0 = batch["f0"].to(model.device)
-        input_ids = [tokenizer.encode(t) for t in batch["transcription"]]
+    
+    def collate_fn(self, batch):
+        specs = [item["spectrogram"] for item in batch]
+        f0s = [item["f0"] for item in batch]
+        transcriptions = [item["transcription"] for item in batch]
+        
+        max_spec_len = max(s.shape[-1] for s in specs)
+        max_f0_len = max(f0.shape[-1] for f0 in f0s)
+        
+        padded_specs = torch.stack([
+            torch.nn.functional.pad(s, (0, max_spec_len - s.shape[-1])) for s in specs
+        ])
+        
+        padded_f0s = torch.stack([
+            torch.nn.functional.pad(f0, (0, max_f0_len - f0.shape[-1])) for f0 in f0s
+        ])
+        
+        input_ids = [self.tokenizer.encode(t) for t in transcriptions]
         max_len = max(len(ids) for ids in input_ids)
-        input_ids = [ids + [tokenizer.pad_token_id] * (max_len - len(ids)) for ids in input_ids]
-        input_ids = torch.tensor(input_ids, dtype=torch.long, device=model.device)
+        input_ids = [ids + [self.tokenizer.pad_token_id] * (max_len - len(ids)) for ids in input_ids]
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
         labels = input_ids.clone()
-        out = model(input_ids=input_ids, spectrogram=x, f0=f0, labels=labels)
-        loss = out["loss"]
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad()
-        if step % 100 == 0:
-            current_lr = scheduler.get_last_lr()[0]
-            print(f"Step {step}: Train loss: {loss.item():.4f} | LR: {current_lr:.6f}")
-        step += 1
+        
+        return {
+            "spectrogram": padded_specs,
+            "f0": padded_f0s,
+            "input_ids": input_ids,
+            "labels": labels,
+            "transcription": transcriptions
+        }
+    
+    def create_dataloaders(self, batch_size=1, train_split=0.8, shuffle_train=True):
+        train_size = int(train_split * len(self))
+        test_size = len(self) - train_size
+        
+        train_set, test_set = random_split(self, [train_size, test_size])
+        
+        train_loader = DataLoader(
+            train_set, 
+            batch_size=batch_size, 
+            shuffle=shuffle_train, 
+            collate_fn=self.collate_fn
+        )
+        
+        test_loader = DataLoader(
+            test_set, 
+            batch_size=batch_size, 
+            shuffle=False, 
+            collate_fn=self.collate_fn
+        )
+        
+        return train_loader, test_loader
 
-model.eval()
-total_wer = 0
-n = 0
-with torch.no_grad():
-    for batch in test_loader:
-        x = batch["spectrogram"].to(model.device)
-        f0 = batch["f0"].to(model.device)
-        pred_ids = model.generate(spectrogram=x, f0=f0, tokenizer=tokenizer, max_length=32)
-        pred_text = tokenizer.batch_decode(pred_ids.tolist())
-        ref_text = batch["transcription"]
-        print(f"REF: {ref_text[0]}")
-        print(f"PRED: {pred_text[0]}")
-        w = wer(ref_text[0], pred_text[0])
-        print(f"WER: {w:.2f}")
-        total_wer += w
-        n += 1
-print(f"\nAverage WER: {total_wer/n:.2f}")
+class SpeechTrainer:
+    def __init__(self, model, data_processor, tokenizer, device='cuda'):
+        self.model = model.to(device)
+        self.data_processor = data_processor
+        self.tokenizer = tokenizer
+        self.device = device
+        self.step = 0
+        self.train_losses = []
+        self.eval_metrics = []
+        
+    def setup_optimizer(self, lr=0.00025, weight_decay=0.025, max_steps=100000):
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(), 
+            lr=lr, 
+            eps=1e-8, 
+            weight_decay=weight_decay, 
+            betas=(0.9, 0.999))
+        
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=max_steps, eta_min=0.0)
+        self.max_steps = max_steps
+        
+    def train(self, max_steps=None, lr=0.00025, weight_decay=0.025, 
+              batch_size=1, print_every=100, train_split=0.8):
+        if max_steps is None:
+            max_steps = self.max_steps if hasattr(self, 'max_steps') else 100000
+            
+        if not hasattr(self, 'optimizer'):
+            self.setup_optimizer(lr, weight_decay, max_steps)
+            
+        train_loader, test_loader = self.data_processor.create_dataloaders(
+            batch_size=batch_size, train_split=train_split
+        )
+        
+        self.model.train()
+        self.step = 0
+        
+        print(f"Starting training for {max_steps} steps...")
+        
+        while self.step < max_steps:
+            for batch in train_loader:
+                if self.step >= max_steps:
+                    break
+                    
+                x = batch["spectrogram"].to(self.device)
+                f0 = batch["f0"].to(self.device)
+                input_ids = batch["input_ids"].to(self.device)
+                labels = batch["labels"].to(self.device)
+                
+                out = self.model(input_ids=input_ids, spectrogram=x, f0=f0, labels=labels)
+                loss = out["loss"]
+                
+                loss.backward()
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+                
+                self.train_losses.append(loss.item())
+                if self.step % print_every == 0:
+                    current_lr = self.scheduler.get_last_lr()[0]
+                    avg_loss = np.mean(self.train_losses[-print_every:])
+                    print(f"Step {self.step}: Train loss: {avg_loss:.4f} | LR: {current_lr:.6f}")
+                self.step += 1
+        print("Training completed!")
+        
+    def evaluate(self, max_samples=None, batch_size=1):
+        train_loader, test_loader = self.data_processor.create_dataloaders(
+            batch_size=batch_size, train_split=0.8)
+        self.model.eval()
+        total_wer = 0
+        n = 0
+        
+        print("Starting evaluation...")
+        with torch.no_grad():
+            for batch in test_loader:
+                if max_samples and n >= max_samples:
+                    break
+                    
+                x = batch["spectrogram"].to(self.device)
+                f0 = batch["f0"].to(self.device)
+                
+                pred_ids = self.model.generate(
+                    spectrogram=x, f0=f0, tokenizer=self.tokenizer, max_length=32
+                )
+                pred_text = self.tokenizer.batch_decode(pred_ids.tolist())
+                ref_text = batch["transcription"]
+                w = self._calculate_wer(ref_text[0], pred_text[0])
+                
+                print(f"REF: {ref_text[0]}")
+                print(f"PRED: {pred_text[0]}")
+                print(f"WER: {w:.2f}")
+                
+                total_wer += w
+                n += 1
+                
+        avg_wer = total_wer / n if n > 0 else 0.0
+        print(f"\nAverage WER: {avg_wer:.2f}")
+        
+        self.eval_metrics.append(avg_wer)
+        return avg_wer
+    
+    def _calculate_wer(self, ref, hyp):
+        r = ref.split()
+        h = hyp.split()
+        d = np.zeros((len(r)+1, len(h)+1), dtype=np.uint8)
+        
+        for i in range(len(r)+1):
+            d[i][0] = i
+        for j in range(len(h)+1):
+            d[0][j] = j
+            
+        for i in range(1, len(r)+1):
+            for j in range(1, len(h)+1):
+                if r[i-1] == h[j-1]:
+                    d[i][j] = d[i-1][j-1]
+                else:
+                    substitution = d[i-1][j-1] + 1
+                    insertion    = d[i][j-1] + 1
+                    deletion     = d[i-1][j] + 1
+                    d[i][j] = min(substitution, insertion, deletion)
+                    
+        wer_value = d[len(r)][len(h)] / float(len(r)) if len(r) > 0 else 0.0
+        return min(wer_value, 1.0)
+    
+    def save_checkpoint(self, path):
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'step': self.step,
+            'train_losses': self.train_losses,
+            'eval_metrics': self.eval_metrics
+        }
+        torch.save(checkpoint, path)
+        print(f"Checkpoint saved to {path}")
+    
+    def load_checkpoint(self, path):
+        checkpoint = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        self.step = checkpoint['step']
+        self.train_losses = checkpoint['train_losses']
+        self.eval_metrics = checkpoint['eval_metrics']
+        print(f"Checkpoint loaded from {path}")
+
+raw_dataset = load_dataset(
+    "google/fleurs",
+    "en_us",
+    token=token,
+    split="train",#[:2000]",
+    trust_remote_code=True,
+)
+
+raw_dataset = raw_dataset.cast_column("audio", Audio(sampling_rate=16000)).shuffle()
+tokenizer = setup_tokenizer(token)
+data_processor = SpeechDataProcessor(raw_dataset, tokenizer)
+trainer = SpeechTrainer(Echo(param), data_processor, tokenizer)
+trainer.train(max_steps=1000, lr=0.00025, print_every=100)
+avg_wer = trainer.evaluate(max_samples=10)
+print(f"Final Average WER: {avg_wer:.2f}")
+trainer.save_checkpoint("checkpoint.pt")
+
