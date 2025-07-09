@@ -44,30 +44,34 @@ Reference: [PyTorch Documentation - torch.polar](https://pytorch.org/docs/stable
 Here are the abbreviated steps for replacing theta and radius in the rotary forward:
 
 ```python
+
 f0 = f0.to(device, dtype) # feature extracted during processing
-f0_mean = f0.mean() # mean only used as theta in freqs calculation
-theta = f0_mean + self.theta
-## This can be just f0_mean or even perhaps f0 (per frame) and probably should for voice audio.
-## In text, theta=10,000 sets the base frequency for positional encoding, ensuring a wide range of periodicities for long sequences. I'm not convinced by that arguement even for text.
-## But.. for audio, especially speech, the relevant periodicities are determined by the pitch (f0), so using f0_mean (or even better, the local f0 per frame) might be more meaningful. 
+if f0 is not None:
+    if f0.dim() == 2:
+        f0 = f0.squeeze(0) 
+    theta = f0 + self.theta  
+else:
+    theta = self.theta 
 
-freqs = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2) / 2595) - 1) / 1000
-## This seems to give superior results compared to the standard freqs = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim)).
-## I thought a mel-scale version might be more perceptually meaningful for audio..
-## Using mel-scale to create a perceptually-relevant distance metric instead of Euclidean distance.
+## In text, theta=10,000 sets the base frequency for positional encoding, ensuring a wide range of periodicities for long sequences. I'm not sure if the specific number 10k was experimentally derived.
+## For audio, especially speech, the relevant periodicities are determined by the pitch (f0 neighborhood or f0 per frame) might be more meaningful. 
 
-freqs = t[:, None] * freqs[None, :] # dont repeat or use some other method here 
+freqs = (theta.unsqueeze(-1) / 220.0) * 700 * (
+    torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), 
+            self.dim // 2, device=theta.device, dtype=theta.dtype) / 2595) - 1) / 1000
+
+## This seems to give better results compared to the standard freqs = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim)).
+## I thought a mel-scale version might be more perceptually meaningful for audio.. ie. using mel-scale to create a perceptually-relevant distance metric instead of Euclidean distance.
+
+t = torch.arange(ctx, device=device, dtype=dtype)
+freqs = t[:, None] * freqs  # dont repeat or use some other method here 
 
 if self.radii and f0 is not None:
-    radius = f0.to(device, dtype) # we want to avoid using the mean of f0 (or any stat or interpolation)
-    if radius.shape[0] != x.shape[0]: # encoder outputs will already be the correct length
-        F = radius.shape[0] / x.shape[0]
-        idx = torch.arange(x.shape[0], device=f0.device)
-        idx = (idx * F).long().clamp(0, radius.shape[0] - 1)
-        radius = radius[idx]
-    freqs = torch.polar(radius.unsqueeze(-1).expand_as(freqs), freqs)
+    radius = f0.to(device, dtype)
+    freqs = torch.polar(radius.unsqueeze(-1), freqs)
 else:
-    freqs = torch.polar(torch.ones_like(freqs), freqs)
+    radius = torch.ones_like(freqs)
+    freqs = torch.polar(radius, freqs)
 
 ```
 
