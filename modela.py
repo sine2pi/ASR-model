@@ -984,7 +984,6 @@ class Echo(nn.Module):
                     "eos_token_id": self.eos_token_id,
                 })
         return Config()
-
 def setup_tokenizer(token: str, local_tokenizer_path: str = "./"):
     from tokenizers import Tokenizer
     tokenizer = Tokenizer.from_file(f"{local_tokenizer_path}/tokenizer.json")
@@ -1017,10 +1016,33 @@ def extract_features(batch, tokenizer, sample_rate=16000, n_mels=128, n_fft=1024
     waveform = torch.tensor(audio["array"]).float()
     if waveform.dim() == 2:
         waveform = waveform.mean(dim=0)
+
+    # transform = torchaudio.transforms.MelSpectrogram(
+    #     f_max=fmax,
+    #     f_min=fmin,
+    #     n_mels=n_mels,
+    #     sample_rate=sr,
+    #     n_fft=n_fft,
+    #     hop_length=hop_length,
+    #     norm=norm,
+    #     normalized=normalized,
+    #     power=power,
+    #     center=center, 
+    #     mel_scale=mel_scale,
+    #     window_fn=window_fn,
+    #     pad_mode=pad_mode)
+    
+    # mel_spectrogram = transform(wav)      
+    # log_mel = torch.clamp(mel_spectrogram, min=1e-10).log10()
+    # log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
+    # spec = (log_mel + 4.0) / 4.0
+    # spec = torch.tensor(spec)
+
     mel = torchaudio.transforms.MelSpectrogram(
         sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels
     )
     spec = mel(waveform)
+    spec = torch.clamp(spec, min=1e-10).log10()
     spec = torch.tensor(spec) if not isinstance(spec, torch.Tensor) else spec
     wav_np = waveform.numpy().astype(np.float64)
     f0, t = pw.dio(wav_np, sample_rate, frame_period=hop_length/sample_rate*1000)
@@ -1056,13 +1078,18 @@ def prepare_datasets(tokenizer, token: str, sample_rate=16000, n_mels=128, n_fft
 
 @dataclass
 class DataCollator:
-    tokenizer: any
-    def __call__(self, features):
+    tokenizer: Any
+
+    def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         pad_token_id = getattr(self.tokenizer, 'pad_token_id', 0)
+        bos_token_id = getattr(self.tokenizer, 'bos_token_id', 1)
+        eos_token_id = getattr(self.tokenizer, 'eos_token_id', 2)
+
+        # Gather and pad spectrograms and f0
         specs = [f["spectrogram"] for f in features]
         f0s = [f["f0"] for f in features]
-        specs = [torch.tensor(item["spectrogram"]) if not isinstance(item["spectrogram"], torch.Tensor) else item["spectrogram"] for item in features]
-        f0s = [torch.tensor(item["f0"]) if not isinstance(item["f0"], torch.Tensor) else item["f0"] for item in features]
+        specs = [torch.tensor(s) if not isinstance(s, torch.Tensor) else s for s in specs]
+        f0s = [torch.tensor(f0) if not isinstance(f0, torch.Tensor) else f0 for f0 in f0s]
         max_spec_len = max(s.shape[-1] for s in specs)
         max_f0_len = max(f0.shape[-1] for f0 in f0s)
         padded_specs = torch.stack([
@@ -1071,11 +1098,18 @@ class DataCollator:
         padded_f0s = torch.stack([
             torch.nn.functional.pad(f0, (0, max_f0_len - f0.shape[-1])) for f0 in f0s
         ])
-        input_ids = [f["input_ids"] for f in features]
-        max_len = max(len(ids) for ids in input_ids)
-        input_ids = [ids + [pad_token_id] * (max_len - len(ids)) for ids in input_ids]
+
+        # Gather and pad input_ids/labels
+        input_ids_list = [f["input_ids"] for f in features]
+        # Ensure all are lists, not tensors
+        input_ids_list = [ids.tolist() if isinstance(ids, torch.Tensor) else ids for ids in input_ids_list]
+        max_len = max(len(ids) for ids in input_ids_list)
+        # Add BOS to input_ids, EOS to labels, pad both to max_len+1
+        input_ids = [[bos_token_id] + ids + [pad_token_id] * (max_len - len(ids)) for ids in input_ids_list]
+        labels = [ids + [eos_token_id] + [pad_token_id] * (max_len - len(ids)) for ids in input_ids_list]
         input_ids = torch.tensor(input_ids, dtype=torch.long)
-        labels = input_ids.clone()
+        labels = torch.tensor(labels, dtype=torch.long)
+
         return {
             "spectrogram": padded_specs,
             "f0": padded_f0s,
@@ -1202,4 +1236,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
