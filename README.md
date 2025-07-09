@@ -1,15 +1,20 @@
- -- There's a leak somewhere and i can't find it.
-
 NLP/ASR multimodal modal with f0 modulated relative positional embeddings. 
 For research/testing.
-
-Why?
-
-Because a significant portion of current AI research is focused on optimizing existing methods instead of exploring new approaches.
-
 ----
 
-multi feature encoder, features = ["spectrogram", "waveform", "pitch", "phase", "envelope"]
+Questions:
+
+   -How can we make attention mechanisms aware of speech-specific properties?
+   
+   -Can we incorporate acoustic information directly into positional encodings?
+   
+   -Does pitch-conditioning improve speech recognition?
+
+   Standard RoPE was designed for text: Text doesn't have pitch, timing, or acoustic properties.
+   
+----
+
+
 
 
 <img width="780" alt="cc5" src="https://github.com/user-attachments/assets/106ebe75-f1db-4f85-bdae-818b114fedd2"  />
