@@ -984,6 +984,8 @@ class Echo(nn.Module):
                     "eos_token_id": self.eos_token_id,
                 })
         return Config()
+
+
 def setup_tokenizer(token: str, local_tokenizer_path: str = "./"):
     from tokenizers import Tokenizer
     tokenizer = Tokenizer.from_file(f"{local_tokenizer_path}/tokenizer.json")
@@ -994,6 +996,7 @@ def setup_tokenizer(token: str, local_tokenizer_path: str = "./"):
             sp_ids = [tokenizer.token_to_id(t) for t in ["<PAD>", "<BOS>", "<EOS>"]]
             ids = [id for id in ids if id not in sp_ids]
         return ids
+
     def bdec(ids_list, skip_special_tokens=True):
         results = []
         for ids in ids_list:
@@ -1004,8 +1007,13 @@ def setup_tokenizer(token: str, local_tokenizer_path: str = "./"):
                     ids = ids[:-1]
             results.append(tokenizer.decode(ids))
         return results
+
+    def save_pretrained(save_dir):
+        os.makedirs(save_dir, exist_ok=True)
+        tokenizer.save(f"{save_dir}/tokenizer.json")
     tokenizer.encode = enc
     tokenizer.batch_decode = bdec
+    tokenizer.save_pretrained = save_pretrained
     tokenizer.pad_token_id = 0
     tokenizer.bos_token_id = 1
     tokenizer.eos_token_id = 2
@@ -1016,22 +1024,7 @@ def extract_features(batch, tokenizer, sample_rate=16000, n_mels=128, n_fft=1024
     waveform = torch.tensor(audio["array"]).float()
     if waveform.dim() == 2:
         waveform = waveform.mean(dim=0)
-
-    # transform = torchaudio.transforms.MelSpectrogram(
-    #     f_max=fmax,
-    #     f_min=fmin,
-    #     n_mels=n_mels,
-    #     sample_rate=sr,
-    #     n_fft=n_fft,
-    #     hop_length=hop_length,
-    #     norm=norm,
-    #     normalized=normalized,
-    #     power=power,
-    #     center=center, 
-    #     mel_scale=mel_scale,
-    #     window_fn=window_fn,
-    #     pad_mode=pad_mode)
-    
+        
     # mel_spectrogram = transform(wav)      
     # log_mel = torch.clamp(mel_spectrogram, min=1e-10).log10()
     # log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
@@ -1099,7 +1092,6 @@ class DataCollator:
             torch.nn.functional.pad(f0, (0, max_f0_len - f0.shape[-1])) for f0 in f0s
         ])
 
-        # Gather and pad input_ids/labels
         input_ids_list = [f["input_ids"] for f in features]
         # Ensure all are lists, not tensors
         input_ids_list = [ids.tolist() if isinstance(ids, torch.Tensor) else ids for ids in input_ids_list]
