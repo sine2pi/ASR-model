@@ -146,6 +146,73 @@ class rotary(nn.Module):
         self.bias = nn.Parameter(torch.zeros(max_ctx, dims // 2))
         self.theta = nn.Parameter(torch.tensor(theta, device=device, dtype=dtype), requires_grad=True)
 
+    # def theta_freqs(self, theta):
+    #     freq = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+    #     freqs = nn.Parameter(torch.tensor(freq, device=device, dtype=dtype), requires_grad=True)        
+    #     return freqs
+
+    # def mel_geodesic_rotary(f0, theta):
+    #     mel_f0 = 1127.0 * torch.log(1.0 + f0 / 700.0)
+    #     fisher_info = torch.var(mel_f0) + 1e-8
+    #     adaptive_theta = theta * torch.sqrt(fisher_info)
+    #     freqs = self.theta_freqs(adaptive_theta)
+    #     return freqs
+
+    # def compute_pitch_fisher_info(f0, window_size=10):
+    #     if f0.dim() == 1:
+    #         f0 = f0.unsqueeze(0)
+    #     mel_f0 = 1127.0 * torch.log(1.0 + f0 / 700.0)
+    #     fisher_info = torch.nn.functional.avg_pool1d(
+    #         mel_f0.unsqueeze(0), 
+    #         kernel_size=window_size, 
+    #         stride=1, 
+    #         padding=window_size//2
+    #     ).squeeze(0)
+    #     fisher_info = (fisher_info - fisher_info.min()) / (fisher_info.max() - fisher_info.min() + 1e-8)
+    #     return fisher_info
+
+    # def compute_advanced_fisher_info(f0, window_size=10):
+    #     mel_f0 = 1127.0 * torch.log(1.0 + f0 / 700.0)
+    #     local_mean = torch.nn.functional.avg_pool1d(
+    #         mel_f0.unsqueeze(0), window_size, 1, window_size//2
+    #     ).squeeze(0)
+        
+    #     local_var = torch.nn.functional.avg_pool1d(
+    #         (mel_f0 - local_mean).pow(2).unsqueeze(0), 
+    #         window_size, 1, window_size//2
+    #     ).squeeze(0)
+   
+    #     fisher_info = 1.0 / (local_var + 1e-8)
+    #     return fisher_info
+
+    # def test_fisher_info(self, f0):
+    #     """Test Fisher information computation."""    #     fisher_info = self.compute_pitch_fisher_info(f0)
+        
+    #     print(f"f0 range: {f0.min():.1f} - {f0.max():.1f}")
+    #     print(f"Fisher info range: {fisher_info.min():.3f} - {fisher_info.max():.3f}")
+    #     print(f"Fisher info mean: {fisher_info.mean():.3f}")
+        
+    #     # Visualize: high Fisher info = meaningful pitch changes
+    #     return fisher_info
+
+    # def forward(self, x=None, enc=None, layer=None, feature_type="audio"):
+        
+    #     if f0 is not None:
+    #         # Compute Fisher information
+    #         fisher_info = self.compute_pitch_fisher_info(f0)
+            
+    #         # Use Fisher info to weight pitch influence
+    #         f0_weighted = f0 * fisher_info
+            
+    #         # Apply to both theta and radius
+    #         f0_mean = f0_weighted.mean()
+    #         theta = f0_mean + self.theta
+            
+    #         if self.radii:
+    #             radius = f0_weighted.to(device, dtype)
+
+
+    
     def theta_freqs(self, theta):
         freq = (theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
         freqs = nn.Parameter(torch.tensor(freq, device=device, dtype=dtype), requires_grad=True)        
