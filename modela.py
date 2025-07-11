@@ -33,7 +33,6 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
 def get_activation(act: str) -> nn.Module:
-    """Get activation function by name."""
     act_map = {
         "gelu": nn.GELU(), 
         "relu": nn.ReLU(), 
@@ -199,7 +198,6 @@ def plot_waveform(x=None, w=None, p=None, per=None, sample_idx=0, sr=16000, hop_
     return fig
 
 def valid(default_value, *items):
-    """Get first non-None item"""
     for item in items:
         if item is not None:
             return item
