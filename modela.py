@@ -33,7 +33,6 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
 def get_activation(act: str) -> nn.Module:
-    """Get activation function by name."""
     act_map = {
         "gelu": nn.GELU(), 
         "relu": nn.ReLU(), 
@@ -193,12 +192,11 @@ def plot_waveform(x=None, w=None, p=None, per=None, sample_idx=0, sr=16000, hop_
             axs[0].legend(loc='upper right', fontsize='small')
     axs[-1].set_xlabel("t (s)")
     fig.suptitle(title, fontsize=16)
-    plt.tight_layout(rect=[0, 0, 1, 0.97]) # type: ignore
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
     plt.show()
     return fig
 
 def valid(default_value, *items):
-    """Get first non-None item"""
     for item in items:
         if item is not None:
             return item
@@ -245,17 +243,17 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.elementwise_affine = elementwise_affine
         if self.elementwise_affine:
-            self.weight = nn.Parameter(torch.empty(self.normalized_shape))  # type: ignore
+            self.weight = nn.Parameter(torch.empty(self.normalized_shape))
             init.ones_(self.weight)  
         else:
             self.register_parameter("weight", None)
     def forward(self, x):
-        return F.rms_norm(x, self.normalized_shape, self.weight, self.eps)  # type: ignore
+        return F.rms_norm(x, self.normalized_shape, self.weight, self.eps)
     
 def LayerNorm(x: Tensor, normalized_shape: Union[int, Tensor, List, Tuple],
                weight: Optional[Tensor] = None, bias: Optional[Tensor] = None,
                eps: float = 1e-5) -> Tensor:
-    return F.layer_norm(x, normalized_shape, weight, bias, eps)  # type: ignore
+    return F.layer_norm(x, normalized_shape, weight, bias, eps)
 
 def get_device():
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -339,7 +337,7 @@ class rotary(nn.Module):
         elif isinstance(x, torch.Tensor) and x.ndim == 3:
             batch, ctx, dims = x.shape
         else:
-            batch, head, ctx, head_dim = x.shape # type: ignore
+            batch, head, ctx, head_dim = x.shape
 
         if f0 is not None:
             if f0.dim() == 2:
@@ -365,7 +363,6 @@ class rotary(nn.Module):
             radius_mean = radius.mean() if 'radius' in locals() else 0.0
             print(f"  [{layer}] [Radius] {radius_shape} {radius_mean:.2f} [Theta] {theta_value:.2f} [f0] {f0.shape if f0 is not None else None} [Freqs] {freqs.shape} {freqs.mean():.2f} [ctx] {ctx}")
             print(f"  [{layer}] [Radius] {radius}")
-        # self.theta_values.append(theta.item())
         self.counter += 1
         return freqs.unsqueeze(0)
 
@@ -386,7 +383,8 @@ class MultiheadA(nn.Module):
 
     rbf = False
     def __init__(self, dims: int, head: int, rotary_emb: bool = True, 
-                 zero_val: float = 1e-7, minz: float = 1e-8, maxz: float = 1e-6, debug: List[str] = [], optim_attn=False, use_pbias=False):
+                 zero_val: float = 1e-7, minz: float = 1e-8, maxz: float = 1e-6, debug: List[str] = [], 
+                 optim_attn=False, use_pbias=False, use_smart_sensor=False, use_focus_bias=False):
         super(MultiheadA, self).__init__()
 
         self.dims = dims
@@ -419,6 +417,16 @@ class MultiheadA(nn.Module):
         else:
             self.rope = None
 
+        self.use_smart_sensor = use_smart_sensor
+        if use_smart_sensor:
+            self.head_gate = nn.Parameter(torch.ones(head))
+            self.guidance_strength = nn.Parameter(torch.tensor(0.3))
+            self.lr_scale = nn.Parameter(torch.tensor(1.0))
+
+        self.use_focus_bias = use_focus_bias
+        if use_focus_bias:
+            self.focus_bias_strength = nn.Parameter(torch.tensor(0.3))
+
     def cos_sim(self, q: Tensor, k: Tensor, v: Tensor, mask) -> Tensor:
         q_norm = torch.nn.functional.normalize(q, dim=-1, eps=1e-12)
         k_norm = torch.nn.functional.normalize(k, dim=-1, eps=1e-12)
@@ -440,7 +448,7 @@ class MultiheadA(nn.Module):
         rbf_scores = torch.exp(-dist_sq / (2 * rbf_sigma**2))
         return (1 - rbf_ratio) * dot_scores + rbf_ratio * rbf_scores
           
-    def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, enc = None, layer = None, feature_type="audio", need_weights=True) -> tuple:
+    def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, enc = None, layer = None, feature_type="audio", need_weights=True, focus_bias=None, head_weights=None, cross_guidance=None, attention_lr=None) -> tuple:
 
         x = x.to(device, dtype)
         if xa is not None:
@@ -459,8 +467,8 @@ class MultiheadA(nn.Module):
             q2 = q.shape[2]
             k2 = k.shape[2]
 
-            q = self.rope.apply_rotary(q, (self.rope(x=q2, enc=enc, layer=layer)))  # type: ignore
-            k = self.rope.apply_rotary(k, (self.rope(x=k2, enc=enc, layer=layer)))  # type: ignore
+            q = self.rope.apply_rotary(q, (self.rope(x=q2, enc=enc, layer=layer)))
+            k = self.rope.apply_rotary(k, (self.rope(x=k2, enc=enc, layer=layer)))
         else:
             q = q.view(*q.shape[:2], self.head, -1).permute(0, 2, 1, 3)
             k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
@@ -468,10 +476,26 @@ class MultiheadA(nn.Module):
         
         qk = (q * scale) @ (k * scale).transpose(-1, -2)
 
+        if self.use_focus_bias and focus_bias is not None:
+            bias_strength = torch.sigmoid(self.focus_bias_strength)
+            qk = qk + bias_strength * focus_bias
+
+        if self.use_smart_sensor and head_weights is not None:
+            head_gate = torch.sigmoid(self.head_gate) * head_weights
+            qk = qk * head_gate.unsqueeze(-1).unsqueeze(-1)
+        
+        if self.use_smart_sensor and cross_guidance is not None:
+            guidance_strength = torch.sigmoid(self.guidance_strength)
+            qk = qk + guidance_strength * cross_guidance
+        
+        if self.use_smart_sensor and attention_lr is not None:
+            lr_scale = torch.sigmoid(self.lr_scale)
+            self.register_buffer("predicted_lr", attention_lr * lr_scale)
+
         if self.rbf:
             qk = self.rbf_scores(q * scale, k * scale, rbf_sigma=1.0, rbf_ratio=0.3)
         if self.use_pbias:
-            pbias = self.rope.pitch_bias(f0 = enc.get("f0", None) if enc is not None else None)  # type: ignore
+            pbias = self.rope.pitch_bias(f0 = enc.get("f0", None) if enc is not None else None)
             if pbias is not None:
                 qk = qk + pbias[:,:,:q2,:q2]
 
@@ -481,9 +505,6 @@ class MultiheadA(nn.Module):
         zscale[token_ids.float() == self.pad_token] = fzero
         
         if mask is not None:
-            # mask = mask[:q2, :q2]#torch.tril(torch.ones(q2, q2, device=q.device))
-            # audio_mask = torch.ones(q2, k2 - q2, device=q.device)
-            # mask = torch.cat([mask, audio_mask], dim=-1)
             mask = mask.unsqueeze(0).unsqueeze(0)
             qk = qk + mask * zscale.unsqueeze(-2).expand(qk.shape)
 
@@ -499,7 +520,7 @@ class MultiheadA(nn.Module):
 class FocusWindow(nn.Module):
     
     def __init__(self, dims: int, head: int, max_span: int = 512, max_dist: int = 256, 
-                 feature_type: str = "waveform", debug: List[str] = []):
+                 feature_type: str = "waveform", debug: List[str] = [], learn_lr: bool = False, base_lr: float = 0.001):
         super().__init__()
         self.dims = dims
         self.head = head
@@ -508,22 +529,19 @@ class FocusWindow(nn.Module):
         self.max_dist = max_dist
         self.feature_type = feature_type
         self.debug = debug
-        
-        # Adaptive parameters for focus control
+        self.learn_lr = learn_lr
+        self.base_lr = base_lr
         self.threshold = nn.Parameter(torch.tensor(0.01))
         self.s_factor = nn.Parameter(torch.tensor(0.1))
         self.temp_scale = nn.Parameter(torch.tensor(1.0))
         self.sharpen = True
         
-        # Feature-specific projections
         self.q_proj = Linear(dims, dims)
         self.k_proj = Linear(dims, dims)
         self.v_proj = Linear(dims, dims)
         
-        # Bias strength controller
         self.bias_strength = nn.Parameter(torch.tensor(0.5))
         
-        # Feature-specific window sizes
         self.window_sizes = {
             "spectrogram": 128,
             "waveform": 256, 
@@ -532,7 +550,6 @@ class FocusWindow(nn.Module):
             "phase": 64
         }
         
-        # Feature-specific span lengths
         self.span_lengths = {
             "spectrogram": 256,
             "waveform": 512,
@@ -541,16 +558,32 @@ class FocusWindow(nn.Module):
             "phase": 128
         }
 
-    def _focus(self, q, k, v, span_scale, mask=None):
+        self.head_router = nn.Sequential(
+            Linear(dims, dims),
+            nn.SiLU(),
+            Linear(dims, head)
+        )
 
+        self.lr_predictor = nn.Sequential(
+            Linear(dims, dims // 4),
+            nn.SiLU(),
+            Linear(dims // 4, 1),
+            nn.Sigmoid()
+        )
+        
+    def predict_attention_lr(self, x, feature_data=None):
+        lr_factor = self.lr_predictor(x.mean(dim=1))
+        return self.base_lr * lr_factor
+
+    def _focus(self, q, k, v, span_scale, mask=None):
+        
         q_energy = torch.norm(q, dim=-1).mean()
         k_energy = torch.norm(k, dim=-1).mean()
         content_richness = (q_energy + k_energy) / 2
         
-        # Dynamic max iterations: more interesting content = more iterations
         base_iterations = 3
         max_iterations = int(base_iterations + content_richness * 12)
-        max_iterations = min(max_iterations, 20)  # Cap at 20
+        max_iterations = min(max_iterations, 20)
         
         iteration = 0
         prev_attn = torch.zeros_like(q)
@@ -570,13 +603,13 @@ class FocusWindow(nn.Module):
 
             q_span = q[:, :eff_span, :]
             k_span = k[:, :eff_span, :]
-            v_span = k[:, :eff_span, :]
+            v_span = v[:, :eff_span, :]
 
             batch, ctx, dims = q_span.size()
             
-            q = q_span.view(batch, ctx, self.head, -1).transpose(1, 2)
-            k = k_span.view(batch, ctx, self.head, -1).transpose(1, 2)
-            v = v_span.view(batch, ctx, self.head, -1).transpose(1, 2)
+            q_head = q_span.view(batch, ctx, self.head, -1).transpose(1, 2)
+            k_head = k_span.view(batch, ctx, self.head, -1).transpose(1, 2)
+            v_head = v_span.view(batch, ctx, self.head, -1).transpose(1, 2)
 
             if self.sharpen:
                 temperature = 1.0 + self.temp_scale * (1.0 - span_scale.mean().item())
@@ -584,11 +617,11 @@ class FocusWindow(nn.Module):
                 temperature = 0.5 + self.temp_scale * span_scale.mean().item()
             
             scale = (dims // self.head) ** -0.5
-            attn = torch.matmul(q, k.transpose(-1, -2)) * scale
+            attn = torch.matmul(q_head, k_head.transpose(-1, -2)) * scale
             
             if mask is not None:
                 if mask.dim() == 4:
-                    q_len, k_len = q.size(2), k.size(2)
+                    q_len, k_len = q_head.size(2), k_head.size(2)
                     mask_q_len = min(mask.size(2), q_len)
                     mask_k_len = min(mask.size(3), k_len)
                     
@@ -603,7 +636,7 @@ class FocusWindow(nn.Module):
             attn = F.softmax(attn, dim=-1)
             
             if mask is not None and mask.dtype == torch.bool:
-                q_len, k_len = q.size(2), k.size(2)
+                q_len, k_len = q_head.size(2), k_head.size(2)
                 mask_q_len = min(mask.size(2), q_len)
                 mask_k_len = min(mask.size(3), k_len)
                 
@@ -616,8 +649,11 @@ class FocusWindow(nn.Module):
                 
                 attn[:, :, :mask_q_len, :mask_k_len] = attn_to_mask
                 
-            attn_output = torch.matmul(attn, v)
-            attn_out = attn_output.transpose(1, 2).contiguous().view(batch, ctx, -1)
+            attn_output = torch.matmul(attn, v_head)
+            attn_out = attn_output.transpose(1, 2).contiguous().view(batch, ctx, dims)
+
+            q = q.clone()
+            q[:, :eff_span, :] = q_span + attn_out
 
             diff = torch.abs(attn_out - prev_attn).mean()
             dynamic_threshold = threshold + s_factor * diff
@@ -626,7 +662,6 @@ class FocusWindow(nn.Module):
                 break
 
             prev_attn = attn_out
-            q = q + attn_out
             iteration += 1
             
         return attn_out, attn_weights
@@ -644,9 +679,9 @@ class FocusWindow(nn.Module):
             k_start = max(0, start_idx - span_len + win_size)
             k_end = min(start_idx + span_len, ctx)
 
-            q = x[:, start_idx:end_idx, :]
-            k = x[:, k_start:k_end, :]
-            k = k
+            q = x[:, start_idx:end_idx, :]     
+            k = x[:, k_start:k_end, :]          
+            v = x[:, k_start:k_end, :]   
 
             window_mask = None
             if mask is not None:
@@ -656,32 +691,35 @@ class FocusWindow(nn.Module):
                     if window_mask.size(1) == 1:
                         window_mask = window_mask.expand(-1, self.head, -1, -1)
 
-            attn_out, _ = self._focus(
-                q=q, k=k, v=v, span_scale=span_scale, mask=window_mask
-            )
+            attn_out, _ = self._focus(q=q, k=k, v=v, span_scale=span_scale, mask=window_mask)
 
             output[:, start_idx:end_idx, :] = attn_out
 
         return output
 
-    def forward(self, x, xa=None, mask=None, enc=None, layer=None, return_bias=True):
+    def predict_head_importance(self, x, xa=None):
+        if xa is not None:
+            combined = x + 0.1 * xa
+        else:
+            combined = x
+        head_importance = self.head_router(combined.mean(dim=1))
+        return head_importance
+
+    def forward(self, x, xa=None, mask=None, enc=None, layer=None, return_bias=False, return_head_weights=False, learn_lr=False):
+        
         q = self.q_proj(x)
         k = self.k_proj(x if xa is None else xa)
         v = self.v_proj(x if xa is None else xa)
         
-        # Create span scale based on feature characteristics
         if xa is not None:
-            # Feature-specific span scaling
             feature_energy = torch.norm(xa, dim=-1).mean(dim=-1, keepdim=True)
             span_scale = torch.sigmoid(feature_energy / (feature_energy.std() + 1e-6))
         else:
             span_scale = torch.ones(x.size(0), 1, device=x.device)
         
-        # Get feature-specific parameters
         win_size = self.window_sizes.get(self.feature_type, 128)
         span_len = self.span_lengths.get(self.feature_type, 256)
         
-        # Apply sliding window with focus attention
         output = self.slide_win(
             x=q,
             win_size=win_size,
@@ -689,13 +727,129 @@ class FocusWindow(nn.Module):
             span_scale=span_scale,
             mask=mask
         )
-        
+
+        if learn_lr:
+            lr_factor = self.lr_predictor(output.mean(dim=1))
+            return output, lr_factor
+
+        if return_head_weights:
+            head_weights = self.predict_head_importance(x, xa)
+            return output, head_weights
+
         if return_bias:
-            # Return as bias for main attention
             bias_strength = torch.sigmoid(self.bias_strength)
             return bias_strength * output
         else:
             return output
+
+class CrossFeatureFocusAttention(nn.Module):
+    def __init__(self, dims: int, head: int, features: List[str] = ["spectrogram", "pitch"]):
+        super().__init__()
+        self.dims = dims
+        self.head = head
+        self.features = features
+        
+        self.cross_attn_layers = nn.ModuleDict({
+            feature: nn.MultiheadAttention(dims, head, batch_first=True)
+            for feature in features
+        })
+        
+        self.feature_fusion = nn.Sequential(
+            Linear(dims * len(features), dims),
+            nn.SiLU(),
+            Linear(dims, dims)
+        )
+        
+    def forward(self, x, enc, mask=None):
+        if enc is None:
+            return None
+            
+        cross_features = []
+        for feature in self.features:
+            if feature in enc:
+                feature_data = enc[feature]
+                if feature_data is not None:
+                    attn_out, _ = self.cross_attn_layers[feature](
+                        x, feature_data, feature_data, 
+                        attn_mask=mask
+                    )
+                    cross_features.append(attn_out)
+        
+        if not cross_features:
+            return None
+            
+        if len(cross_features) > 1:
+            fused = torch.cat(cross_features, dim=-1)
+            return self.feature_fusion(fused)
+        else:
+            return cross_features[0]
+
+class AdaptiveAttentionLR(nn.Module):
+    def __init__(self, dims: int, head: int):
+        super().__init__()
+        self.dims = dims
+        self.head = head
+        
+        self.lr_predictor = nn.Sequential(
+            Linear(dims, dims // 4),
+            nn.SiLU(),
+            Linear(dims // 4, 1),
+            nn.Sigmoid()
+        )
+        
+        self.quality_estimator = nn.Sequential(
+            Linear(dims, dims // 2),
+            nn.SiLU(),
+            Linear(dims // 2, 1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x, feature_data=None, mask=None):
+        quality = self.quality_estimator(x.mean(dim=1))
+        lr_factor = self.lr_predictor(x.mean(dim=1)
+        adaptive_lr = quality * lr_factor
+        return adaptive_lr, adaptive_lr
+
+class SmartSensorResidual(nn.Module):
+    def __init__(self, ctx, dims, head, act, cross_attn=True, debug: List[str] = [], 
+                 use_smart_sensor=True):
+        super().__init__()
+        self.ctx = ctx
+        self.dims = dims
+        self.head = head
+        self.act = act
+        self.debug = debug
+        
+        if use_smart_sensor:
+            self.focus_attn = FocusWindow(dims, head, feature_type="waveform")
+            self.cross_feature_guide = CrossFeatureFocusAttention(dims, head, 
+                                                               features=["spectrogram", "pitch"])
+            self.adaptive_lr = AdaptiveAttentionLR(dims, head)
+            
+            self.attna = MultiheadA(dims, head, debug=debug)
+            self.lna = RMSNorm(dims)
+    
+    def forward(self, x, xa=None, mask=None, enc=None, layer=None, feature_type="audio"):
+        if hasattr(self, 'focus_attn') and enc is not None:
+            focus_output, head_weights = self.focus_attn(x, enc.get("waveform"), mask, 
+                                                       return_head_weights=True)
+            
+            cross_guidance = self.cross_feature_guide(x, enc, mask)
+            
+            _, attention_lr = self.adaptive_lr(x, enc.get("waveform"), mask)
+            
+            x = x + self.attna(
+                self.lna(x), 
+                xa=None, 
+                mask=mask, 
+                head_weights=head_weights,
+                cross_guidance=cross_guidance,
+                attention_lr=attention_lr,
+                enc=enc, 
+                layer=layer
+            )[0]
+        
+        return x
 
 class t_gate(nn.Module):
     def __init__(self, dims, num_types=4, enabled=True):
@@ -821,6 +975,7 @@ class Residual(nn.Module):
         bx = b * ax + (1 - b) * x
         cx = self.lnb(bx)
         dx = self.mlp(cx)
+
         ex = self.t_gate(cx) if not None else self.default(self.m_gate(cx), self.mlp_gate(cx))
         fx = x + ex + dx
         gx = self.lnc(fx)
@@ -1066,7 +1221,7 @@ class SpeechTransformer(nn.Module):
         for f in self.features:
             if f in enc and f in self.blocks:
                 xa = enc[f]
-                for block in self.blocks[f]: # type: ignore
+                for block in self.blocks[f]:
                     xa = block(xa, enc=enc, layer=layer)
                 out[f] = xa
                 xa = xa + self.audio_embedding[:xa.shape[1]]
@@ -1327,7 +1482,6 @@ def extract_features(batch, tokenizer, sample_rate=16000, hop_length=256, **data
     log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
     spec = (log_mel + 4.0) / 4.0
     spec = torch.tensor(spec)
-    # batch["spectrogram"] = spec
     
     wav_np = wav.numpy().astype(np.float64)  
     f0, t = pw.dio(wav_np, sample_rate, frame_period=hop_length/sample_rate*1000)
@@ -1340,8 +1494,6 @@ def extract_features(batch, tokenizer, sample_rate=16000, hop_length=256, **data
         "spectrogram": spec,
         "f0": f0,
         "labels": labels,
-        # "waveform": wav,
-        # "pitch": f0,
     }
 
 def prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, **dataset_config):
@@ -1569,11 +1721,11 @@ def main():
     trainer = Seq2SeqTrainer(
         args=training_args,
         model=model,
-        train_dataset=train_dataset, # type: ignore
-        eval_dataset=test_dataset, # type: ignore
-        data_collator=DataCollator(tokenizer=tokenizer), # type: ignore 
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,
+        data_collator=DataCollator(tokenizer=tokenizer),
         compute_metrics=metrics_fn,
-        optimizers=(optimizer, scheduler) # type: ignore
+        optimizers=(optimizer, scheduler)
     )
     model.init_weights()
     trainer.train()
