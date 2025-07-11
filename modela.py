@@ -32,7 +32,15 @@ dtype = torch.float32
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
+PATH = 'E:/hf'
+os.environ['HF_HOME'] = PATH
+os.environ['HF_DATASETS_CACHE'] = PATH
+os.environ['TORCH_HOME'] = PATH
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 def get_activation(act: str) -> nn.Module:
+    """Get activation function by name."""
     act_map = {
         "gelu": nn.GELU(), 
         "relu": nn.ReLU(), 
@@ -198,6 +206,7 @@ def plot_waveform(x=None, w=None, p=None, per=None, sample_idx=0, sr=16000, hop_
     return fig
 
 def valid(default_value, *items):
+    """Get first non-None item"""
     for item in items:
         if item is not None:
             return item
@@ -494,6 +503,207 @@ class MultiheadA(nn.Module):
             print(f"MHA: q={q.shape}, k={k.shape}, v={v.shape} - {qk.shape}, wv shape: {wv.shape}")
         self.counter += 1        
         return self.o(wv), qk
+
+class FocusWindow(nn.Module):
+    
+    def __init__(self, dims: int, head: int, max_span: int = 512, max_dist: int = 256, 
+                 feature_type: str = "waveform", debug: List[str] = []):
+        super().__init__()
+        self.dims = dims
+        self.head = head
+        self.head_dim = dims // head
+        self.max_span = max_span
+        self.max_dist = max_dist
+        self.feature_type = feature_type
+        self.debug = debug
+        
+        # Adaptive parameters for focus control
+        self.threshold = nn.Parameter(torch.tensor(0.01))
+        self.s_factor = nn.Parameter(torch.tensor(0.1))
+        self.temp_scale = nn.Parameter(torch.tensor(1.0))
+        self.sharpen = True
+        
+        # Feature-specific projections
+        self.q_proj = Linear(dims, dims)
+        self.k_proj = Linear(dims, dims)
+        self.v_proj = Linear(dims, dims)
+        
+        # Bias strength controller
+        self.bias_strength = nn.Parameter(torch.tensor(0.5))
+        
+        # Feature-specific window sizes
+        self.window_sizes = {
+            "spectrogram": 128,
+            "waveform": 256, 
+            "pitch": 64,
+            "envelope": 64,
+            "phase": 64
+        }
+        
+        # Feature-specific span lengths
+        self.span_lengths = {
+            "spectrogram": 256,
+            "waveform": 512,
+            "pitch": 128,
+            "envelope": 128,
+            "phase": 128
+        }
+
+    def _focus(self, q, k, v, span_scale, mask=None):
+
+        q_energy = torch.norm(q, dim=-1).mean()
+        k_energy = torch.norm(k, dim=-1).mean()
+        content_richness = (q_energy + k_energy) / 2
+        
+        # Dynamic max iterations: more interesting content = more iterations
+        base_iterations = 3
+        max_iterations = int(base_iterations + content_richness * 12)
+        max_iterations = min(max_iterations, 20)  # Cap at 20
+        
+        iteration = 0
+        prev_attn = torch.zeros_like(q)
+        attn_out = torch.zeros_like(q)
+        attn_weights = None
+
+        threshold = self.threshold.item()
+        s_factor = self.s_factor.item()
+
+        while iteration < max_iterations:
+            span_len = int(self.max_span * span_scale.mean().item())
+            span_len = min(span_len, q.size(1), k.size(1), k.size(1))
+            eff_span = min(span_len, self.max_dist)
+
+            if eff_span == 0:
+                break
+
+            q_span = q[:, :eff_span, :]
+            k_span = k[:, :eff_span, :]
+            v_span = k[:, :eff_span, :]
+
+            batch, ctx, dims = q_span.size()
+            
+            q = q_span.view(batch, ctx, self.head, -1).transpose(1, 2)
+            k = k_span.view(batch, ctx, self.head, -1).transpose(1, 2)
+            v = v_span.view(batch, ctx, self.head, -1).transpose(1, 2)
+
+            if self.sharpen:
+                temperature = 1.0 + self.temp_scale * (1.0 - span_scale.mean().item())
+            else:
+                temperature = 0.5 + self.temp_scale * span_scale.mean().item()
+            
+            scale = (dims // self.head) ** -0.5
+            attn = torch.matmul(q, k.transpose(-1, -2)) * scale
+            
+            if mask is not None:
+                if mask.dim() == 4:
+                    q_len, k_len = q.size(2), k.size(2)
+                    mask_q_len = min(mask.size(2), q_len)
+                    mask_k_len = min(mask.size(3), k_len)
+                    
+                    mask_part = mask[:, :, :mask_q_len, :mask_k_len]
+                    if mask_part.dtype == torch.bool:
+                        attn[:, :, :mask_q_len, :mask_k_len] = attn[:, :, :mask_q_len, :mask_k_len].masked_fill(
+                            mask_part, float("-inf")
+                        )
+                    else:
+                        attn[:, :, :mask_q_len, :mask_k_len] = attn[:, :, :mask_q_len, :mask_k_len] + mask_part
+            
+            attn = F.softmax(attn, dim=-1)
+            
+            if mask is not None and mask.dtype == torch.bool:
+                q_len, k_len = q.size(2), k.size(2)
+                mask_q_len = min(mask.size(2), q_len)
+                mask_k_len = min(mask.size(3), k_len)
+                
+                binary_mask = (~mask[:, :, :mask_q_len, :mask_k_len]).float()
+                attn_to_mask = attn[:, :, :mask_q_len, :mask_k_len]
+                attn_to_mask = attn_to_mask * binary_mask
+                
+                attn_sum = attn_to_mask.sum(dim=-1, keepdim=True)
+                attn_to_mask = attn_to_mask / (attn_sum + 1e-6)
+                
+                attn[:, :, :mask_q_len, :mask_k_len] = attn_to_mask
+                
+            attn_output = torch.matmul(attn, v)
+            attn_out = attn_output.transpose(1, 2).contiguous().view(batch, ctx, -1)
+
+            diff = torch.abs(attn_out - prev_attn).mean()
+            dynamic_threshold = threshold + s_factor * diff
+
+            if diff < dynamic_threshold:
+                break
+
+            prev_attn = attn_out
+            q = q + attn_out
+            iteration += 1
+            
+        return attn_out, attn_weights
+
+    def slide_win(self, x, win_size, span_len, span_scale, mask=None):
+        batch, ctx, dims = x.size()
+        num_windows = (ctx + win_size - 1) // win_size
+        output = torch.zeros_like(x)
+
+        for i in range(num_windows):
+            start_idx = i * win_size
+            end_idx = min((i + 1) * win_size, ctx)
+            window_size = end_idx - start_idx
+
+            k_start = max(0, start_idx - span_len + win_size)
+            k_end = min(start_idx + span_len, ctx)
+
+            q = x[:, start_idx:end_idx, :]
+            k = x[:, k_start:k_end, :]
+            k = k
+
+            window_mask = None
+            if mask is not None:
+                if mask.dim() == 4:
+                    window_mask = mask[:, :, start_idx:end_idx, k_start:k_end]
+                    
+                    if window_mask.size(1) == 1:
+                        window_mask = window_mask.expand(-1, self.head, -1, -1)
+
+            attn_out, _ = self._focus(
+                q=q, k=k, v=v, span_scale=span_scale, mask=window_mask
+            )
+
+            output[:, start_idx:end_idx, :] = attn_out
+
+        return output
+
+    def forward(self, x, feature_data=None, mask=None, return_bias=True):
+        q = self.q_proj(x)
+        k = self.k_proj(x if feature_data is None else feature_data)
+        v = self.v_proj(x if feature_data is None else feature_data)
+        
+        # Create span scale based on feature characteristics
+        if feature_data is not None:
+            # Feature-specific span scaling
+            feature_energy = torch.norm(feature_data, dim=-1).mean(dim=-1, keepdim=True)
+            span_scale = torch.sigmoid(feature_energy / (feature_energy.std() + 1e-6))
+        else:
+            span_scale = torch.ones(x.size(0), 1, device=x.device)
+        
+        # Get feature-specific parameters
+        win_size = self.window_sizes.get(self.feature_type, 128)
+        span_len = self.span_lengths.get(self.feature_type, 256)
+        
+        # Apply sliding window with focus attention
+        output = self.slide_win(
+            x=q,
+            win_size=win_size,
+            span_len=span_len,
+            span_scale=span_scale,
+            mask=mask
+        )
+        
+        if return_bias:
+            # Return as bias for main attention
+            bias_strength = torch.sigmoid(self.bias_strength)
+            return bias_strength * output
+        else:
+            return output
 
 class t_gate(nn.Module):
     def __init__(self, dims, num_types=4, enabled=True):
@@ -948,7 +1158,7 @@ class Echo(nn.Module):
         self.init_counts = {
             "Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0,
             "Conv2d": 0, "SEBlock": 0, "SpeechTransformer": 0, 
-            "Residual": 0, "MultiheadA": 0, "MultiheadB - Cross Attention": 0, 
+            "Residual": 0, "MultiheadA": 0, 
             "MultiheadC": 0, "MultiheadD": 0, "FEncoder": 0,
             "WEncoder": 0, "PEncoder": 0}
 
@@ -1165,9 +1375,9 @@ def prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, **
                 return train_dataset, test_dataset   
 
         def filter_func(x):
-            return (0 < len(x["transcription"]) < 512 and
+            return (0 < len(x["transcription"]) < 2048 and
                    len(x["audio"]["array"]) > 0 and
-                   len(x["audio"]["array"]) < 1500 * 160)
+                   len(x["audio"]["array"]) < 2048 * 160)
 
         raw_train = load_dataset(
             "google/fleurs", "en_us", token=token, split="train[:1000]", trust_remote_code=True)
@@ -1321,7 +1531,6 @@ def main():
         vocab=40000, ctx=2048, dims=512, head=4, layer=4,
         mels=128, act="swish", 
         debug={},
-        cross_attn=True, 
         features=["spectrogram"]
         )
     
