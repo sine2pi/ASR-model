@@ -32,13 +32,6 @@ dtype = torch.float32
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
-PATH = 'E:/hf'
-os.environ['HF_HOME'] = PATH
-os.environ['HF_DATASETS_CACHE'] = PATH
-os.environ['TORCH_HOME'] = PATH
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 def get_activation(act: str) -> nn.Module:
     """Get activation function by name."""
     act_map = {
@@ -65,7 +58,6 @@ class Dimensions:
     mels: int
     act: str
     debug: List[str]
-    cross_attn: bool
     features: List[str]
 
 def get_generation_config(param):
@@ -672,15 +664,15 @@ class FocusWindow(nn.Module):
 
         return output
 
-    def forward(self, x, feature_data=None, mask=None, return_bias=True):
+    def forward(self, x, xa=None, mask=None, enc=None, layer=None, return_bias=True):
         q = self.q_proj(x)
-        k = self.k_proj(x if feature_data is None else feature_data)
-        v = self.v_proj(x if feature_data is None else feature_data)
+        k = self.k_proj(x if xa is None else xa)
+        v = self.v_proj(x if xa is None else xa)
         
         # Create span scale based on feature characteristics
-        if feature_data is not None:
+        if xa is not None:
             # Feature-specific span scaling
-            feature_energy = torch.norm(feature_data, dim=-1).mean(dim=-1, keepdim=True)
+            feature_energy = torch.norm(xa, dim=-1).mean(dim=-1, keepdim=True)
             span_scale = torch.sigmoid(feature_energy / (feature_energy.std() + 1e-6))
         else:
             span_scale = torch.ones(x.size(0), 1, device=x.device)
@@ -785,7 +777,7 @@ class mlp_gate(nn.Module):
 class Residual(nn.Module):
     _seen = set()  
     def __init__(self, ctx, dims, head, act, debug: List[str] = [], 
-                 tgate=True, mgate=False, cgate=False, mem_size=512, features=None):
+                 tgate=True, mgate=False, cgate=False, mem_size=512, features=None, focus=True):
         super().__init__()
         
         self.dims = dims
@@ -799,7 +791,9 @@ class Residual(nn.Module):
 
         self.blend = nn.Parameter(torch.tensor(0.5)) 
         act_fn = get_activation(act)
+        
         self.attn = MultiheadA(dims, head, rotary_emb=True, debug=debug)
+        self.focus = FocusWindow(dims, head, debug=debug) if focus else None
 
         if not any([tgate, mgate, cgate]):
             self.mlp_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
@@ -819,9 +813,11 @@ class Residual(nn.Module):
         self.lnc = RMSNorm(dims)
 
     def forward(self, x, xa=None, mask=None, enc=None, layer=None, feature_type="audio") -> Tensor:
-        
+
+        focus = self.focus(x, xa=xa, mask=mask, enc=enc, layer=layer) if self.focus is not None else 0
+
         b = torch.sigmoid(self.blend)
-        ax = x + self.attn(self.lna(x), xa=xa, mask=mask, enc=enc, layer=layer)[0]  
+        ax = x + self.attn(self.lna(x), xa=xa, mask=mask, enc=enc, layer=layer)[0] + focus
         bx = b * ax + (1 - b) * x
         cx = self.lnb(bx)
         dx = self.mlp(cx)
@@ -1016,32 +1012,32 @@ class SpeechTransformer(nn.Module):
 
             "spectrogram": nn.ModuleList(
             [FEncoder(input_dims=mels, dims=dims, head=head, layer=layer, kernel_size=3, act=act_fn)] + 
-            [Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features, cgate=cgate) for _ in range(layer)] 
+            [Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features, cgate=cgate, focus=False) for _ in range(layer)] 
             if "spectrogram" in features else None), 
 
             "waveform": nn.ModuleList(
             [WEncoder(input_dims=1, dims=dims, head=head, layer=layer, kernel_size=11, act=act_fn)] +
-            [Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features, cgate=cgate) for _ in range(layer)] 
+            [Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features, cgate=cgate, focus=False) for _ in range(layer)] 
             if "waveform" in features else None),
 
             "pitch": nn.ModuleList(
             [FEncoder(input_dims=1, dims=dims, head=head, layer=layer, kernel_size=9, act=act, stride=2)] +
-            [Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features, cgate=cgate) for _ in range(layer)] 
+            [Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features, cgate=cgate, focus=False) for _ in range(layer)] 
             if "pitch" in features else None),
 
             "envelope": nn.ModuleList(
             [FEncoder(input_dims=mels, dims=dims, head=head, layer=layer, kernel_size=3, act=act_fn)] + 
-            [Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features, cgate=cgate) for _ in range(layer)] 
+            [Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features, cgate=cgate, focus=False) for _ in range(layer)] 
             if "envelope" in features else None),
 
             "phase": nn.ModuleList(
             [FEncoder(input_dims=mels, dims=dims, head=head, layer=layer, kernel_size=3, act=act_fn)] + 
-            [Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features, cgate=cgate) for _ in range(layer)] 
+            [Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features, cgate=cgate, focus=False) for _ in range(layer)] 
             if "phase" in features else None),
             })
 
         self.block = nn.ModuleList([
-            Residual(ctx=ctx, dims=dims, head=head, act="gelu", debug=debug, features=features)
+            Residual(ctx=ctx, dims=dims, head=head, act="gelu", debug=debug, features=features, focus=False)
             for _ in range(layer)])  
         
         self.blend = nn.Parameter(torch.tensor(0.5))
