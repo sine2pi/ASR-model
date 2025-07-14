@@ -3,12 +3,13 @@ For research/testing.
 
 Moving beyond literal transcription toward something more artistic and creative.
 
-On a road to build a "creative" speech-to-text model that can:
-Generate stories from audio
-Make poetic associations
-Fill in gaps with imagination
-Create richer, more expressive text..
-Seperate the sad Morrissey songs from the two that arn't.. 
+      On a road to build a "creative" speech-to-text model that can:
+      
+      -Generate stories from audio
+      -Make poetic associations
+      -Fill in gaps with imagination
+      -Create richer, more expressive text..
+      -Seperate the sad Morrissey songs from the two that arn't.. 
 
 
 ----
