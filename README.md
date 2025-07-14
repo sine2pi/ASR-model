@@ -23,6 +23,8 @@ Questions:
    -Does pitch-conditioning improve speech recognition?
 
    Standard RoPE was designed for text: Text doesn't have pitch, timing, or acoustic properties.
+   Xpos is an artificial generic decay. This takes its place with something more meaningful.
+   
    
 ---
 
