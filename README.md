@@ -1,5 +1,16 @@
 NLP/ASR multimodal modal with f0 modulated relative positional embeddings. 
 For research/testing.
+
+Moving beyond literal transcription toward something more artistic and creative.
+
+On a road to build a "creative" speech-to-text model that can:
+Generate stories from audio
+Make poetic associations
+Fill in gaps with imagination
+Create richer, more expressive text..
+Seperate the sad Morrissey songs from the two that arn't.. 
+
+
 ----
 
 Questions:
@@ -12,8 +23,7 @@ Questions:
 
    Standard RoPE was designed for text: Text doesn't have pitch, timing, or acoustic properties.
    
-----
-
+---
 
 
 
