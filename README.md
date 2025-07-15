@@ -1,18 +1,6 @@
-NLP/ASR multimodal modal with f0 modulated relative positional embeddings. 
-For research/testing.
+NLPASR multimodal modal with f0 modulated relative positional embeddings. 
+For researchtesting.
 
-Moving beyond literal transcription toward something more artistic and creative.
-
-      On a road to build a "creative" speech-to-text model that can:
-      
-      -Generate stories from audio
-      -Make poetic associations
-      -Fill in gaps with imagination
-      -Create richer, more expressive text..
-      -Seperate the sad Morrissey songs from the two that arn't.. 
-
-
-----
 
 Questions:
 
@@ -30,69 +18,114 @@ Questions:
 
 
 
-<img width="780" alt="cc5" src="https://github.com/user-attachments/assets/106ebe75-f1db-4f85-bdae-818b114fedd2"  />
+<img width="780" alt="cc5" src="https:github.comuser-attachmentsassets106ebe75-f1db-4f85-bdae-818b114fedd2"  >
 
-This plot illustrates the pattern similiarity of pitch waveform and spectrogram. (librispeech - clean).
+This plot illustrates the pattern similiarity of pitch waveform and spectrogram. librispeech - clean.
 
 To explore the relationship between pitch and rotary embeddings, the model implements three complementary pitch based enhancements:
 
-1. Pitch modulated theta Pitch (f0) is used to modify the theta parameter, dynamically adjusting the rotary frequency.
+1. Pitch modulated theta Pitch f0 is used to modify the theta parameter, dynamically adjusting the rotary frequency.
 2. Direct similarity bias: A pitch based similarity bias is added directly to the attention mechanism.
-3. Variable radii in torch.polar: The unit circle radius (1.0) in the torch.polar calculation is replaced with variable radii derived from f0. This creates acoustically-weighted positional encodings, so each position in the embedding space reflects the acoustic prominence in the original speech. This approach effectively adds phase and amplitutde information without significant computational overhead.
+3. Variable radii in torch.polar: The unit circle radius 1.0 in the torch.polar calculation is replaced with variable radii derived from f0. This creates acoustically-weighted positional encodings, so each position in the embedding space reflects the acoustic prominence in the original speech. This approach effectively adds phase and amplitutde information without significant computational overhead.
 
 The function `torch.polar` constructs a complex tensor from polar coordinates:
 
 ````python
-# torch.polar(magnitude, angle) returns:
-result = magnitude * (torch.cos(angle) + 1j * torch.sin(angle))
+# torch.polarmagnitude, angle returns:
+result = magnitude * torch.cosangle + 1j * torch.sinangle
 ````
 
 So, for each element:
-- magnitude is the modulus (radius, r)
-- angle is the phase (theta, in radians)
-- The result is: `r * exp(i * theta) = r * (cos(theta) + i * sin(theta))`
+- magnitude is the modulus radius, r
+- angle is the phase theta, in radians
+- The result is: `r * expi * theta = r * costheta + i * sintheta`
 
-Reference: [PyTorch Documentation - torch.polar](https://pytorch.org/docs/stable/generated/torch.polar.html)
+Reference: [PyTorch Documentation - torch.polar]https:pytorch.orgdocsstablegeneratedtorch.polar.html
 
 Here are the abbreviated steps for replacing theta and radius in the rotary forward:
 
 ```python
 
-f0 = f0.to(device, dtype) # feature extracted during processing
+f0 = f0.todevice, dtype # feature extracted during processing
 if f0 is not None:
-    if f0.dim() == 2:
-        f0 = f0.squeeze(0) 
+    if f0.dim == 2:
+        f0 = f0.squeeze0 
     theta = f0 + self.theta  
 else:
     theta = self.theta 
 
 ## In text, theta=10,000 sets the base frequency for positional encoding, ensuring a wide range of periodicities for long sequences. I'm not sure if the specific number 10k was experimentally derived.
-## For audio, especially speech, the relevant periodicities are determined by the pitch (f0 neighborhood or f0 per frame) might be more meaningful. 
+## For audio, especially speech, the relevant periodicities are determined by the pitch f0 neighborhood or f0 per frame might be more meaningful. 
 
-freqs = (theta.unsqueeze(-1) / 220.0) * 700 * (
-    torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), 
-            self.dim // 2, device=theta.device, dtype=theta.dtype) / 2595) - 1) / 1000
+freqs = theta.unsqueeze-1  220.0 * 700 * 
+    torch.pow10, torch.linspace0, 2595 * torch.log10torch.tensor1 + 8000700, 
+            self.dim  2, device=theta.device, dtype=theta.dtype  2595 - 1  1000
 
-## This seems to give better results compared to the standard freqs = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim)).
+## This seems to give better results compared to the standard freqs = 1.  theta  torch.arange0, dim, 2[:dim  2].float  dim.
 ## I thought a mel-scale version might be more perceptually meaningful for audio.. ie. using mel-scale to create a perceptually-relevant distance metric instead of Euclidean distance.
 
-t = torch.arange(ctx, device=device, dtype=dtype)
+t = torch.arangectx, device=device, dtype=dtype
 freqs = t[:, None] * freqs  # dont repeat or use some other method here 
 
 if self.radii and f0 is not None:
-    radius = f0.to(device, dtype)
-    freqs = torch.polar(radius.unsqueeze(-1), freqs)
+    radius = f0.todevice, dtype
+    freqs = torch.polarradius.unsqueeze-1, freqs
 else:
-    radius = torch.ones_like(freqs)
-    freqs = torch.polar(radius, freqs)
+    radius = torch.ones_likefreqs
+    freqs = torch.polarradius, freqs
 
+```
+
+            
+            For f0: Phase Accumulation
+            
+            - F0 as Instantaneous Frequency:  
+              Your F0 track F0_{raw,t} represents the fundamental frequency at each time step t.
+            
+            - Angular Frequency:  
+              Convert F0,t to angular frequency omega_t using the relationship:  
+              omega_t = 2pi F0,t  
+              This gives you radians per second.
+            
+            - Phase Change:  
+              To get the phase change Delta phi_t between the current frame t and the previous frame t-1, you multiply the angular    
+              frequency by the time duration of your frame T_{frame}:  
+              Delta phi_t = omega_t cdot T_{frame} = 2pi F0{raw,t} cdot T_{frame}.
+            
+            - Accumulated Phase:  
+              The actual phase angle phi_t for the current frame t would then be the accumulated sum of these phase changes:  
+              phi_t = phi_{t-1} + Delta phi_t.
+            
+            ---
+            
+            Practical Equation for the Rotation Angle phi:
+            
+            Let:  
+            - F0{raw,t} be the fundamental frequency in Hz at time t.  
+            - T{frame} be the duration of each time frame in seconds e.g., 10 ms = 0.01 seconds.  
+            - phi_0 be an initial phase offset could be 0 or learned.
+            
+            Then, the rotation angle phi_t for each time step t can be calculated as:  
+            [
+            phi_t = phi_{t-1} + 2pi F0{raw,t} cdot T_{frame}
+            ]
+            
+
+```python
+
+    def accumulate_phase(self, f0, t_frame, phi0=0.0):
+        omega = 2 * torch.pi * f0
+        dphi = omega * t_frame
+        phi = torch.cumsum(dphi, dim=0) + phi0
+        phi = torch.remainder(phi, 2 * torch.pi) 
+        return phi
 ```
 
 A closer look at whats going on. Here is a slice of the actual radius values for one step
       
-      [encoder] [Radius] torch.Size([454]) 92.32 [Theta] 10092.01 [f0] torch.Size([454]) [Freqs] torch.Size([454, 64]) 2.17+1.17j [ctx] 454
+      [encoder] [Radius] torch.Size[454] 92.32 [Theta] 10092.01 [f0] torch.Size[454] [Freqs] torch.Size[454, 64] 2.17+1.17j [ctx] 454
       
-     [encoder] [Radius] tensor([  0.0000,   0.0000,   0.0000,   0.0000,   0.0000,   0.0000,   0.0000,
+     [encoder] [Radius] tensor[  0.0000,   0.0000,   0.0000,   0.0000,   0.0000,   0.0000,   0.0000,
              0.0000,   0.0000,   0.0000,   0.0000,   0.0000,   0.0000,   0.0000,
              0.0000,   0.0000,   0.0000,   0.0000,   0.0000,   0.0000,   0.0000,
              0.0000,   0.0000,   0.0000,   0.0000,   0.0000,   0.0000,   0.0000,
@@ -157,14 +190,14 @@ A closer look at whats going on. Here is a slice of the actual radius values for
              0.0000,   0.0000,   0.0000,   0.0000,   0.0000,   0.0000,   0.0000,
              0.0000, 195.8783, 145.3826,   0.0000,   0.0000,   0.0000,   0.0000,
              0.0000,   0.0000,   0.0000,   0.0000,   0.0000,   0.0000],
-          device='cuda:0')
+          device='cuda:0'
           
 What the Radius Values Tell Us:
 
 1. Speech Structure is Clear
    
-         Zeros: Silence/unvoiced segments (no pitch)
-         Non-zero values: Voiced speech segments (with pitch)
+         Zeros: Silenceunvoiced segments no pitch
+         Non-zero values: Voiced speech segments with pitch
          Pattern: 0.0000 → 283.7590 → 0.0000 → 220.4299
 
 2. Pitch Range is Realistic
@@ -175,13 +208,13 @@ What the Radius Values Tell Us:
 
 3. Temporal Dynamics
    
-         Clusters: Pitch values cluster together (natural speech)
+         Clusters: Pitch values cluster together natural speech
          Transitions: Smooth changes between values
          Silence gaps: Natural pauses in speech
 
-         Silence detection: 0.0000 = no pitch (silence/unvoiced)
+         Silence detection: 0.0000 = no pitch silenceunvoiced
          Pitch extraction: 283.7590 = actual f0 values
-         Speech segmentation: Clear boundaries between voiced/unvoiced
+         Speech segmentation: Clear boundaries between voicedunvoiced
          
          Realistic values: 145-365 Hz is normal speech range
          Proper structure: Matches natural speech patterns
@@ -189,12 +222,12 @@ What the Radius Values Tell Us:
 
 The Complex Frequency Result:
 
-      [Freqs] torch.Size([454, 64]) 2.17+1.17j
+      [Freqs] torch.Size[454, 64] 2.17+1.17j
 
 This means:
 
-      Magnitude: sqrt(2.17² + 1.17²) ≈ 2.5
-      Phase: atan2(1.17, 2.17) ≈ 0.49 radians
+      Magnitude: sqrt2.17² + 1.17² ≈ 2.5
+      Phase: atan21.17, 2.17 ≈ 0.49 radians
       
       Variable radius: Each frame has different magnitude
 
@@ -213,44 +246,44 @@ The Pattern Makes Sense:
 
 ----
 
-Approximation methods like using cos/sin projections or fixed rotation matrices typically assume a unit circle (radius=1.0) or only rotate, not scale. When we introduce a variable radius, those approximations break down and can't represent the scaling effect, only the rotation. When using a variable radius, we should use true complex multiplication to get correct results. Approximations that ignore the radius or scale after the rotation don't seem to capture the intended effect, leading to degraded or incorrect representations from my tests so far.
+Approximation methods like using cossin projections or fixed rotation matrices typically assume a unit circle radius=1.0 or only rotate, not scale. When we introduce a variable radius, those approximations break down and can't represent the scaling effect, only the rotation. When using a variable radius, we should use true complex multiplication to get correct results. Approximations that ignore the radius or scale after the rotation don't seem to capture the intended effect, leading to degraded or incorrect representations from my tests so far.
 
 ```python
 
 ### Do not approximate:
-#     radius = radius.unsqueeze(-1).expand_as(x_rotated[..., ::2])
+#     radius = radius.unsqueeze-1.expand_asx_rotated[..., ::2]
 #     x_rotated[..., ::2] = x_rotated[..., ::2] * radius
 #     x_rotated[..., 1::2] = x_rotated[..., 1::2] * radius
 
 ### 
-    def apply_rotary(x, freqs):
+    def apply_rotaryx, freqs:
         x1 = x[..., :freqs.shape[-1]*2]
         x2 = x[..., freqs.shape[-1]*2:]
         orig_shape = x1.shape
         if x1.ndim == 2:
-            x1 = x1.unsqueeze(0)
-        x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
-        x1 = torch.view_as_complex(x1) * freqs
-        x1 = torch.view_as_real(x1).flatten(-2)
-        x1 = x1.view(orig_shape)
-        return torch.cat([x1.type_as(x), x2], dim=-1)
+            x1 = x1.unsqueeze0
+        x1 = x1.float.reshape*x1.shape[:-1], -1, 2.contiguous
+        x1 = torch.view_as_complexx1 * freqs
+        x1 = torch.view_as_realx1.flatten-2
+        x1 = x1.vieworig_shape
+        return torch.cat[x1.type_asx, x2], dim=-1
 ```
-This approach respects both the rotation (phase) and the scaling (radius) for each token/head, so the rotary embedding is applied when the radius varies.
+This approach respects both the rotation phase and the scaling radius for each tokenhead, so the rotary embedding is applied when the radius varies.
 
-<img width="780" alt="cc4" src="https://github.com/user-attachments/assets/165a3f18-659a-4e2e-a154-a3456b667bae"  />
+<img width="780" alt="cc4" src="https:github.comuser-attachmentsassets165a3f18-659a-4e2e-a154-a3456b667bae"  >
 
 Each figure shows 4 subplots one for each of the first 4 dimensions of your embeddings in the test run. These visualizations show how pitch information modifies position encoding patterns in the model.
 
 In each subplot:
 
-- Thick solid lines: Standard RoPE rotations for even dimensions (no F0 adaptation)
-- Thick dashed lines: Standard RoPE rotations for odd dimensions (no F0 adaptation)
+- Thick solid lines: Standard RoPE rotations for even dimensions no F0 adaptation
+- Thick dashed lines: Standard RoPE rotations for odd dimensions no F0 adaptation
 - Thin solid lines: F0 RoPE rotations for even dimensions
 - Thin dashed lines: F0 RoPE rotations for odd dimensions
 
 1. Differences between thick and thin lines: This shows how much the F0 information is modifying the standard position encodings. Larger differences indicate stronger F0 adaptation.
 
-2. Pattern changes: The standard RoPE (thick lines) show regular sinusoidal patterns, while the F0 RoPE (thin lines) show variations that correspond to the audio's pitch contour.
+2. Pattern changes: The standard RoPE thick lines show regular sinusoidal patterns, while the F0 RoPE thin lines show variations that correspond to the audio's pitch contour.
 
 3. Dimension specific effects: Compared across four subplots to see if F0 affects different dimensions differently.
 
@@ -259,19 +292,19 @@ In each subplot:
 The patterns below show how positions "see" each other in relation to theta and f0. 
 
 Bright diagonal line: Each position matches itself perfectly.
-Wider bright bands: Positions can "see" farther (good for long dependencies) but can be noisy.
-Narrow bands: More focus on nearby positions (good for local patterns)
+Wider bright bands: Positions can "see" farther good for long dependencies but can be noisy.
+Narrow bands: More focus on nearby positions good for local patterns
 
-<img width="680" alt="cc" src="https://github.com/user-attachments/assets/28d00fc5-2676-41ed-a971-e4d857af43f8"  />
-<img width="680" alt="cc2" src="https://github.com/user-attachments/assets/9089e806-966b-41aa-8793-bee03a6e6be1"  />
+<img width="680" alt="cc" src="https:github.comuser-attachmentsassets28d00fc5-2676-41ed-a971-e4d857af43f8"  >
+<img width="680" alt="cc2" src="https:github.comuser-attachmentsassets9089e806-966b-41aa-8793-bee03a6e6be1"  >
 
 ----
-https://huggingface.co/Sin2pi/Echo17/tensorboard?params=scalars
+https:huggingface.coSin2piEcho17tensorboard?params=scalars
 
 ----
 
 This model sometimes uses :
 
-https://github.com/sine2pi/Maxfactor
+https:github.comsine2piMaxfactor
 
 MaxFactor is a custom PyTorch optimizer with adaptive learning rates and specialized handling for matrix parameters. I wrote it for the model in the asr_model repository. I needed something that performs well and has a light memory foot print since I do everything from my laptop.
