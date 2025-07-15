@@ -421,12 +421,9 @@ class rotary(nn.Module):
         f0 = enc.get("f0") if enc is not None else None 
         f0t = enc.get("f0t") if enc is not None else None 
         f0 = self.check_f0(f0, f0t, ctx)
-
         theta = f0 + self.theta if f0 is not None else self.theta
-
-        theta = f0
+        # theta = f0
         freqs = self.theta_freqs(theta)
-
         t = torch.arange(ctx, device=device, dtype=dtype)
         freqs = t[:, None] * freqs
         freqs, radius = self._apply_radii(freqs, f0, ctx)
@@ -1417,8 +1414,8 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, f0=True, f0t=
 
     if f0:
         f0_tensor = torch.from_numpy(f0_np)
-        t_frame = torch.mean(t[1:] - t[:-1])
-        f0_tensor = accumulate_phase_mod(f0_tensor, t_frame)
+        # t_frame = torch.mean(t[1:] - t[:-1])
+        # f0_tensor = accumulate_phase_mod(f0_tensor, t_frame)
  
     if f0t:
         audio_duration = len(wavnp) / sample_rate
@@ -1441,7 +1438,7 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, f0=True, f0t=
         pitch_tok[pitch_tok < 100.0] = 0.0
         bos_pitch = pitch_tok[0] if len(pitch_tok) > 0 else 0.0
         f0t_tensor = torch.from_numpy(np.concatenate([[bos_pitch], pitch_tok]))
-        f0t_tensor = accumulate_phase_mod(f0t_tensor, t_frame)
+        # f0t_tensor = accumulate_phase_mod(f0t_tensor, t_frame)
 
     if pitch:
         p_tensor = torch.from_numpy(f0_np)
