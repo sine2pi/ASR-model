@@ -32,6 +32,13 @@ dtype = torch.float32
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
+PATH = 'E:/hf'
+os.environ['HF_HOME'] = PATH
+os.environ['HF_DATASETS_CACHE'] = PATH
+os.environ['TORCH_HOME'] = PATH
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 def get_activation(act: str) -> nn.Module:
     """Get activation function by name."""
     act_map = {
@@ -266,32 +273,33 @@ def get_dtype():
 def tox():
     return {"device": get_device(), "dtype": get_dtype()}
 
-class sinus(nn.Module):
-    def __init__(self, ctx: int, dims: int):
+class Sinusoids(nn.Module):
+    def __init__(self, length, channels, max_tscale=10000):
         super().__init__()
-
-        position = torch.arange(start=0, end=ctx, dtype=dtype).unsqueeze(dim=1)
-        div_term = torch.exp(input=torch.arange(start=0, end=dims, step=2, dtype=dtype) * -(math.log(10000.0) / dims))
-        features = torch.zeros(ctx, dims)
-        features[:, 0::2] = torch.sin(position * div_term)
-        features[:, 1::2] = torch.cos(position* div_term)
-        self.register_buffer('sinusoid', tensor=features)
-        self.positional_embeddings = nn.Parameter(self.sinusoid.clone())
+        assert channels % 2 == 0
+        log_tscale_increment = np.log(max_tscale) / (channels // 2 - 1)
+        inv_tscales = torch.exp(-log_tscale_increment * torch.arange(channels // 2))
+        scaled_t = torch.arange(length)[:, None] * inv_tscales[None, :]
+        pos1 = torch.sin(scaled_t)
+        pos2 = torch.cos(scaled_t)
+        positions = torch.cat([pos1, pos2], dim=1) 
+        self.embedding = nn.Embedding.from_pretrained(positions, freeze=False)
     def forward(self, positions):
-        position_embeddings = self.positional_embeddings[positions]
-        return position_embeddings
+        return self.embedding(positions)
 
 def sinusoids(length, channels, max_tscale=10000):
     assert channels % 2 == 0
     log_tscale_increment = np.log(max_tscale) / (channels // 2 - 1)
     inv_tscales = torch.exp(-log_tscale_increment * torch.arange(channels // 2))
-    scaled_t = torch.arange(length)[:, np.newaxis] * inv_tscales[np.newaxis, :]
-    return torch.cat([torch.sin(scaled_t), torch.cos(scaled_t)], dim=1)
+    scaled_t = torch.arange(length)[:, None] * inv_tscales[None, :]
+    pos1 = torch.sin(scaled_t)
+    pos2 = torch.cos(scaled_t)
+    positions = torch.cat([pos1, pos2], dim=1)
+    return nn.Parameter(positions.clone())
 
 class rotary(nn.Module):
-    def __init__(self, dims, head, max_ctx=1500, radii=True, debug: List[str] = [], use_pbias=False):
+    def __init__(self, dims, head, max_ctx=1500, radii=True, debug: List[str] = [], use_pbias=False, use_2d_axial=False, spec_shape=None, use_true_2d_relative=False, freq_bins=None):
         super(rotary, self).__init__()
-
         self.use_pbias = use_pbias
         self.dims = dims
         self.head = head
@@ -302,10 +310,42 @@ class rotary(nn.Module):
         self.counter = 0
         self.last_theta = None
 
+        self.use_2d_axial = use_2d_axial
+        if use_2d_axial and spec_shape is not None:
+            time_frames, freq_bins = spec_shape
+            self.time_frames = time_frames
+            self.freq_bins = freq_bins
+            time_theta = 50.0
+            time_freqs = 1.0 / (time_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+            self.register_buffer('time_freqs', time_freqs)
+            freq_theta = 100.0
+            freq_freqs = 1.0 / (freq_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+            self.register_buffer('freq_freqs', freq_freqs)
+
         self.bias = nn.Parameter(torch.zeros(max_ctx, dims // 2), requires_grad=True if use_pbias else False)
         theta = (torch.tensor(10000, device=device, dtype=dtype))
         self.theta = nn.Parameter(theta, requires_grad=True)    
         self.theta_values = []
+
+        self.use_true_2d_relative = use_true_2d_relative
+        self.freq_bins = freq_bins
+        self.true2d_dim = (dims // head) // 2
+        self.omega_t = nn.Parameter(torch.randn(self.true2d_dim))
+        self.omega_f = nn.Parameter(torch.randn(self.true2d_dim))
+
+    def axial_freqs(self, seq_len):
+        if not self.use_2d_axial:
+            return None
+        time_frames = self.time_frames
+        freq_bins = self.freq_bins
+        t = torch.arange(seq_len, device=device, dtype=dtype)
+        t_x = (t % time_frames).float()
+        t_y = torch.div(t, time_frames, rounding_mode='floor').float()
+        freqs_x = torch.outer(t_x, self.time_freqs)
+        freqs_y = torch.outer(t_y, self.freq_freqs)
+        freqs_cis_x = torch.polar(torch.ones_like(freqs_x), freqs_x)
+        freqs_cis_y = torch.polar(torch.ones_like(freqs_y), freqs_y)
+        return torch.cat([freqs_cis_x, freqs_cis_y], dim=-1)
 
     def mel_scale_scalar(self, freq: float) -> float:
         return 1127.0 * math.log(1.0 + freq / 700.0)
@@ -328,7 +368,6 @@ class rotary(nn.Module):
         freq = (theta.unsqueeze(-1) / 220.0) * 700 * (
             torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), 
                     self.dim // 2, device=theta.device, dtype=theta.dtype) / 2595) - 1) / 1000
-
         return freq
 
     def _apply_radii(self, freqs, f0, ctx):
@@ -347,32 +386,37 @@ class rotary(nn.Module):
             return torch.polar(torch.ones_like(freqs), freqs), None
 
     def check_f0(self, f0, f0t, ctx):
-        if f0 is not None and f0.shape[1] == ctx:
+        if f0 is not None and f0.dim() == 2:
+            f0 = f0.squeeze(0) 
+        if f0t is not None and f0t.dim() == 2:
+            f0t = f0t.squeeze(0) 
+
+        if f0 is not None and f0.shape[0] == ctx:
             return f0
-        elif f0t is not None and f0t.shape[1] == ctx:
+        elif f0t is not None and f0t.shape[0] == ctx:
             return f0t
         else:
             return None         
 
     def forward(self, x=None, enc=None, layer=None, feature=None) -> Tensor:
-        ctx=x
+        ctx = x
+        if self.use_2d_axial and feature == "spectrogram":
+            freqs_2d = self.axial_freqs(ctx)
+            if freqs_2d is not None:
+                return freqs_2d.unsqueeze(0)
+
         f0 = enc.get("f0") if enc is not None else None 
         f0t = enc.get("f0t") if enc is not None else None 
-
         f0 = self.check_f0(f0, f0t, ctx)
-        if f0 is not None:
-            if f0.dim() == 2:
-                f0 = f0.squeeze(0) 
-            theta = f0 + self.theta  
-        else:
-            theta = self.theta 
+        theta = f0 + self.theta if f0 is not None else self.theta
         freqs = self.theta_freqs(theta)
         t = torch.arange(ctx, device=device, dtype=dtype)
         freqs = t[:, None] * freqs
         freqs, radius = self._apply_radii(freqs, f0, ctx)
-
+        
         if "radius" in self.debug and self.counter == 10:
-            print(f"  [{layer}] [Radius] {radius.shape if radius is not None else None} {radius.mean() if radius is not None else None} [Theta] {theta.mean() if theta is not None else None} [f0] {f0.shape if f0 is not None else None} [Freqs] {freqs.shape} {freqs.mean():.2f} [ctx] {ctx}")
+            print(f"  [{layer}] [Radius] {radius.shape if radius is not None else None} {radius.mean() if radius is not None else None} [Theta] {theta.mean() if theta is not None else None} [f0] {f0.shape if f0 is not None else None}  [ctx] {ctx}")
+
         self.counter += 1
         return freqs.unsqueeze(0)
 
@@ -389,19 +433,114 @@ class rotary(nn.Module):
         x1 = x1.view(orig_shape)
         return torch.cat([x1.type_as(x), x2], dim=-1)
 
+    # @staticmethod
+    # def apply_rotary(x, freqs):
+    #     # x: [batch, head, seq, head_dim]
+    #     # freqs: [1, seq, head_dim] or [1, seq, 2*head_dim] for 2D
+    #     if freqs.shape[-1] == x.shape[-1]:
+    #         # 1D rotary
+    #         x1 = x
+    #         orig_shape = x1.shape
+    #         if x1.ndim == 2:
+    #             x1 = x1.unsqueeze(0)
+    #         x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
+    #         x1 = torch.view_as_complex(x1) * freqs
+    #         x1 = torch.view_as_real(x1).flatten(-2)
+    #         x1 = x1.view(orig_shape)
+    #         return x1.type_as(x)
+    #     else:
+    #         # 2D rotary: split x and apply to each axis
+    #         head_dim = x.shape[-1] // 2
+    #         x_time = x[..., :head_dim]
+    #         x_freq = x[..., head_dim:]
+    #         f_time = freqs[..., :head_dim]
+    #         f_freq = freqs[..., head_dim:]
+    #         # Apply rotary to each axis
+    #         def apply_axis(xa, freqs):
+    #             orig_shape = xa.shape
+    #             xa = xa.float().reshape(*xa.shape[:-1], -1, 2).contiguous()
+    #             xa = torch.view_as_complex(xa) * freqs
+    #             xa = torch.view_as_real(xa).flatten(-2)
+    #             xa = xa.view(orig_shape)
+    #             return xa.type_as(x)
+    #         x_time = apply_axis(x_time, f_time)
+    #         x_freq = apply_axis(x_freq, f_freq)
+    #         return torch.cat([x_time, x_freq], dim=-1)
+
+    # def true2d_relative_angle(self, t_q, f_q, t_k, f_k):
+    #     # t_q, f_q, t_k, f_k: [seq]
+    #     delta_t = t_q[:, None] - t_k[None, :]  # [seq, seq]
+    #     delta_f = f_q[:, None] - f_k[None, :]  # [seq, seq]
+    #     angle = delta_t[..., None] * self.omega_t + delta_f[..., None] * self.omega_f  # [seq, seq, true2d_dim]
+    #     angle = torch.cat([angle, angle], dim=-1)  # [seq, seq, head_dim]
+    #     return angle
+
+    # def true2d_apply_rotary(self, q, k, freqs):
+    #     # q, k: [batch, head, seq, head_dim]
+    #     # freqs: [seq, seq, head_dim//2] complex, or [seq, seq, head_dim] if you want
+    #     b, h, seq, d = q.shape
+    #     d2 = d // 2
+    #     q_exp = q.unsqueeze(3).expand(b, h, seq, seq, d)
+    #     k_exp = k.unsqueeze(2).expand(b, h, seq, seq, d)
+    #     # Convert to complex
+    #     def to_complex(x):
+    #         return torch.complex(x[..., 0::2], x[..., 1::2])  # [b, h, seq, seq, d2]
+    #     q_c = to_complex(q_exp)
+    #     k_c = to_complex(k_exp)
+    #     # Multiply by freqs (which should be [seq, seq, d2] complex)
+    #     q_rot = q_c * freqs
+    #     k_rot = k_c * freqs
+    #     # Back to real
+    #     def to_real(x):
+    #         return torch.stack([x.real, x.imag], dim=-1).flatten(-2)
+    #     q_rot = to_real(q_rot)
+    #     k_rot = to_real(k_rot)
+    #     return q_rot, k_rot
+
+def parallel_slice(self, q, k, v, mask=None):
+    batch, head, ctx, dims = q.shape
+    head_dim = self.head_dim
+    batch, ctx, dims = q.shape
+    ctx_len = k.shape[1]
+    head = dims // head_dim
+
+    scores = torch.zeros(batch, head, ctx, ctx_len, device=q.device)
+    
+    for h in range(head):
+        start_idx = h * head_dim
+        end_idx = start_idx + head_dim
+        q_h = q[:, :, start_idx:end_idx]
+        k_h = k[:, :, start_idx:end_idx]
+        
+        scores[:, h] = torch.bmm(q_h, k_h.transpose(1, 2)) / math.sqrt(head_dim)
+    
+    if mask is not None:
+        scores = scores + mask.unsqueeze(0).unsqueeze(0)
+        
+    attn_weights = F.softmax(scores, dim=-1)
+    
+    output = torch.zeros_like(q)
+    for h in range(head):
+        start_idx = h * head_dim
+        end_idx = start_idx + head_dim
+        v_h = v[:, :, start_idx:end_idx]
+        output[:, :, start_idx:end_idx] = torch.bmm(attn_weights[:, h], v_h)
+    return output    
+
 class MultiheadA(nn.Module):
-
-    rbf = False
     def __init__(self, dims: int, head: int, rotary_emb: bool = True, 
-                 zero_val: float = 1e-7, minz: float = 1e-8, maxz: float = 1e-6, debug: List[str] = [], optim_attn=False, use_pbias=False):
+                 zero_val: float = 1e-7, minz: float = 1e-8, maxz: float = 1e-6, debug: List[str] = [], optim_attn=False, use_pbias=False, use_true_2d_relative=False, freq_bins=None, radii=False, use_2d_axial=False, spec_shape=None, rbf=False):
+                 
         super(MultiheadA, self).__init__()
-
         self.dims = dims
         self.head = head
         self.head_dim = dims // head
         self.debug = debug
         self.counter = 0
         self.use_pbias = use_pbias
+        self.use_true_2d_relative = use_true_2d_relative
+        self.freq_bins = freq_bins
+        self.rbf = rbf
 
         self.q = nn.Linear(dims, dims).to(device, dtype)
         self.k = nn.Linear(dims, dims, bias=False).to(device, dtype)
@@ -421,8 +560,10 @@ class MultiheadA(nn.Module):
                 dims=dims,
                 head=head,
                 debug=debug,
-                radii=True,
-                )
+                radii=radii,
+                use_true_2d_relative=use_true_2d_relative,
+                freq_bins=freq_bins,
+            )
         else:
             self.rope = None
 
@@ -466,8 +607,23 @@ class MultiheadA(nn.Module):
             q2 = q.shape[2]
             k2 = k.shape[2]
 
-            q = self.rope.apply_rotary(q, (self.rope(x=q2, enc=enc, layer=layer)))
-            k = self.rope.apply_rotary(k, (self.rope(x=k2, enc=enc, layer=layer)))
+            if self.use_true_2d_relative and feature == "spectrogram":
+                seq_len = q2
+                freq_bins = self.freq_bins
+                idxs = torch.arange(seq_len, device=q.device)
+                t_idx = idxs // freq_bins
+                f_idx = idxs % freq_bins
+                angle = self.rope.true2d_relative_angle(t_idx, f_idx, t_idx, f_idx)
+                q_rot, k_rot = self.rope.true2d_apply_rotary(q, k, angle)
+                scale = (self.dims // self.head) ** -0.25
+                qk = (q_rot * scale * k_rot * scale).sum(-1)
+                w = F.softmax(qk, dim=-1).to(q.dtype)
+                wv = torch.einsum('bhij,bhjd->bhid', w, v.unsqueeze(2).expand(-1, -1, seq_len, -1, -1))
+                wv = wv.permute(0, 2, 1, 3).flatten(start_dim=2)
+                return self.o(wv), qk
+            else:
+                q = self.rope.apply_rotary(q, (self.rope(x=q2, enc=enc, layer=layer)))
+                k = self.rope.apply_rotary(k, (self.rope(x=k2, enc=enc, layer=layer)))
         else:
             q = q.view(*q.shape[:2], self.head, -1).permute(0, 2, 1, 3)
             k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
@@ -481,6 +637,9 @@ class MultiheadA(nn.Module):
             pbias = self.rope.pitch_bias(f0 = enc.get("f0", None) if enc is not None else None) 
             if pbias is not None:
                 qk = qk + pbias[:,:,:q2,:q2]
+
+        if mask is not None:
+            mask = mask[:q2, :q2]
 
         token_ids = k[:, :, :, 0]
         zscale = torch.ones_like(token_ids)
@@ -643,31 +802,28 @@ class FEncoder(nn.Module):
         if use_rope:
             if spec_shape is not None:
                 self.rope = rotary(
-                    dims=self.head_dim,
-                    head=self.head,
+                    dims=dims,
+                    head=head,
                     use_2d_axial=True,
                     spec_shape=spec_shape, debug=[])
             else:
                 self.rope = rotary(
-                    dims=self.head_dim,
-                    head=self.head,
+                    dims=dims,
+                    head=head,
                     use_2d_axial=False, debug=[])
         else:
             self.rope = None
-            self.positional = lambda length: sinusoids(length, dims)
+            self.sinusoid_pos = lambda length, dims: sinusoids(length, dims, max_tscale=10000)
             
         self.norm = RMSNorm(dims)
-        self._norm = RMSNorm(dims)
 
     def apply_rope_to_features(self, x, layer=None, feature=None):
-        if feature in ["envelope", "phase"]:
-            feature = "spectrogram"
         batch, ctx, dims = x.shape
         x = x.view(batch, ctx, self.head, self.head_dim).permute(0, 2, 1, 3)
-        if feature_type == "spectrogram" and self.rope is not None:
-            rope_freqs = self.rope(ctx, layer=layer, input_type="spectrogram")
+        if feature == "spectrogram" and self.rope is not None:
+            rope_freqs = self.rope(ctx, layer=layer, feature="spectrogram")
         else:
-            rope_freqs = self.rope(ctx, layer=layer, input_type="audio")
+            rope_freqs = self.rope(ctx, layer=layer, feature="audio")
         x = self.rope.apply_rotary(x, rope_freqs)
         x = x.permute(0, 2, 1, 3).contiguous().view(batch, ctx, dims)
         return x
@@ -677,10 +833,9 @@ class FEncoder(nn.Module):
         if self.use_rope:
             x = self.apply_rope_to_features(x, layer=layer, feature=feature)
         else:
-            x = x + self.positional(x.shape[1]).to(x.device, x.dtype)
+            x = x + self.sinusoid_pos(x.shape[1], x.shape[-1]).to(x.device, x.dtype)
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
-        x = self._norm(x)
-        return x
+        return self.norm(x)
 
 class WEncoder(nn.Module):
     def __init__(self, input_dims, dims, head, layer, kernel_size, act, use_rope=False):
@@ -693,7 +848,6 @@ class WEncoder(nn.Module):
         self.dims = dims
         
         act_fn = get_activation(act)
-        
         self.downsample = nn.Sequential(
             Conv1d(input_dims, dims//8, kernel_size=15, stride=8, padding=7), act_fn,
             Conv1d(dims//8, dims//4, kernel_size=7, stride=4, padding=3), act_fn,
@@ -709,7 +863,7 @@ class WEncoder(nn.Module):
                 debug=[])
         else:
             self.rope = None
-            self.positional = lambda length: sinusoids(length, dims)
+            self.sinusoid_pos = lambda length, dims: sinusoids(length, dims, max_tscale=10000)   
         self.norm = RMSNorm(dims)
 
     def apply_rope_to_features(self, x, layer=None, feature=None):
@@ -729,7 +883,7 @@ class WEncoder(nn.Module):
         if self.use_rope:
             x = self.apply_rope_to_features(x, layer=layer)
         else:
-            x = x + self.positional(x.shape[1]).to(x.device, x.dtype)
+            x = x + self.sinusoid_pos(x.shape[1], x.shape[-1]).to(x.device, x.dtype)
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
         return self.norm(x)
 
@@ -757,7 +911,7 @@ class PEncoder(nn.Module):
                 debug=[])
         else:
             self.rope = None
-            self.positional = lambda length: sinusoids(length, dims)
+            self.sinusoid_pos = lambda length, dims: sinusoids(length, dims, max_tscale=10000)
         self.norm = RMSNorm(dims)
 
     def apply_rope_to_features(self, x, layer=None, feature=None):
@@ -775,20 +929,15 @@ class PEncoder(nn.Module):
         if self.use_rope:
             x = self.apply_rope_to_features(x, layer=layer)
         else:
-            x = x + self.positional(x.shape[1]).to(x.device, x.dtype)
+            x = x + self.sinusoid_pos(x.shape[1], x.shape[-1]).to(x.device, x.dtype)
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
-        x = self.norm(x)
-        return x
+        return self.norm(x)
 
 class theBridge(nn.Module):
     def __init__(self, vocab: int, mels: int, ctx: int, dims: int, head: int, layer: int, 
                 debug: List[str], features: List[str], act: str = "gelu"): 
         super(theBridge, self).__init__()
     
-        self.ctx = ctx     
-        self.dims = dims
-        self.head = head
-        self.head_dim = dims // head
         self.debug = debug
         self.counter = 0
         self.dropout = 0.01 
@@ -798,30 +947,26 @@ class theBridge(nn.Module):
 
         self.token = nn.Embedding(vocab, dims, device=device, dtype=dtype)
         self.positional = nn.Parameter(torch.empty(ctx, dims, device=device, dtype=dtype), requires_grad=True)
-        self.sinusoid = lambda length: sinusoids(length, dims)
         self.blend = nn.Parameter(torch.tensor(0.5, device=device, dtype=dtype), requires_grad=True)
-        self.ln_dec = RMSNorm(dims)
+        self.sinusoid_pos = lambda length, dims: sinusoids(length, dims, max_tscale=10000)
 
         with torch.no_grad():
             self.token.weight[0].zero_()
         
         self.block = nn.ModuleList([
-            Residual(ctx=ctx, dims=dims, head=head, act="gelu", debug=debug, features=features)
+            Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features)
             for _ in range(layer)])  
 
         self.cross_attn = nn.ModuleList([
-            Residual(ctx=ctx, dims=dims, head=head, act="gelu", debug=debug, features=features)
+            Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features)
             for _ in range(layer)])  
 
         self.cross_modal = nn.ModuleList([
-            Residual(ctx=ctx, dims=dims, head=head, act="gelu", debug=debug, features=features)
+            Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features)
             for _ in range(layer)])  
         
         mask = torch.tril(torch.ones(ctx, ctx), diagonal=0).unsqueeze(0).unsqueeze(0)    
         self.register_buffer("mask", mask, persistent=False)
-        self.register_buffer("mask_win", self.window_mask(ctx, ctx), persistent=False)
-        self.register_buffer("mask_cat", self.modal_mask(ctx, ctx), persistent=False)
-        self.register_buffer("mask_cross", self.cross_mask(ctx, ctx), persistent=False)
 
         act_fn = get_activation(act)
         if features == ["spectrogram", "waveform", "pitch"]:
@@ -846,83 +991,64 @@ class theBridge(nn.Module):
             [FEncoder(input_dims=mels, dims=dims, head=head, layer=layer, kernel_size=3, act=act_fn)] + 
             [Residual(ctx=ctx, dims=dims, head=head, act=act, debug=debug, features=features, cgate=cgate) for _ in range(layer)] if "phase" in features else None)})
 
-    def window_mask(self, text_ctx, aud_ctx):
-        mask = torch.tril(torch.ones(text_ctx, text_ctx, device=device), diagonal=0)
-        audio_mask = torch.tril(torch.ones(text_ctx, aud_ctx - text_ctx, device=device))
-        full_mask = torch.cat([mask, audio_mask], dim=-1)
-        return full_mask.unsqueeze(0).unsqueeze(0)
-
-    def modal_mask(self, text_len, audio_len):
-        combined_mask = torch.ones(text_len + audio_len, text_len + audio_len, device=device)
-        combined_mask[:text_len, :text_len] = torch.tril(torch.ones(text_len, text_len, device=device))  
-        combined_mask[:text_len, text_len:] = torch.tril(torch.ones(text_len, audio_len, device=device))   
-        return combined_mask.unsqueeze(0).unsqueeze(0)
-
-    def cross_mask(self, text_len, audio_len):
-        mask = torch.tril(torch.ones(text_len, text_len, device=device))
-        audio_mask = torch.tril(torch.ones(text_len, audio_len, device=device))
-        full_mask = torch.cat([mask, audio_mask], dim=-1)
-        return full_mask.unsqueeze(0).unsqueeze(0)
+        self.norm = RMSNorm(dims)
 
     def forward(self, x, enc, layer='decoder', feature=None) -> Tensor:
+        out = {}
+        out.update(enc)
         enc = dict_to(enc, device, dtype)
         _text_len = x.shape[1]  
 
         x = self.token(x) + self.positional[:x.shape[1]]
-        x = F.dropout(x, p=self.dropout, training=self.training)
-
+   
         for f in enc:
             if f in self.features:
                 xa = enc[f]
                 for block in self.blocks[f]:
                     xa = block(xa, enc=enc, layer=layer, feature=feature)
+                    xa = xa + self.sinusoid_pos(xa.shape[1], xa.shape[-1]).to(xa.device, xa.dtype)
+                    out[f] = xa
 
-        for block in self.block:
-            mask = self.mask[:x.shape[1], :x.shape[1]]
-            x = block(x, xa=None, mask=mask, enc=enc, layer=layer)
-            if feature in self.features:
-                xa = xa + self.sinusoid(xa.shape[1])
-                mask = self.mask_win[:x.shape[1], :xa.shape[1]]
-                out = block(x, xa=xa, mask=mask, enc=enc, layer=layer)
+        for block in self.block:          
+            x = block(x, xa=None, mask=self.mask, enc=enc, layer=layer)
+            if f in self.features:
+                
+                out = block(x, xa=xa, mask=self.mask, enc=enc, layer=layer)
                 if self.sequential:
                     x = out
                 else:
                     a = torch.sigmoid(self.blend)
                     x = a * out + (1 - a) * x
+                    x = self.token(x) + self.positional[:x.shape[1]]
+                    out[f] = x
 
         for block in self.cross_attn:
-            if feature in self.features:
-                xa = xa + self.sinusoid(xa.shape[1])
-                mask_x = self.cross_mask(x.shape[1], xa.shape[1])
-                mask_xa = self.cross_mask(xa.shape[1], x.shape[1])
-                x = block(x, xa=xa, mask=mask_x, enc=enc, layer=layer)
-                xa = block(xa, xa=x, mask=mask_xa, enc=enc, layer=layer)
-                out = block(x, xa=xa, mask=mask_x, enc=enc, layer=layer)
+            if f in self.features:
+                x = block(x, xa=xa, mask=self.mask, enc=enc, layer=layer)
+                xa = block(xa, xa=x, mask=self.mask, enc=enc, layer=layer)
+                out = block(x, xa=xa, mask=self.mask, enc=enc, layer=layer)
                 if self.sequential:
                     x = out
                 else:
                     a = torch.sigmoid(self.blend)
                     x = a * out + (1 - a) * x
+                    x = self.token(x) + self.positional[:x.shape[1]]
+                    out[f] = x
 
         for block in self.cross_modal:
-            if feature in enc: 
-                xa = xa + self.sinusoid(xa.shape[1])
+            if f in self.features:
                 xcat = torch.cat([x, xa], dim=1)
-                mask = self.mask_cat(x.shape[1], xa.shape[1])
-                x = block(xcat, xa=None, mask=mask, enc=enc, layer=layer)
+                x = block(xcat, xa=None, mask=self.mask, enc=enc, layer=layer)
                 x = x[:, :_text_len]  
-
+                out[f] = x
         if self.counter < 1 and "encoder" in self.debug:      
-                s = enc.get("spectrogram")
-                w = enc.get("waveform")
-                p = default(enc.get("pitch"), enc.get("f0"))
-                plot_waveform(x=s, w=w, p=p, hop_length=128)
                 shapes = {k: v.shape for k, v in enc.items()}
                 print(f"Step {self.counter}: mode: {list(enc.keys()) }: shapes: {shapes}")
         self.counter += 1
-
-        x = self.ln_dec(x)
-        return x @ torch.transpose(self.token.weight.to(dtype), 0, 1).float()
+       
+        x = x @ torch.transpose(self.token.weight.to(dtype), 0, 1).float()
+        x = self.norm(x)
+        return x, out
 
 class Echo(nn.Module):
     def __init__(self, param: Dimensions):
@@ -977,7 +1103,8 @@ class Echo(nn.Module):
         else:
             feature = "spectrogram"
 
-        logits = self.processor(input_ids, enc, feature)
+        out, logits = self.processor(input_ids, enc, feature)
+        self.out=out
 
         loss = None
         if labels is not None:
@@ -1089,7 +1216,7 @@ class Echo(nn.Module):
                     "eos_token_id": self.eos_token_id,
                 })
         return Config()
-        
+
 def setup_tokenizer(token: str):
     from tokenizers import Tokenizer
     tokenizer = Tokenizer.from_file("./tokenizer.json")
@@ -1116,7 +1243,6 @@ def setup_tokenizer(token: str):
                     ids = ids[:-1]
             results.append(tokenizer.decode(ids))
         return results
-
 
     def save_pretrained(save_dir):
         os.makedirs(save_dir, exist_ok=True)
@@ -1159,8 +1285,7 @@ def world_to_mel(sp, ap, sample_rate=16000, n_mels=128):
     
     return sp_mel, ap_mel
 
-def extract_features(batch, tokenizer, waveform=False, spec=True, f0=False, f0t=False, sample_rate=16000, hop_length=256, mode="mean", debug=True, **dataset_config):
-
+def extract_features(batch, tokenizer, waveform=False, spec=True, f0=True, f0t=True, pitch=False, harmonics=False, sample_rate=16000, hop_length=256, mode="mean", debug=False, **dataset_config):
     dataset_config = {
         "hop_length": 256,
         "f_min": 150,
@@ -1175,113 +1300,100 @@ def extract_features(batch, tokenizer, waveform=False, spec=True, f0=False, f0t=
         "mel_scale": "htk",
         "norm": None,
         "normalized": False,
-        }
+    }
 
     audio = batch["audio"]
     sr = audio["sampling_rate"]
-    wave = load_wave(wave_data=audio, sample_rate=sr)
     labels = tokenizer.encode(batch["transcription"])
 
-    if waveform:
+    wav = wavnp = f0_np = t = None
+    spectrogram = f0_tensor = f0t_tensor = harmonic = aperiodic = None
+
+    if waveform or spec or f0 or f0t or harmonics:
         wav = load_wave(wave_data=audio, sample_rate=sr)
-    else:
-        wav = None
+        wavnp = wav.numpy().astype(np.float64)
 
     if spec:
-        transform = torchaudio.transforms.MelSpectrogram( **dataset_config)
-        mel_spectrogram = transform(wave)      
+        transform = torchaudio.transforms.MelSpectrogram(**dataset_config)
+        mel_spectrogram = transform(wav)
         log_mel = torch.clamp(mel_spectrogram, min=1e-10).log10()
         log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
-        spec = (log_mel + 4.0) / 4.0
-        spec = torch.tensor(spec)
-    else:
-        spec = None
+        spectrogram = (log_mel + 4.0) / 4.0
+        spectrogram = torch.tensor(spectrogram)
+
+    if f0 or f0t or harmonics:
+        f0_np, t = pw.dio(wavnp, sample_rate,
+                          frame_period=hop_length / sample_rate * 1000, f0_ceil=500, f0_floor=71.1)
+        f0_np = pw.stonemask(wavnp, f0_np, t, sample_rate)
 
     if f0:
-        wavnp = wave.numpy().astype(np.float64)
-        f0_np, t = pw.dio(wavnp, sample_rate,
-                        frame_period = hop_length / sample_rate * 1000)
-        f0_np = pw.stonemask(wavnp, f0_np, t, sample_rate)
-        f0 = torch.from_numpy(f0_np)
+        f0_tensor = torch.from_numpy(f0_np)
+        f0_tensor = torch.where(f0_tensor == 0.0, torch.zeros_like(f0_tensor), (f0_tensor - 71.0) / (500.0 - 71.0))
 
-        if f0t:
-            audio_duration = len(wavnp) / sample_rate  
-            T = len(labels)               
-            tok_dur_sec  = audio_duration / T
-            token_starts = np.arange(T)      * tok_dur_sec
-            token_ends  = token_starts + tok_dur_sec
-            start_idx = np.searchsorted(t, token_starts, side="left")
-            end_idx  = np.searchsorted(t, token_ends,   side="right")
-            pitch_tok = np.zeros(T, dtype=np.float32)
-            for i in range(T):
-                lo, hi = start_idx[i], max(start_idx[i]+1, end_idx[i])
-                segment = f0_np[lo:hi]
-                pitch_tok[i] = segment.mean() if mode=="mean" else (np.median(segment) if mode=="median" else segment[-1])           
-            pitch_tok[pitch_tok < 100.0] = 0.0            
+    if f0t:
+        audio_duration = len(wavnp) / sample_rate
+        T = len(labels)
+        tok_dur_sec = audio_duration / T
+        token_starts = np.arange(T) * tok_dur_sec
+        token_ends = token_starts + tok_dur_sec
+        start_idx = np.searchsorted(t, token_starts, side="left")
+        end_idx = np.searchsorted(t, token_ends, side="right")
+        pitch_tok = np.zeros(T, dtype=np.float32)
+        for i in range(T):
+            lo, hi = start_idx[i], max(start_idx[i]+1, end_idx[i])
+            segment = f0_np[lo:hi]
+            if mode == "mean":
+                pitch_tok[i] = segment.mean()
+            elif mode == "median":
+                pitch_tok[i] = np.median(segment)
+            else:
+                pitch_tok[i] = segment[-1]
+        pitch_tok[pitch_tok < 100.0] = 0.0
+        bos_pitch = pitch_tok[0] if len(pitch_tok) > 0 else 0.0
+        f0t_tensor = torch.from_numpy(np.concatenate([[bos_pitch], pitch_tok]))
+        f0t_tensor = torch.where(f0t_tensor == 0.0, torch.zeros_like(f0t_tensor), (f0t_tensor - 71.0) / (500.0 - 71.0))
 
-            bos_pitch = pitch_tok[0] if len(pitch_tok) > 0 else 0.0
-            f0t = torch.from_numpy(np.concatenate([[bos_pitch], pitch_tok]))
-            f0t = torch.from_numpy(pitch_tok)
-            f0 = torch.from_numpy(f0_np)
-
-            spnp = pw.cheaptrick(wavnp, f0_np, t, sample_rate, fft_size=256) 
-            apnp = pw.d4c(wavnp, f0_np, t, sample_rate, fft_size=256)
-            sp = torch.from_numpy(spnp)
-            ap = torch.from_numpy(apnp)
-            sp = sp[:, :128].contiguous().T
-            ap = ap[:, :128].contiguous().T
-            f0t = torch.where(f0t == 0.0, torch.zeros_like(f0t), (f0t - 71.0) / (400.0 - 71.0))
-            sp = torch.where(sp == 0.0,  torch.zeros_like(sp), sp / 1.0)
-            ap= torch.where(ap == 0.0,  torch.zeros_like(ap), ap / 1.0)
-
-        else:
-            f0t = None
-            sp = None
-            ap = None
-            t = None
-            token_starts = None
-    else:
-        f0t = None
-        f0 = None
-        sp = None
-        ap = None
-        t = None
-        token_starts = None
+    if harmonics:
+        spnp = pw.cheaptrick(wavnp, f0_np, t, sample_rate, fft_size=256)
+        apnp = pw.d4c(wavnp, f0_np, t, sample_rate, fft_size=256)
+        harmonic = torch.from_numpy(spnp)
+        aperiodic = torch.from_numpy(apnp)
+        harmonic = harmonic[:, :128].contiguous().T
+        aperiodic = aperiodic[:, :128].contiguous().T
+        harmonic = torch.where(harmonic == 0.0, torch.zeros_like(harmonic), harmonic / 1.0)
+        aperiodic = torch.where(aperiodic == 0.0, torch.zeros_like(aperiodic), aperiodic / 1.0)
 
     if debug:
-        print(f"['f0']: {f0t if f0t is not None else None}")
-        print(f"['f0']: {f0.shape if f0 is not None else None}")
-        print(f"['f0t']: {f0t.shape if f0t is not None else None}")
-        print(f"['harmonic']: {sp.shape if sp is not None else None}")
-        print(f"['aperiodic']: {ap.shape if ap is not None else None}")
-        print(f"['spec']: {spec.shape if spec is not None else None}")
-        print(f"['wav']: {wav.shape if wav is not None else None}")
+        print(f"['f0']: {f0_tensor.shape if f0_tensor is not None else None}")
+        print(f"['f0t']: {f0t_tensor.shape if f0t_tensor is not None else None}")
+        print(f"['harmonic']: {harmonic.shape if harmonic is not None else None}")
+        print(f"['aperiodic']: {aperiodic.shape if aperiodic is not None else None}")
+        print(f"['spectrogram']: {spectrogram.shape if spectrogram is not None else None}")
+        print(f"['waveform']: {wav.shape if wav is not None else None}")
+        print(f"['labels']: {len(labels) if labels is not None else None}")
 
     return {
-        "f0": f0,
-        "f0t": f0t,
-        "pitch": f0,
-        "harmonic": sp,
-        "aperiodic": ap,
+        "waveform": wav if waveform else None,
+        "spectrogram": spectrogram if spec else None,
+        "f0": f0_tensor if f0 else None,
+        "f0t": f0t_tensor if f0t else None,
+        "harmonic": harmonic if harmonics else None,
+        "aperiodic": aperiodic if harmonics else None,
         "labels": labels,
-        "waveform": wav,
-        "spectrogram": spec,
-
     }
 
-def prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, **dataset_config):
+def prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, streaming=False, **dataset_config):
 
         if sanity_check:
             test = load_dataset(
-                "google/fleurs", "en_us", token=token, split="test[:10]", trust_remote_code=True
-            ).cast_column("audio", Audio(sample_rate=sample_rate))
-
+                "google/fleurs", "en_us", token=token, split="test", trust_remote_code=True
+            ).cast_column("audio", Audio(sampling_rate=sample_rate)).take(1)
             dataset = test.map(
                 lambda x: extract_features(x, tokenizer, **dataset_config),
                 remove_columns=test.column_names)
-            dataset = dataset(remove_columns=["audio", "transcription"]).with_format(type="torch")
             train_dataset = dataset
             test_dataset = dataset
+            return train_dataset, test_dataset
         else:
 
             cache_dir = "./processed_datasets"
@@ -1300,10 +1412,8 @@ def prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, **
                    len(x["audio"]["array"]) > 0 and
                    len(x["audio"]["array"]) < 2048 * 160)
 
-        raw_train = load_dataset(
-            "google/fleurs", "en_us", token=token, split="train[:1000]", trust_remote_code=True)
-        raw_test = load_dataset(
-            "google/fleurs", "en_us", token=token, split="test[:100]", trust_remote_code=True)
+        raw_train = load_dataset("google/fleurs", "en_us", token=token, split="train", trust_remote_code=True, streaming=streaming)
+        raw_test = load_dataset("google/fleurs", "en_us", token=token, split="test", trust_remote_code=True, streaming=streaming)
 
         raw_train = raw_train.filter(filter_func)
         raw_test = raw_test.filter(filter_func)
@@ -1318,8 +1428,8 @@ def prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, **
             lambda x: extract_features(x, tokenizer, **dataset_config),
             remove_columns=raw_test.column_names)
 
-        train_dataset.save_to_disk(cache_file_train)
-        test_dataset.save_to_disk(cache_file_test)
+        train_dataset.save_to_disk(cache_file_train) if sanity_check or streaming is False else None
+        test_dataset.save_to_disk(cache_file_test) if sanity_check or streaming is False else None
         return train_dataset, test_dataset
 
 @dataclass
@@ -1401,22 +1511,21 @@ def wer_batch(references, hypotheses):
         total_words += len(ref_words)
     return (total_errors / total_words) * 100 if total_words > 0 else 0.0
 
-def clean_ids(ids, pad_token_id=0):
+def clean_ids(ids, pad_token_id=0, bos_token_id=1, eos_token_id=2):
     if isinstance(ids, torch.Tensor):
         ids = ids.tolist()
-    return [int(id) for id in ids if id != -100 and id != pad_token_id]
+    return [int(id) for id in ids if id != -100 and id != pad_token_id and id != bos_token_id and id != eos_token_id]
 
-def clean_batch(batch_ids, pad_token_id=0):
-    return [clean_ids(seq, pad_token_id) for seq in batch_ids]
+def clean_batch(batch_ids, pad_token_id=0, bos_token_id=1, eos_token_id=2):
+    return [clean_ids(seq, pad_token_id, bos_token_id, eos_token_id) for seq in batch_ids]
 
 def compute_metrics(pred, tokenizer=None, model=None, print_pred=False, num_samples=0, optimizer=None, scheduler=None):
-
     label_ids = pred.label_ids
     pred_ids = pred.predictions[0]
-    label_ids = clean_batch(label_ids, pad_token_id=tokenizer.pad_token_id)
-    pred_ids = clean_batch(pred_ids, pad_token_id=tokenizer.pad_token_id)
-    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=False)
-    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=False)
+    label_ids = clean_batch(label_ids)
+    pred_ids = clean_batch(pred_ids)
+    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
     if print_pred:
         for i in range(min(num_samples, len(pred_ids))):
@@ -1433,17 +1542,25 @@ def compute_metrics(pred, tokenizer=None, model=None, print_pred=False, num_samp
     else:
         trainable_params = 0.0
         efficiency_score = 0.0
-    return {
-        "wer": float(wer),
-        "efficiency_score": float(efficiency_score),
-    }
+    return { "wer": float(wer), "efficiency_score": float(efficiency_score)}
+
+def preprocess_logits_for_metrics(logits, labels):
+    pred_ids = torch.argmax(logits, dim=-1)
+    labels = torch.where(labels == -100, 0, labels)
+    pred_ids = torch.where(pred_ids == -100, 0, pred_ids)
+    return pred_ids, labels
 
 def main():
     token = ""
     log_dir = os.path.join('./output/logs', datetime.now().strftime('%m-%d_%H_%M_%S'))
     os.makedirs(log_dir, exist_ok=True)
     tokenizer = setup_tokenizer(token)
-    train_dataset, test_dataset = prepare_datasets(tokenizer, token)
+    train_dataset, test_dataset = prepare_datasets(
+    tokenizer, 
+    token, 
+    sanity_check=False,
+
+    )
     
     param = Dimensions(
         vocab=40000,
@@ -1453,7 +1570,7 @@ def main():
         head=4,
         layer=4,
         act="swish",
-        debug={"decoder", "radius"},
+        debug={"radius", "encoder"},
         features = ["spectrogram"],
         )
     
@@ -1472,20 +1589,20 @@ def main():
         logging_steps=10,
         logging_dir=log_dir,
         eval_strategy="steps",
-        save_strategy="steps",
+        save_strategy="no",
         report_to=["tensorboard"],
         push_to_hub=False,
         disable_tqdm=False,
         save_total_limit=1,
         label_names=["labels"],
         save_safetensors=False,
-        eval_on_start=False,
+        eval_on_start=True,
         batch_eval_metrics=False,
     )
     from functools import partial
     metrics_fn = partial(compute_metrics, 
     print_pred=True, 
-    num_samples=1, 
+    num_samples=2, 
     tokenizer=tokenizer, model=model)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.00025, eps=1e-8, weight_decay=0.025, betas=(0.9, 0.999), 
@@ -1499,9 +1616,11 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         data_collator=DataCollator(tokenizer=tokenizer),
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         compute_metrics=metrics_fn,
         optimizers=(optimizer, scheduler)
     )
+    print(tokenizer.pad_token_id, tokenizer.bos_token_id, tokenizer.eos_token_id)
     model.init_weights()
     trainer.train()
 
