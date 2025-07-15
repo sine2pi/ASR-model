@@ -1089,7 +1089,7 @@ class Echo(nn.Module):
                     "eos_token_id": self.eos_token_id,
                 })
         return Config()
-
+        
 def setup_tokenizer(token: str):
     from tokenizers import Tokenizer
     tokenizer = Tokenizer.from_file("./tokenizer.json")
@@ -1101,21 +1101,22 @@ def setup_tokenizer(token: str):
             ids = [id for id in ids if id not in sp_ids]
         return ids
 
-    def bdec(ids_list, skip_special_tokens=True):
+    def bdec(ids_list, skip_special_tokens=True, pad_token_id=0, bos_token_id=1, eos_token_id=2):
         results = []
         for ids in ids_list:
-            if skip_special_tokens:
-                if ids and ids[0] == 1:
-                    ids = ids[1:]
-                while ids and ids[-1] in [0, 2]:
-                    ids = ids[:-1]
-
             if isinstance(ids, torch.Tensor):
                 ids = ids.tolist()
-            elif isinstance(ids, np.ndarray):
-                ids = ids.tolist()
+            ids = [int(id) for id in ids if id != -100]
+            if skip_special_tokens:
+                ids = [id for id in ids if id not in (pad_token_id, bos_token_id, eos_token_id)]
+
+                if ids and ids and ids[0] == bos_token_id:
+                    ids = ids[1:]
+                while ids and ids[-1] == eos_token_id:
+                    ids = ids[:-1]
             results.append(tokenizer.decode(ids))
         return results
+
 
     def save_pretrained(save_dir):
         os.makedirs(save_dir, exist_ok=True)
@@ -1400,44 +1401,38 @@ def wer_batch(references, hypotheses):
         total_words += len(ref_words)
     return (total_errors / total_words) * 100 if total_words > 0 else 0.0
 
-def compute_metrics(pred, tokenizer=None, model=None, print_pred=False, num_samples=0, optimizer=None, scheduler=None):
-    pred_ids = pred.predictions
-    label_ids = pred.label_ids
-    if isinstance(pred_ids, tuple):
-        pred_ids = pred_ids[0]
-    if hasattr(pred_ids, "ndim") and pred_ids.ndim == 3:
-        if not isinstance(pred_ids, torch.Tensor):
-            pred_ids = torch.tensor(pred_ids)
-        pred_ids = pred_ids.argmax(dim=-1)
+def clean_ids(ids, pad_token_id=0):
+    if isinstance(ids, torch.Tensor):
+        ids = ids.tolist()
+    return [int(id) for id in ids if id != -100 and id != pad_token_id]
 
-    pred_ids = pred_ids.tolist()
-    label_ids = label_ids.tolist()
-    pad_token_id = tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else 0
-    label_ids = [[pad_token_id if token == -100 else token for token in seq] for seq in label_ids]
+def clean_batch(batch_ids, pad_token_id=0):
+    return [clean_ids(seq, pad_token_id) for seq in batch_ids]
+
+def compute_metrics(pred, tokenizer=None, model=None, print_pred=False, num_samples=0, optimizer=None, scheduler=None):
+
+    label_ids = pred.label_ids
+    pred_ids = pred.predictions[0]
+    label_ids = clean_batch(label_ids, pad_token_id=tokenizer.pad_token_id)
+    pred_ids = clean_batch(pred_ids, pad_token_id=tokenizer.pad_token_id)
+    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=False)
+    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=False)
 
     if print_pred:
         for i in range(min(num_samples, len(pred_ids))):
-
-            pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=False)
-            label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=False)
-
             print(f"Pred tokens: {pred_ids[i]}")
             print(f"Label tokens: {label_ids[i]}")
             print(f"Pred: '{pred_str[i]}'")
             print(f"Label: '{label_str[i]}'")
-
             print("-" * 40)
-            
-    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
     wer = wer_batch(label_str, pred_str)
     if model is not None:
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1000000
         efficiency_score = (100 - wer) / trainable_params if trainable_params > 0 else 0.0
     else:
         trainable_params = 0.0
         efficiency_score = 0.0
-
     return {
         "wer": float(wer),
         "efficiency_score": float(efficiency_score),
