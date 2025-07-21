@@ -10,10 +10,6 @@ Questions:
    
    -Does pitch-conditioning improve speech recognition?
 
-   Standard RoPE was designed for text: Text doesn't have pitch, timing, or acoustic properties.
-   Xpos is an artificial generic decay. This takes its place with something more meaningful.
-   
-   
 ---
 
 
@@ -54,15 +50,11 @@ if f0 is not None:
 else:
     theta = self.theta 
 
-## In text, theta=10,000 sets the base frequency for positional encoding, ensuring a wide range of periodicities for long sequences. I'm not sure if the specific number 10k was experimentally derived.
-## For audio, especially speech, the relevant periodicities are determined by the pitch f0 neighborhood or f0 per frame might be more meaningful. 
 
 freqs = theta.unsqueeze-1  220.0 * 700 * 
     torch.pow10, torch.linspace0, 2595 * torch.log10torch.tensor1 + 8000700, 
             self.dim  2, device=theta.device, dtype=theta.dtype  2595 - 1  1000
 
-## This seems to give better results compared to the standard freqs = 1.  theta  torch.arange0, dim, 2[:dim  2].float  dim.
-## I thought a mel-scale version might be more perceptually meaningful for audio.. ie. using mel-scale to create a perceptually-relevant distance metric instead of Euclidean distance.
 
 t = torch.arangectx, device=device, dtype=dtype
 freqs = t[:, None] * freqs  # dont repeat or use some other method here 
@@ -224,21 +216,19 @@ The Complex Frequency Result:
 
       [Freqs] torch.Size[454, 64] 2.17+1.17j
 
-This means:
+
 
       Magnitude: sqrt2.17² + 1.17² ≈ 2.5
       Phase: atan21.17, 2.17 ≈ 0.49 radians
       
       Variable radius: Each frame has different magnitude
 
-   Pitch Conditioning is Working:
+
 
       Silence frames: radius ≈ 0 → freqs ≈ 0
       Voiced frames: radius ≈ 200-300 → freqs ≈ 2-3
       
       Variable attention: Important frames get more attention
-
-The Pattern Makes Sense:
 
       Silence: No acoustic prominence → low radius
       Speech: High acoustic prominence → high radius
@@ -272,34 +262,9 @@ This approach respects both the rotation phase and the scaling radius for each t
 
 <img width="780" alt="cc4" src="https:github.comuser-attachmentsassets165a3f18-659a-4e2e-a154-a3456b667bae"  >
 
-Each figure shows 4 subplots one for each of the first 4 dimensions of your embeddings in the test run. These visualizations show how pitch information modifies position encoding patterns in the model.
-
-In each subplot:
-
-- Thick solid lines: Standard RoPE rotations for even dimensions no F0 adaptation
-- Thick dashed lines: Standard RoPE rotations for odd dimensions no F0 adaptation
-- Thin solid lines: F0 RoPE rotations for even dimensions
-- Thin dashed lines: F0 RoPE rotations for odd dimensions
-
-1. Differences between thick and thin lines: This shows how much the F0 information is modifying the standard position encodings. Larger differences indicate stronger F0 adaptation.
-
-2. Pattern changes: The standard RoPE thick lines show regular sinusoidal patterns, while the F0 RoPE thin lines show variations that correspond to the audio's pitch contour.
-
-3. Dimension specific effects: Compared across four subplots to see if F0 affects different dimensions differently.
-
-4. Position specific variations: In standard RoPE, frequency decreases with dimension index, but F0 adaptation modify this pattern.
-
-The patterns below show how positions "see" each other in relation to theta and f0. 
-
-Bright diagonal line: Each position matches itself perfectly.
-Wider bright bands: Positions can "see" farther good for long dependencies but can be noisy.
-Narrow bands: More focus on nearby positions good for local patterns
-
-<img width="680" alt="cc" src="https:github.comuser-attachmentsassets28d00fc5-2676-41ed-a971-e4d857af43f8"  >
-<img width="680" alt="cc2" src="https:github.comuser-attachmentsassets9089e806-966b-41aa-8793-bee03a6e6be1"  >
 
 ----
-https:huggingface.coSin2piEcho17tensorboard?params=scalars
+[https:huggingface.coSin2piEcho17tensorboard?params=scalars](https://huggingface.co/Sin2pi/Echo3/tensorboard?params=scalars)
 
 ----
 
