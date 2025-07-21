@@ -1,5 +1,5 @@
-NLPASR multimodal modal with f0 modulated relative positional embeddings. 
-For researchtesting.
+ASR model that uses audio frequencies instead of spectrograms + pitch aware relative positional embeddings. 
+
 
 
 Questions:
