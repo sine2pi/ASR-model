@@ -22,6 +22,14 @@ To explore the relationship between pitch and rotary embeddings, the model imple
 3. Variable radii in torch.polar: The unit circle radius 1.0 in the torch.polar calculation is replaced with variable radii derived from f0. This creates acoustically-weighted positional encodings, so each position in the embedding space reflects the acoustic prominence in the original speech. This approach effectively adds phase and amplitutde information without significant computational overhead.
 
 4. Initial findings suggest that f0 is a superior input to spectrograms for ASR models.
+   
+
+<img width="1816" height="707" alt="pitchee2" src="https://github.com/user-attachments/assets/17c89ebf-3373-4dd5-b510-95fa96774ec1" />
+
+
+
+
+
 
 The function `torch.polar` constructs a complex tensor from polar coordinates:
 
