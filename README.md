@@ -202,7 +202,7 @@ The Complex Frequency Result:
       Transitions: Natural pitch changes
 
 
-<img width="780" alt="cc4" src="https:github.comuser-attachmentsassets165a3f18-659a-4e2e-a154-a3456b667bae"  >
+
 
 
 
