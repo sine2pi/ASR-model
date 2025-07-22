@@ -1,3 +1,4 @@
+
 ASR model that uses audio frequencies instead of spectrograms + pitch aware relative positional embeddings. 
 
 
@@ -25,8 +26,6 @@ To explore the relationship between pitch and rotary embeddings, the model imple
    
 
 <img width="1816" height="707" alt="pitchee2" src="https://github.com/user-attachments/assets/17c89ebf-3373-4dd5-b510-95fa96774ec1" />
-
-
 
 
 
@@ -72,42 +71,6 @@ if self.radii and f0 is not None:
 else:
     radius = torch.ones_likefreqs
     freqs = torch.polarradius, freqs
-
-```
-
-            
-            For f0: Phase Accumulation
-            
-            - F0 as Instantaneous Frequency:  
-              Your F0 track F0_{raw,t} represents the fundamental frequency at each time step t.
-            
-            - Angular Frequency:  
-              Convert F0,t to angular frequency omega_t using the relationship:  
-              omega_t = 2pi F0,t  
-              This gives you radians per second.
-            
-            - Phase Change:  
-              To get the phase change Delta phi_t between the current frame t and the previous frame t-1, you multiply the angular    
-              frequency by the time duration of your frame T_{frame}:  
-              Delta phi_t = omega_t cdot T_{frame} = 2pi F0{raw,t} cdot T_{frame}.
-            
-            - Accumulated Phase:  
-              The actual phase angle phi_t for the current frame t would then be the accumulated sum of these phase changes:  
-              phi_t = phi_{t-1} + Delta phi_t.
-            
-            ---
-            
-            Practical Equation for the Rotation Angle phi:
-            
-            Let:  
-            - F0{raw,t} be the fundamental frequency in Hz at time t.  
-            - T{frame} be the duration of each time frame in seconds e.g., 10 ms = 0.01 seconds.  
-            - phi_0 be an initial phase offset could be 0 or learned.
-            
-            Then, the rotation angle phi_t for each time step t can be calculated as:  
-            [
-            phi_t = phi_{t-1} + 2pi F0{raw,t} cdot T_{frame}
-            ]
             
 
 ```python
@@ -224,13 +187,10 @@ The Complex Frequency Result:
       [Freqs] torch.Size[454, 64] 2.17+1.17j
 
 
-
       Magnitude: sqrt2.17² + 1.17² ≈ 2.5
       Phase: atan21.17, 2.17 ≈ 0.49 radians
       
       Variable radius: Each frame has different magnitude
-
-
 
       Silence frames: radius ≈ 0 → freqs ≈ 0
       Voiced frames: radius ≈ 200-300 → freqs ≈ 2-3
@@ -241,39 +201,14 @@ The Complex Frequency Result:
       Speech: High acoustic prominence → high radius
       Transitions: Natural pitch changes
 
-----
-
-Approximation methods like using cossin projections or fixed rotation matrices typically assume a unit circle radius=1.0 or only rotate, not scale. When we introduce a variable radius, those approximations break down and can't represent the scaling effect, only the rotation. When using a variable radius, we should use true complex multiplication to get correct results. Approximations that ignore the radius or scale after the rotation don't seem to capture the intended effect, leading to degraded or incorrect representations from my tests so far.
-
-```python
-
-### Do not approximate:
-#     radius = radius.unsqueeze-1.expand_asx_rotated[..., ::2]
-#     x_rotated[..., ::2] = x_rotated[..., ::2] * radius
-#     x_rotated[..., 1::2] = x_rotated[..., 1::2] * radius
-
-### 
-    def apply_rotaryx, freqs:
-        x1 = x[..., :freqs.shape[-1]*2]
-        x2 = x[..., freqs.shape[-1]*2:]
-        orig_shape = x1.shape
-        if x1.ndim == 2:
-            x1 = x1.unsqueeze0
-        x1 = x1.float.reshape*x1.shape[:-1], -1, 2.contiguous
-        x1 = torch.view_as_complexx1 * freqs
-        x1 = torch.view_as_realx1.flatten-2
-        x1 = x1.vieworig_shape
-        return torch.cat[x1.type_asx, x2], dim=-1
-```
-This approach respects both the rotation phase and the scaling radius for each tokenhead, so the rotary embedding is applied when the radius varies.
 
 <img width="780" alt="cc4" src="https:github.comuser-attachmentsassets165a3f18-659a-4e2e-a154-a3456b667bae"  >
 
 
-----
-[https:huggingface.coSin2piEcho17tensorboard?params=scalars](https://huggingface.co/Sin2pi/Echo3/tensorboard?params=scalars)
 
 ----
+
+https://huggingface.co/Sin2pi/Pitchee-ASR-model/tensorboard?params=scalars
 
 This model sometimes uses :
 
@@ -281,4 +216,4 @@ https:github.comsine2piMaxfactor
 
 MaxFactor is a custom PyTorch optimizer with adaptive learning rates and specialized handling for matrix parameters.
 
-** this model deviates in a lot of ways from standard transformer models.
+** model deviates from standard transformer models.
