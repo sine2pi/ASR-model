@@ -45,7 +45,7 @@ Here are the abbreviated steps for replacing theta and radius in the rotary forw
 
 ```python
 
-f0 = f0.todevice, dtype # feature extracted during processing
+
 if f0 is not None:
     if f0.dim == 2:
         f0 = f0.squeeze0 
@@ -207,10 +207,5 @@ The Complex Frequency Result:
 
 https://huggingface.co/Sin2pi/Pitchee-ASR-model/tensorboard?params=scalars
 
-This model sometimes uses :
 
-https:github.comsine2piMaxfactor
 
-MaxFactor is a custom PyTorch optimizer with adaptive learning rates and specialized handling for matrix parameters.
-
-** model deviates from standard transformer models.
