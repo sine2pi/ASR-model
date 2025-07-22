@@ -1,5 +1,5 @@
 
-ASR model that uses audio frequencies instead of spectrograms + pitch aware relative positional embeddings. 
+ASR model + pitch aware relative positional embeddings. 
 
 
 
