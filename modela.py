@@ -21,6 +21,19 @@ dtype = torch.float32
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
+@dataclass
+class Dimensions:
+    vocab: int
+    mels: int
+    ctx: int
+    dims: int
+    head: int
+    layer: int
+    act: str
+    debug: List[str]
+    features: List[str]
+    tokenizer: str
+
 class rotary(nn.Module):
     def __init__(self, dims, head, max_ctx=1500, radii=False, debug: List[str] = [], use_pbias=False, axial=False, spec_shape=None):
 
@@ -115,8 +128,6 @@ class rotary(nn.Module):
 
         f0 = self.check_f0(f0, f0t, ctx)
         if f0 is not None:
-            if f0.dim() == 2:
-                f0 = f0.squeeze(0) 
             theta = f0 + self.theta  
         else:
             theta = self.theta 
@@ -183,29 +194,7 @@ class MultiheadA(nn.Module):
                 radii=False,
                 )
         else:
-            self.rope = None
-
-    def cos_sim(self, q: Tensor, k: Tensor, v: Tensor, mask) -> Tensor:
-        q_norm = torch.nn.functional.normalize(q, dim=-1, eps=1e-12)
-        k_norm = torch.nn.functional.normalize(k, dim=-1, eps=1e-12)
-        qk_cosine = torch.matmul(q_norm, k_norm.transpose(-1, -2))
-        qk_cosine = qk_cosine + mask
-        weights = F.softmax(qk_cosine, dim=-1)
-        out = torch.matmul(weights, v)
-        return out
-
-    def rbf_scores(self, q, k, rbf_sigma=1.0, rbf_ratio=0.0):
-        scale = (self.dims // self.head) ** -0.25
-        dot_scores = torch.matmul(q, k.transpose(-1, -2)) * scale
-        if rbf_ratio <= 0.0:
-            return dot_scores
-        q_norm = q.pow(2).sum(dim=-1, keepdim=True)
-        k_norm = k.pow(2).sum(dim=-1, keepdim=True)
-        qk = torch.matmul(q, k.transpose(-1, -2))
-        dist_sq = q_norm + k_norm.transpose(-1, -2) - 2 * qk
-        rbf_scores = torch.exp(-dist_sq / (2 * rbf_sigma**2))
-        return (1 - rbf_ratio) * dot_scores + rbf_ratio * rbf_scores
-          
+            self.rope = None         
     def forward(self, x: Tensor, xa = None, mask = None, en= None, layer = None, f=None) -> tuple:
 
         x = x.to(device, dtype)
@@ -362,7 +351,6 @@ class Residual(nn.Module):
         self.blend = nn.Parameter(torch.tensor(0.5)) 
         act_fn = get_activation(act)
         self.attn = MultiheadA(dims, head, rotary_emb=True, debug=debug)
-        self.curiosity = curiosity(dims, head)
 
         if not any([tgate, mgate, cgate]):
             self.mlp_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
@@ -596,7 +584,6 @@ class PEncoder(nn.Module):
         self.use_rope = use_rope
         self.debug = debug
         act_fn = get_activation(act)
-        
         self.encoder = nn.Sequential(
             Conv1d(input_dims, dims, kernel_size=7, stride=1, padding=3), act_fn,
             Conv1d(dims, dims, kernel_size=5, stride=1, padding=2), act_fn,
@@ -604,10 +591,10 @@ class PEncoder(nn.Module):
 
         if use_rope:
                 self.rope = rotary(dims=dims, head=head, radii=False, debug=[], use_pbias=False, axial=False, spec_shape=spec_shape)
+                self.positional = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
         else:
             self.rope = None
             self.positional = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
-        
         self.norm = RMSNorm(dims)
         
     def rope_to_feature(self, x, en=None, f="pitch", layer="PEncoder"):
@@ -617,17 +604,22 @@ class PEncoder(nn.Module):
         x = self.rope.apply_rotary(x, freqs)
         x = x.permute(0, 2, 1, 3).contiguous().view(batch, ctx, dims)
         return x
-        
-    def forward(self, x: Tensor, en= None, f="pitch", layer="PEncoder"):
-
+            
+    def forward(self, x: Tensor, en=None, f="pitch", layer="PEncoder"):
+        raw_pitch = x.clone()
         if x.dim() == 2:
             x = x.unsqueeze(0)
-        
         x = self.encoder(x).permute(0, 2, 1)
         if self.use_rope:
-            x = self.rope_to_feature(x, en=en, f=f, layer=layer)
+            enc_dict = en if en is not None else {}
+            enc_dict = dict(enc_dict)  
+            enc_dict["f0"] = raw_pitch  
+            max_tscale = x.mean()*300
+            x = x + self.positional(x.shape[1], x.shape[-1], max_tscale).to(device, dtype)
+            x = self.rope_to_feature(x, en=enc_dict, f=f, layer=layer)
         else:
-            x = x + self.positional(x.shape[1], x.shape[-1], 10000).to(device, dtype)
+            max_tscale = x.mean()*300
+            x = x + self.positional(x.shape[1], x.shape[-1], max_tscale).to(device, dtype)
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
         x = self.norm(x)
         print(f"X: {x.shape} {f}") if "PEncoder" in self.debug else None
@@ -692,42 +684,19 @@ class theBridge(nn.Module):
             Residual(ctx=ctx, dims=dims, head=head, act=act_fn, tgate=tgate, mgate=mgate, cgate=cgate, debug=debug, features=features)
             for _ in range(layer)])
 
-        self.modal = nn.ModuleList([
-            Residual(ctx=ctx, dims=dims, head=head, act=act_fn, tgate=tgate, mgate=mgate, cgate=cgate, debug=debug, features=features)
-            for _ in range(layer)]) 
-
         mask = torch.tril(torch.ones(ctx, ctx), diagonal=0) 
         self.register_buffer("mask", mask, persistent=False)
-
         self.norm = RMSNorm(dims)
 
-    def forward(self, x, xa, en, f, sequential=False) -> Tensor:
-        mask = self.mask[:x.shape[1], :x.shape[1]] 
-        x = self.token(x.long()) + self.positional[:x.shape[1]]
-
-        out = {}
-        out["input_ids"] = x
-        out.update(en)
-
-        for b in chain(self.blockA[f] or []):
-            xa = b(x=xa, en=out, f=f, layer="en")
-
-        for b in chain(self.blockB or []):
-            x = b(x=x, xa=None, mask=mask, en=out, f=f, layer="dec")
-            y = b(x, xa=xa, mask=None, en=out, f=f, layer="cross")
-            if sequential:
-                x = y
-            else:
-                a = torch.sigmoid(self.blend)
-                x = a * y + (1 - a) * x 
-        for b in self.modal:
-            xc = b(x=torch.cat([x, xa], dim=1), xa=None, mask=None, en=out, f=f, layer="modal")    
-            xm = b(x=xc[:, :x.shape[1]], xa=xc[:, x.shape[1]:], mask=None, en=out, f=f, layer="modal")
-            if sequential:
-                x = xm
-            else:
-                a = torch.sigmoid(self.blend)
-                x = a * x + (1 - a) * xm
+    def forward(self, x, xa, en, feature, sequential=False) -> Tensor:
+        x = self.token(x.long()) + self.positional[:x.shape[1]]    
+        for block in chain(self.blockA[feature] or []):
+            xa = block(x=xa, en=en, f=feature, layer="enc")
+        for block in chain(self.blockB or []):                 
+            x = block(x=x, xa=None, mask=self.mask, en=en, f=feature, layer="dec")                
+            xc = block(x=x, xa=xa, mask=None, en=en, f=feature, layer="cross")
+            a = torch.sigmoid(self.blend)
+            x = a * xc + (1 - a) * x            
 
         if self.counter < 1 and "encoder" in self.debug:      
                 shapes = {k: v.shape for k, v in en.items()}
@@ -954,6 +923,7 @@ def main():
         act="swish",
         debug={"encoder"},
         features = ["spectrogram", "pitch"],
+        tokenizer=tokenizer,
         )
 
     train_dataset, test_dataset = prepare_datasets(tokenizer, token, sanity_check=sanity_check, sample_rate=16000, streaming=streaming,
@@ -964,10 +934,7 @@ def main():
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     from functools import partial
-    metrics_fn = partial(compute_metrics, 
-    print_pred=True, 
-    num_samples=1, 
-    tokenizer=tokenizer, model=model)
+    metrics_fn = partial(compute_metrics,  print_pred=True, num_samples=1, tokenizer=tokenizer, model=model)
 
     if sanity_check:
         training_args = Seq2SeqTrainingArguments(
