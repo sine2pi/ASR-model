@@ -44,35 +44,52 @@ Here are the abbreviated steps for replacing theta and radius in the rotary forw
 
 ```python
 
-class rotary(nn.Module):
-    def __init__(self, dims, head):
-        super(rotary, self).__init__()
-        self.dims = dims
-        self.head = head
-        self.head_dim = dims // head
-        self.theta = nn.Parameter((torch.tensor(36000, device=device, dtype=dtype)), requires_grad=True)    
-
-    def forward(self, x=None) -> Tensor:
-        freqs = (self.theta / 220.0) * 700 * (
+    def theta_freqs(self, theta):
+        if theta.dim() == 0:
+            theta = theta.unsqueeze(0)
+        freq = (theta.unsqueeze(-1) / 220.0) * 700 * (
             torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), 
-                    self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
-        t = torch.arange(x, device=device, dtype=dtype) 
-        freqs = t[:, None] * freqs
-        freqs=torch.polar(torch.ones_like(freqs), freqs)
-        return freqs.unsqueeze(0)
+                    self.head_dim // 2, device=theta.device, dtype=theta.dtype) / 2595) - 1) / 1000
+        return freq
 
-    @staticmethod
-    def apply_rotary(x, freqs):
-        x1 = x[..., :freqs.shape[-1]*2]
-        x2 = x[..., freqs.shape[-1]*2:]
-        orig_shape = x1.shape
-        if x1.ndim == 2:
-            x1 = x1.unsqueeze(0)
-        x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
-        x1 = torch.view_as_complex(x1) * freqs
-        x1 = torch.view_as_real(x1).flatten(-2)
-        x1 = x1.view(orig_shape)
-        return torch.cat([x1.type_as(x), x2], dim=-1)
+    def _apply_radii(self, freqs, f0, ctx):
+        if self.radii and f0 is not None:
+            radius = f0.to(device, dtype)
+            return torch.polar(radius.unsqueeze(-1), freqs), radius
+        else:
+            return torch.polar(torch.ones_like(freqs), freqs), None
+
+
+ def compute_pitch_tokens(wav, sample_rate, labels, mode="mean"):
+     import pyworld as pw
+     wavnp = wav.numpy().astype(np.float64)
+     f0_np, t = pw.dio(wavnp, sample_rate, frame_period=hop_length / sample_rate * 1000)
+     f0_np = pw.stonemask(wavnp, f0_np, t, sample_rate)
+     t = torch.from_numpy(t)
+     audio_duration = len(wav) / sample_rate
+     T = len(labels)
+     tok_dur_sec = audio_duration / T
+     token_starts = torch.arange(T) * tok_dur_sec
+     token_ends = token_starts + tok_dur_sec
+     start_idx = torch.searchsorted(t, token_starts, side="left")
+     end_idx = torch.searchsorted(t, token_ends, side="right")
+     pitch_tok = torch.zeros(T, dtype=torch.float32)
+     for i in range(T):
+         lo, hi = start_idx[i], max(start_idx[i]+1, end_idx[i]) # type: ignore
+         segment = f0_np[lo:hi]
+         if mode == "mean":
+             pitch_tok[i] = segment.mean()
+         elif mode == "median":
+             pitch_tok[i] = torch.median(segment)
+         else:
+             pitch_tok[i] = segment[-1]
+     pitch_tok[pitch_tok < 100.0] = 0.0
+     bos_pitch = pitch_tok[0] if len(pitch_tok) > 0 else 0.0
+     f0t_tensor = torch.cat([torch.tensor([bos_pitch]), pitch_tok])
+     f0t_tensor = torch.where(f0t_tensor == 0.0, torch.zeros_like(f0t_tensor), (f0t_tensor - 71.0) / (500.0 - 71.0))
+     return pitch_tokens
+
+
 
 ```python
 
