@@ -21,6 +21,14 @@ dtype = torch.float32
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
+PATH = 'E:/hf'
+os.environ['HF_HOME'] = PATH
+os.environ['HF_DATASETS_CACHE'] = PATH
+os.environ['TORCH_HOME'] = PATH
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+
 @dataclass
 class Dimensions:
     vocab: int
@@ -63,13 +71,12 @@ class rotary(nn.Module):
 
 class MultiheadA(nn.Module):
 
-    def __init__(self, dims: int, head: int, debug: List[str] = []):
+    def __init__(self, dims: int, head: int):
         super(MultiheadA, self).__init__()
 
         self.dims = dims
         self.head = head
         self.head_dim = dims // head
-        self.debug = debug
 
         self.q = nn.Linear(dims, dims).to(device, dtype)
         self.k = nn.Linear(dims, dims, bias=False).to(device, dtype)
@@ -119,7 +126,6 @@ class Residual(nn.Module):
         self.ctx = ctx
         self.head_dim = dims // head
 
-        
         self.blend = nn.Parameter(torch.tensor(0.5)) 
         act_fn = get_activation(act)
         self.attn = MultiheadA(dims, head)
@@ -144,44 +150,6 @@ class Residual(nn.Module):
         x = x + gate * mlp_out
         return x
 
-
-class feature_encoder(nn.Module):
-    def __init__(self, mels, dims, head, layer, act="gelu"):
-        super().__init__()
-
-        self.dims = dims
-        self.head = head
-        self.head_dim = dims // head  
-        self.dropout = 0.01 
-        act_fn = get_activation(act)
-
-         # pitch
-        # self.encoder = nn.Sequential(
-        #     Conv1d(1, dims, kernel_size=3, stride=1, padding=1), act_fn,
-        #     Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), act_fn,
-        #     Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
-
-        # spectrogram
-        self.encoder = nn.Sequential(
-            Conv1d(mels, dims, kernel_size=3, stride=1, padding=1), act_fn,
-            Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), act_fn,
-            Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
-
-
-        self.positional = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
-        self.norm = RMSNorm(dims)
-
-    def forward(self, x, xa=None, mask=None, max_tscale=36000):
-        if x.dim() == 2:
-            x = x.unsqueeze(0)
-        # x = self.pitch(x).permute(0, 2, 1)
-        x = self.encoder(x).permute(0, 2, 1)
-        max_tscale = x.shape[1] * 1000 if max_tscale is None else max_tscale
-        x = x + self.positional(x.shape[1], x.shape[-1], max_tscale).to(device, dtype)
-        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
-        x = self.norm(x)
-        return x
-
 class processor(nn.Module):
     def __init__(self, vocab: int, mels: int, ctx: int, dims: int, head: int, layer: int, act: str = "gelu"): 
         super(processor, self).__init__()
@@ -196,13 +164,22 @@ class processor(nn.Module):
         self.token = nn.Embedding(vocab, dims, device=device, dtype=dtype)
         self.positional = nn.Parameter(torch.empty(ctx, dims, device=device, dtype=dtype), requires_grad=True)
         self.blend = nn.Parameter(torch.tensor(0.5, device=device, dtype=dtype), requires_grad=True)
+        self.positional_sin = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
 
-        self.bA = nn.ModuleList(
-            [feature_encoder(mels=mels, dims=dims, head=head, layer=layer, act=act_fn)] +
-            [Residual(ctx=ctx, dims=dims, head=head, act=act_fn) for _ in range(layer)])
-        self.bB = nn.ModuleList([
-            Residual(ctx=ctx, dims=dims, head=head, act=act_fn)
-            for _ in range(layer)])
+         # pitch
+        # self.encoder = nn.Sequential(
+        #     Conv1d(1, dims, kernel_size=3, stride=1, padding=1), act_fn,
+        #     Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), act_fn,
+        #     Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
+
+
+        self.encoder = nn.Sequential(
+            Conv1d(mels, dims, kernel_size=3, stride=1, padding=1), act_fn,
+            Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), act_fn,
+            Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
+
+        self.bA = nn.ModuleList([Residual(ctx=ctx, dims=dims, head=head, act=act_fn) for _ in range(layer)])
+        self.bB = nn.ModuleList([Residual(ctx=ctx, dims=dims, head=head, act=act_fn) for _ in range(layer)])
 
         mask = torch.empty(ctx, ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
@@ -210,6 +187,9 @@ class processor(nn.Module):
 
     def forward(self, x, xa, sequential=False) -> Tensor:         
         x = self.token(x.long()) + self.positional[:x.shape[1]]
+
+        xa = self.encoder(xa).permute(0, 2, 1)
+        xa = xa + self.positional_sin(xa.shape[1], xa.shape[-1], 36000).to(device, dtype)
 
         for b in chain(self.bA or []):
             xa = b(x=xa, xa=None, mask=None)
@@ -222,7 +202,17 @@ class processor(nn.Module):
             else:
                 a = torch.sigmoid(self.blend)
                 x = a * xc + (1 - a) * x 
-                
+
+        # for b in chain(self.bB or []):
+        #     xd = b(x=torch.cat([x, xa], dim=1), xa=None, mask=None)    
+        #     xm = b(x=xd[:, :x.shape[1]], xa=xd[:, x.shape[1]:], mask=None)
+        #     if sequential:
+        #         x = xm
+        #     else:
+        #         a = torch.sigmoid(self.blend)
+        #         x = a * x + (1 - a) * xm
+
+        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
         x = self.norm(x)
         x = x @ torch.transpose(self.token.weight.to(dtype), 0, 1).float()
         return x
@@ -252,10 +242,8 @@ class Echo(nn.Module):
         enc= {}
         if pitch is not None:
             xa = pitch
-            enc["pitch"] = pitch
         if spectrogram is not None:
             xa = spectrogram
-            enc["spectrogram"] = spectrogram
 
         x = input_ids
         logits = self.processor(x, xa)
@@ -306,8 +294,6 @@ class Echo(nn.Module):
                 self.init_counts["MultiheadA"] += 1
             elif isinstance(module, Residual):
                 self.init_counts["Residual"] += 1
-            elif isinstance(module, feature_encoder):
-                self.init_counts["feature_encoder"] += 1
             elif isinstance(module, processor):
                 self.init_counts["processor"] += 1
             elif isinstance(module, Echo):
@@ -336,10 +322,10 @@ def main():
 
     extract_args = {
         "waveform": False,
-        "spec": False,
+        "spec": True,
         "f0": False,
         "f0t": False,
-        "pitch": True,
+        "pitch": False,
         "harmonics": False,
         "aperiodics": False,
         "phase_mod": False,
