@@ -19,6 +19,13 @@ dtype = torch.float32
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
+PATH = 'E:/hf'
+os.environ['HF_HOME'] = PATH
+os.environ['HF_DATASETS_CACHE'] = PATH
+os.environ['TORCH_HOME'] = PATH
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 @dataclass
 class Dimensions:
     vocab: int
@@ -161,26 +168,15 @@ class Model(nn.Module):
             )       
         
     def forward(self,
-        labels=None,
-        input_ids=None,
-        pitch: Optional[torch.Tensor]=None,
-        ) -> Dict[str, Optional[torch.Tensor]]:
+        labels=None, input_ids=None, pitch: Optional[torch.Tensor]=None) -> Dict[str, Optional[torch.Tensor]]:
         if pitch is not None:
             xa = pitch
         x = input_ids
         logits = self.processor(x, xa)
         loss = None
         if labels is not None:
-            loss = torch.nn.functional.cross_entropy(
-                logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=0)
+            loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1))
         return {"logits": logits, "loss": loss} 
-
-    @property
-    def device(self):
-        return next(self.parameters()).device
-    @property
-    def dtype(self):
-        return next(self.parameters()).dtype
 
     def _init_weights(self, module):
         self.init_counts = {
@@ -225,14 +221,7 @@ def main():
     token = ""
     log_dir = os.path.join('D:/newmodel/output/logs', datetime.now().strftime('%m-%d_%H_%M_%S'))
     os.makedirs(log_dir, exist_ok=True)
-    tokenizer = setup_tokenizer("D:/newmodel/mod5/tokenizer.json")
-
-    sanity_check = False
-    streaming = False
-    load_saved = False
-    save_dataset = False
-    cache_dir = None
-    extract_args = None    
+    tokenizer = setup_tokenizer("D:/newmodel/mod5/tokenizer.json") 
 
     extract_args = {
         "waveform": False,
@@ -260,71 +249,42 @@ def main():
         act="swish",
         )
 
-    train_dataset, test_dataset = prepare_datasets(tokenizer, token, sanity_check=sanity_check, sample_rate=16000, streaming=streaming,
-        load_saved=load_saved, save_dataset=save_dataset, cache_dir=cache_dir, extract_args=extract_args, max_ctx=param.ctx)
+    train_dataset, test_dataset = prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, streaming=False,
+        load_saved=False, save_dataset=False, cache_dir=None, extract_args=None, max_ctx=param.ctx)
 
     model = Model(param).to('cuda')
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     from functools import partial
-    metrics_fn = partial(compute_metrics, print_pred=True, num_samples=1, 
-    tokenizer=tokenizer, model=model)
+    metrics_fn = partial(compute_metrics, print_pred=True, num_samples=1, tokenizer=tokenizer, model=model)
 
-    if sanity_check:
-        training_args = Seq2SeqTrainingArguments(
-            output_dir=log_dir,
-            per_device_train_batch_size=1,
-            per_device_eval_batch_size=1,
-            max_steps=10,
-            eval_steps=5,
-            save_steps=0,
-            warmup_steps=0,
-            logging_steps=1,
-            logging_dir=log_dir,
-            eval_strategy="steps",
-            save_strategy="no",
-            logging_strategy="no",
-            report_to=["tensorboard"],
-            push_to_hub=False,
-            save_total_limit=1,
-            label_names=["labels"],
-            save_safetensors=False,
-            eval_on_start=False,
-            batch_eval_metrics=False,
-            disable_tqdm=False,
-            include_tokens_per_second=True,
-            include_num_input_tokens_seen=True,
-            learning_rate=1e-7,
-            weight_decay=0.01,
-        )
-    else:
-        training_args = Seq2SeqTrainingArguments(
-            output_dir=log_dir,
-            per_device_train_batch_size=1,
-            per_device_eval_batch_size=1,
-            max_steps=1000,
-            eval_steps=100,
-            save_steps=1000,
-            warmup_steps=100,
-            logging_steps=10,
-            logging_dir=log_dir,
-            logging_strategy="steps",
-            eval_strategy="steps",
-            save_strategy="no",
-            report_to=["tensorboard"],
-            push_to_hub=False,
-            save_total_limit=1,
-            label_names=["labels"],
-            save_safetensors=False,
-            eval_on_start=False,
-            batch_eval_metrics=False,
-            disable_tqdm=False,
-            include_tokens_per_second=True,
-            include_num_input_tokens_seen=True,
-            learning_rate=0.00025,
-            weight_decay=0.025,
-        )
+    training_args = Seq2SeqTrainingArguments(
+        output_dir=log_dir,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+        max_steps=1000,
+        eval_steps=100,
+        save_steps=1000,
+        warmup_steps=100,
+        logging_steps=10,
+        logging_dir=log_dir,
+        logging_strategy="steps",
+        eval_strategy="steps",
+        save_strategy="no",
+        report_to=["tensorboard"],
+        push_to_hub=False,
+        save_total_limit=1,
+        label_names=["labels"],
+        save_safetensors=False,
+        eval_on_start=False,
+        batch_eval_metrics=False,
+        disable_tqdm=False,
+        include_tokens_per_second=True,
+        include_num_input_tokens_seen=True,
+        learning_rate=0.00025,
+        weight_decay=0.025,
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=training_args.learning_rate, eps=1e-8, weight_decay=training_args.weight_decay, betas=(0.9, 0.999), 
     amsgrad=False, foreach=False, fused=False, capturable=False, differentiable=False, maximize=False)
