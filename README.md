@@ -44,30 +44,35 @@ Here are the abbreviated steps for replacing theta and radius in the rotary forw
 
 ```python
 
+class rotary(nn.Module):
+    def __init__(self, dims, head):
+        super(rotary, self).__init__()
+        self.dims = dims
+        self.head = head
+        self.head_dim = dims // head
+        self.theta = nn.Parameter((torch.tensor(36000, device=device, dtype=dtype)), requires_grad=True)    
 
-if f0 is not None:
-    if f0.dim == 2:
-        f0 = f0.squeeze0 
-    theta = f0 + self.theta  
-else:
-    theta = self.theta 
+    def forward(self, x=None) -> Tensor:
+        freqs = (self.theta / 220.0) * 700 * (
+            torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), 
+                    self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+        t = torch.arange(x, device=device, dtype=dtype) 
+        freqs = t[:, None] * freqs
+        freqs=torch.polar(torch.ones_like(freqs), freqs)
+        return freqs.unsqueeze(0)
 
-
-freqs = theta.unsqueeze-1  220.0 * 700 * 
-    torch.pow10, torch.linspace0, 2595 * torch.log10torch.tensor1 + 8000700, 
-            self.dim  2, device=theta.device, dtype=theta.dtype  2595 - 1  1000
-
-
-t = torch.arangectx, device=device, dtype=dtype
-freqs = t[:, None] * freqs  # dont repeat or use some other method here 
-
-if self.radii and f0 is not None:
-    radius = f0.todevice, dtype
-    freqs = torch.polarradius.unsqueeze-1, freqs
-else:
-    radius = torch.ones_likefreqs
-    freqs = torch.polarradius, freqs
-            
+    @staticmethod
+    def apply_rotary(x, freqs):
+        x1 = x[..., :freqs.shape[-1]*2]
+        x2 = x[..., freqs.shape[-1]*2:]
+        orig_shape = x1.shape
+        if x1.ndim == 2:
+            x1 = x1.unsqueeze(0)
+        x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
+        x1 = torch.view_as_complex(x1) * freqs
+        x1 = torch.view_as_real(x1).flatten(-2)
+        x1 = x1.view(orig_shape)
+        return torch.cat([x1.type_as(x), x2], dim=-1)
 
 ```python
 
