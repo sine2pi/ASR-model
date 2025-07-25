@@ -16,15 +16,11 @@ Questions:
 ---
 
 
-
-
 To explore the relationship between pitch and rotary embeddings, the model implements three complementary pitch based enhancements:
 
 1. Pitch modulated theta Pitch f0 is used to modify the theta parameter, dynamically adjusting the rotary frequency.
 2. Direct similarity bias: A pitch based similarity bias is added directly to the attention mechanism.
 3. Variable radii in torch.polar: The unit circle radius 1.0 in the torch.polar calculation is replaced with variable radii derived from f0. This creates acoustically-weighted positional encodings, so each position in the embedding space reflects the acoustic prominence in the original speech. This approach effectively adds phase and amplitutde information without significant computational overhead.
-
-
 
 
 
