@@ -1,6 +1,8 @@
 
 ASR model + pitch aware relative positional embeddings. 
 
+<img width="1431" height="636" alt="pitch_spectrogram" src="https://github.com/user-attachments/assets/2db80884-7e27-4a24-ad38-c9b8c28f26da" />
+<img width="233" height="77" alt="legend" src="https://github.com/user-attachments/assets/fad84550-a199-43b3-8471-d011a9fd6f94" />
 
 
 Questions:
