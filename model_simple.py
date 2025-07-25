@@ -35,34 +35,24 @@ class rotary(nn.Module):
         self.dims = dims
         self.head = head
         self.head_dim = dims // head
-        self.theta = nn.Parameter((torch.tensor(36000, device=device, dtype=dtype)), requires_grad=True)  
-        self.twotwenty = nn.Parameter((torch.tensor(220, device=device, dtype=dtype)), requires_grad=True)  
-
-    def forward(self, x=None) -> Tensor:
-        freqs = (self.theta / 220.0) * 700 * (
-            torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), 
-                    self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
-        t = torch.arange(x, device=device, dtype=dtype)  # type: ignore
+        self.theta = nn.Parameter((torch.tensor(10000, device=device, dtype=dtype)), requires_grad=True)  
+    def forward(self, x, ctx) -> Tensor:
+        freqs = (self.theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+        t = torch.arange(ctx, device=device, dtype=dtype) 
         freqs = t[:, None] * freqs
         freqs=torch.polar(torch.ones_like(freqs), freqs)
-        return freqs.unsqueeze(0)
-
-    @staticmethod
-    def apply_rotary(x, freqs):
         x1 = x[..., :freqs.shape[-1]*2]
         x2 = x[..., freqs.shape[-1]*2:]
         orig_shape = x1.shape
-        if x1.ndim == 2:
-            x1 = x1.unsqueeze(0)
         x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
         x1 = torch.view_as_complex(x1) * freqs
         x1 = torch.view_as_real(x1).flatten(-2)
         x1 = x1.view(orig_shape)
         return torch.cat([x1.type_as(x), x2], dim=-1)
 
-class MultiheadA(nn.Module):
+class attention(nn.Module):
     def __init__(self, dims: int, head: int):
-        super(MultiheadA, self).__init__()
+        super(attention, self).__init__()
         self.dims = dims
         self.head = head
         self.head_dim = dims // head
@@ -71,7 +61,7 @@ class MultiheadA(nn.Module):
         self.v = nn.Linear(dims, dims).to(device, dtype)
         self.o = nn.Linear(dims, dims).to(device, dtype)
         self.rope = rotary(dims=dims, head=head)
-        self.lnq = nn.LayerNorm(self.head_dim, bias = False)
+        self.lny = nn.LayerNorm(self.head_dim, bias = False)  
         self.lnx = nn.LayerNorm(dims, bias = False)
     def forward(self, x: Tensor, xa = None, mask = None):
         scale = (self.dims // self.head) ** -0.25
@@ -81,15 +71,13 @@ class MultiheadA(nn.Module):
         q = q.view(*q.shape[:2], self.head, -1).permute(0, 2, 1, 3)
         k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
         v = v.view(*v.shape[:2], self.head, -1).permute(0, 2, 1, 3)
-        q = self.lnq(q)
-        k = self.lnq(k)
-        q = self.rope.apply_rotary(q, (self.rope(q.shape[2]))) # type: ignore
-        k = self.rope.apply_rotary(k, (self.rope(k.shape[2]))) # type: ignore
-        a = scaled_dot_product_attention(q, k, v, is_causal=mask is not None and q.shape[1] > 1)
+        q = self.rope(q, q.shape[2])
+        k = self.rope(k, k.shape[2]) 
+        a = scaled_dot_product_attention(self.lny(q), self.lny(k), v, is_causal=mask is not None and q.shape[1] > 1)
         out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
         return self.o(out)
 
-class t_gate(nn.Module):
+class tgate(nn.Module):
     def __init__(self, dims, num_types=4):
         super().__init__()
         self.gate_projections = nn.ModuleList([
@@ -106,89 +94,58 @@ class t_gate(nn.Module):
 
 class Residual(nn.Module):
     _seen = set()  
-    def __init__(self, dims: int, head: int, ctx: int, act: str = "silu"):
-    
+    def __init__(self, dims: int, head: int, act: str = "silu"):
         super().__init__()
-        
-        self.dims = dims
-        self.head = head
-        self.ctx = ctx
-        self.head_dim = dims // head
         act_fn = get_activation(act)
         self.blend = nn.Parameter(torch.tensor(0.5)) 
-        self.attn = MultiheadA(dims, head)
-        mlp = dims * 4
-        self.mlp = nn.Sequential(Linear(dims, mlp), act_fn, Linear(mlp, dims))
-        self.t_gate = t_gate(dims=dims, num_types=4*2)
-        
+        self.attn = attention(dims, head)
+        self.mlp = nn.Sequential(Linear(dims, dims*4), act_fn, Linear(dims*4, dims))
+        self.tgate = tgate(dims=dims, num_types=4*2)
         self.lna = nn.LayerNorm(dims, bias = False)
-        self.lnb = nn.LayerNorm(dims, bias = False)
-        self.lnc = nn.LayerNorm(dims, bias = False)
-
     def forward(self, x, xa=None, mask=None) -> Tensor:
-        x = x + self.attn(self.lna(x), xa=None, mask=mask)[0]
-        xb = x
+        xb = x + self.attn(self.lna(x), xa=None, mask=mask)[0]
         if xa is not None:
-            x = x + self.attn(self.lnb(x), xa=xa, mask=None)[0]  # type: ignore
+            x = x + self.attn(self.lna(x), xa=xa, mask=None)[0] 
             b = torch.sigmoid(self.blend)
             x = b * xb + (1 - b) * x   
-        normx = self.lnc(x)
-        mlp_out = self.mlp(normx)
-        gate = self.t_gate(normx) 
-        x = x + gate * mlp_out
+        out = self.mlp(self.lna(x))
+        gate = self.tgate(self.lna(x)) 
+        x = x + gate * out
         return x
 
 class processor(nn.Module):
     def __init__(self, vocab: int, mels: int, ctx: int, dims: int, head: int, layer: int, act: str = "gelu"): 
         super(processor, self).__init__()
-        self.dims = dims
-        self.head = head
-        self.layer = layer
-        self.ctx = ctx
-        self.act = act
-        self.dropout = 0.01 
         act_fn = get_activation(act)
-
         self.token = nn.Embedding(vocab, dims, device=device, dtype=dtype)
         self.positional = nn.Parameter(torch.empty(ctx, dims, device=device, dtype=dtype), requires_grad=True)
         self.blend = nn.Parameter(torch.tensor(0.5, device=device, dtype=dtype), requires_grad=True)
         self.positional_sin = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
-
-         # pitch
         self.encoder = nn.Sequential(
             Conv1d(1, dims, kernel_size=3, stride=1, padding=1), act_fn,
             Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), act_fn,
             Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
-
-        # self.encoder = nn.Sequential(
-        #     Conv1d(mels, dims, kernel_size=3, stride=1, padding=1), act_fn,
-        #     Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), act_fn,
-        #     Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
-
-        self.bA = nn.ModuleList([Residual(ctx=ctx, dims=dims, head=head, act=act_fn) for _ in range(layer)])
-        self.bB = nn.ModuleList([Residual(ctx=ctx, dims=dims, head=head, act=act_fn) for _ in range(layer)])
-
+        self.bA = nn.ModuleList([Residual(dims=dims, head=head, act=act_fn) for _ in range(layer)])
+        self.bB = nn.ModuleList([Residual(dims=dims, head=head, act=act_fn) for _ in range(layer)])
         mask = torch.empty(ctx, ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
         self.norm = nn.LayerNorm(dims, device=device, dtype=dtype)
 
-    def forward(self, x, xa, sequential=False) -> Tensor:         
+    def forward(self, x, xa) -> Tensor:    
         x = self.token(x.long()) + self.positional[:x.shape[1]]
-
         xa = self.encoder(xa).permute(0, 2, 1)
-        xa = xa + self.positional_sin(xa.shape[1], xa.shape[-1], 36000).to(device, dtype)
+        xa = xa + self.positional_sin(xa.shape[1], xa.shape[-1], 10000.0).to(device, dtype)
         for b in chain(self.bA or []):
             xa = b(x=xa, xa=None, mask=None)
         for b in chain(self.bB or []):
             x = b(x=x, xa=None, mask=self.mask)
             x = b(x, xa=xa, mask=None)
-
-        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
+        x = nn.functional.dropout(x, p=0.001, training=self.training)
         x = self.norm(x)
         x = x @ torch.transpose(self.token.weight.to(dtype), 0, 1).float()
         return x
    
-class Echo(nn.Module):
+class Model(nn.Module):
     def __init__(self, param: Dimensions):
         super().__init__()
         self.param = param
@@ -206,19 +163,12 @@ class Echo(nn.Module):
     def forward(self,
         labels=None,
         input_ids=None,
-        spectrogram: Optional[torch.Tensor]=None,
         pitch: Optional[torch.Tensor]=None,
         ) -> Dict[str, Optional[torch.Tensor]]:
-
-        enc= {}
         if pitch is not None:
             xa = pitch
-        if spectrogram is not None:
-            xa = spectrogram
-
         x = input_ids
         logits = self.processor(x, xa)
-
         loss = None
         if labels is not None:
             loss = torch.nn.functional.cross_entropy(
@@ -233,14 +183,9 @@ class Echo(nn.Module):
         return next(self.parameters()).dtype
 
     def _init_weights(self, module):
-        std = 0.02
         self.init_counts = {
             "Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0,
-            "Conv2d": 0, "processor": 0, "Echo": 0, 
-            "Residual": 0, "MultiheadA": 0, 
-            "MultiheadC": 0, "MultiheadD": 0, "FEncoder": 0,
-            "WEncoder": 0, "PEncoder": 0, "feature_encoder": 0}
-
+            "Conv2d": 0, "processor": 0, "attention": 0, "Residual": 0}
         for name, module in self.named_modules():
             if isinstance(module, RMSNorm):
                 nn.init.ones_(module.weight)
@@ -252,23 +197,21 @@ class Echo(nn.Module):
                     nn.init.zeros_(module.bias)
                 self.init_counts["Linear"] += 1
             elif isinstance(module, Conv1d):
-                nn.init.normal_(module.weight, mean=0.0, std=std)
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
                 self.init_counts["Conv1d"] += 1
             elif isinstance(module, Conv2d):
-                nn.init.normal_(module.weight, mean=0.0, std=std)
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
                 self.init_counts["Conv2d"] += 1
-            elif isinstance(module, MultiheadA):
-                self.init_counts["MultiheadA"] += 1
+            elif isinstance(module, attention):
+                self.init_counts["attention"] += 1
             elif isinstance(module, Residual):
                 self.init_counts["Residual"] += 1
             elif isinstance(module, processor):
                 self.init_counts["processor"] += 1
-            elif isinstance(module, Echo):
-                self.init_counts["Echo"] += 1
 
     def init_weights(self):
         print("Initializing model weights...")
@@ -320,7 +263,7 @@ def main():
     train_dataset, test_dataset = prepare_datasets(tokenizer, token, sanity_check=sanity_check, sample_rate=16000, streaming=streaming,
         load_saved=load_saved, save_dataset=save_dataset, cache_dir=cache_dir, extract_args=extract_args, max_ctx=param.ctx)
 
-    model = Echo(param).to('cuda')
+    model = Model(param).to('cuda')
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
     
