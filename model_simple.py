@@ -6,12 +6,10 @@ from itertools import chain
 import torch
 import torch.nn.functional as feature
 from torch import nn, Tensor
-from tensordict import TensorDict
 from typing import Optional, Dict, Union, List, Tuple
 import numpy as np
 from functools import partial
 from datetime import datetime
-from tensordict import TensorDict
 from transformers.trainer_seq2seq import Seq2SeqTrainer
 from transformers.training_args_seq2seq import Seq2SeqTrainingArguments
 from echoutils import *
