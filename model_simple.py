@@ -19,14 +19,6 @@ dtype = torch.float32
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
-PATH = 'E:/hf'
-os.environ['HF_HOME'] = PATH
-os.environ['HF_DATASETS_CACHE'] = PATH
-os.environ['TORCH_HOME'] = PATH
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-
 @dataclass
 class Dimensions:
     vocab: int
@@ -43,7 +35,8 @@ class rotary(nn.Module):
         self.dims = dims
         self.head = head
         self.head_dim = dims // head
-        self.theta = nn.Parameter((torch.tensor(36000, device=device, dtype=dtype)), requires_grad=True)    
+        self.theta = nn.Parameter((torch.tensor(36000, device=device, dtype=dtype)), requires_grad=True)  
+        self.twotwenty = nn.Parameter((torch.tensor(220, device=device, dtype=dtype)), requires_grad=True)  
 
     def forward(self, x=None) -> Tensor:
         freqs = (self.theta / 220.0) * 700 * (
@@ -68,35 +61,33 @@ class rotary(nn.Module):
         return torch.cat([x1.type_as(x), x2], dim=-1)
 
 class MultiheadA(nn.Module):
-
     def __init__(self, dims: int, head: int):
         super(MultiheadA, self).__init__()
-
         self.dims = dims
         self.head = head
         self.head_dim = dims // head
-
         self.q = nn.Linear(dims, dims).to(device, dtype)
         self.k = nn.Linear(dims, dims, bias=False).to(device, dtype)
         self.v = nn.Linear(dims, dims).to(device, dtype)
         self.o = nn.Linear(dims, dims).to(device, dtype)
         self.rope = rotary(dims=dims, head=head)
-
+        self.lnq = nn.LayerNorm(self.head_dim, bias = False)
+        self.lnx = nn.LayerNorm(dims, bias = False)
     def forward(self, x: Tensor, xa = None, mask = None):
         scale = (self.dims // self.head) ** -0.25
-        q = self.q(x)
-        k = self.k(x if xa is None else xa)
-        v = self.v(x if xa is None else xa)
-        batch, ctx, dims = q.shape
+        q = self.q(self.lnx(x))
+        k = self.k(self.lnx(x if xa is None else xa))
+        v = self.v(self.lnx(x if xa is None else xa))
         q = q.view(*q.shape[:2], self.head, -1).permute(0, 2, 1, 3)
         k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
         v = v.view(*v.shape[:2], self.head, -1).permute(0, 2, 1, 3)
+        q = self.lnq(q)
+        k = self.lnq(k)
         q = self.rope.apply_rotary(q, (self.rope(q.shape[2]))) # type: ignore
         k = self.rope.apply_rotary(k, (self.rope(k.shape[2]))) # type: ignore
-        a = scaled_dot_product_attention(q, k, v, is_causal=mask is not None and ctx > 1)
+        a = scaled_dot_product_attention(q, k, v, is_causal=mask is not None and q.shape[1] > 1)
         out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
-        qk = None
-        return self.o(out), qk
+        return self.o(out)
 
 class t_gate(nn.Module):
     def __init__(self, dims, num_types=4):
@@ -123,17 +114,16 @@ class Residual(nn.Module):
         self.head = head
         self.ctx = ctx
         self.head_dim = dims // head
-
-        self.blend = nn.Parameter(torch.tensor(0.5)) 
         act_fn = get_activation(act)
+        self.blend = nn.Parameter(torch.tensor(0.5)) 
         self.attn = MultiheadA(dims, head)
         mlp = dims * 4
         self.mlp = nn.Sequential(Linear(dims, mlp), act_fn, Linear(mlp, dims))
         self.t_gate = t_gate(dims=dims, num_types=4*2)
         
-        self.lna = RMSNorm(dims)
-        self.lnb = RMSNorm(dims)
-        self.lnc = RMSNorm(dims)
+        self.lna = nn.LayerNorm(dims, bias = False)
+        self.lnb = nn.LayerNorm(dims, bias = False)
+        self.lnc = nn.LayerNorm(dims, bias = False)
 
     def forward(self, x, xa=None, mask=None) -> Tensor:
         x = x + self.attn(self.lna(x), xa=None, mask=mask)[0]
@@ -165,16 +155,15 @@ class processor(nn.Module):
         self.positional_sin = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
 
          # pitch
-        # self.encoder = nn.Sequential(
-        #     Conv1d(1, dims, kernel_size=3, stride=1, padding=1), act_fn,
-        #     Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), act_fn,
-        #     Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
-
-
         self.encoder = nn.Sequential(
-            Conv1d(mels, dims, kernel_size=3, stride=1, padding=1), act_fn,
+            Conv1d(1, dims, kernel_size=3, stride=1, padding=1), act_fn,
             Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), act_fn,
             Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
+
+        # self.encoder = nn.Sequential(
+        #     Conv1d(mels, dims, kernel_size=3, stride=1, padding=1), act_fn,
+        #     Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), act_fn,
+        #     Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
 
         self.bA = nn.ModuleList([Residual(ctx=ctx, dims=dims, head=head, act=act_fn) for _ in range(layer)])
         self.bB = nn.ModuleList([Residual(ctx=ctx, dims=dims, head=head, act=act_fn) for _ in range(layer)])
@@ -188,27 +177,11 @@ class processor(nn.Module):
 
         xa = self.encoder(xa).permute(0, 2, 1)
         xa = xa + self.positional_sin(xa.shape[1], xa.shape[-1], 36000).to(device, dtype)
-
         for b in chain(self.bA or []):
             xa = b(x=xa, xa=None, mask=None)
-
         for b in chain(self.bB or []):
             x = b(x=x, xa=None, mask=self.mask)
-            xc = b(x, xa=xa, mask=None)
-            if sequential:
-                x = xc
-            else:
-                a = torch.sigmoid(self.blend)
-                x = a * xc + (1 - a) * x 
-
-        # for b in chain(self.bB or []):
-        #     xd = b(x=torch.cat([x, xa], dim=1), xa=None, mask=None)    
-        #     xm = b(x=xd[:, :x.shape[1]], xa=xd[:, x.shape[1]:], mask=None)
-        #     if sequential:
-        #         x = xm
-        #     else:
-        #         a = torch.sigmoid(self.blend)
-        #         x = a * x + (1 - a) * xm
+            x = b(x, xa=xa, mask=None)
 
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
         x = self.norm(x)
@@ -320,10 +293,10 @@ def main():
 
     extract_args = {
         "waveform": False,
-        "spec": True,
+        "spec": False,
         "f0": False,
         "f0t": False,
-        "pitch": False,
+        "pitch": True,
         "harmonics": False,
         "aperiodics": False,
         "phase_mod": False,
