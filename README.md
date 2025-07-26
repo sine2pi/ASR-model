@@ -44,28 +44,24 @@ Reference: [PyTorch Documentation - torch.polar]https:pytorch.orgdocsstablegener
 
 
 
-<img width="349" height="577" alt="standard" src="https://github.com/user-attachments/assets/450f814f-5e9c-4599-8f85-9c5620c42394" />
+<img width="1443" height="702" alt="123123" src="https://github.com/user-attachments/assets/a03d118b-2730-4adb-b667-be773e5eee65" />
 
-
-
-<img width="400" height="500" alt="standardl" src="https://github.com/user-attachments/assets/6197a6a4-c778-443c-9a04-62f99d01fdac" />
 
 
 ```python
 
 
-
 # Modified freq calculation:
 
-   pos = torch.arange(ctx, device=device, dtype=dtype) 
-   freqs = (self.theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
-   freqs = pos[:, None] * freqs
+      pos = torch.arange(ctx, device=device, dtype=dtype) 
+      freqs = (self.theta / 220.0) * 200 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 4000/200)), self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+      freqs = pos[:, None] * freqs
 
 # standard
-        # pos = torch.arange(ctx, dtype=torch.float32, device=device).unsqueeze(1)
-        # dim = torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device)
-        # freqs = pos / (self.theta ** (dim / self.head_dim))
-        # dim = torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device)
+     pos = torch.arange(ctx, dtype=torch.float32, device=device)
+     freqs = 1.0 / (self.theta ** (torch.arange(0, self.head_dim, 2, device=device, dtype=dtype) / (self.head_dim // 2)))
+     freqs = pos[:, None] * freqs
+
 ```
       # 200Hz - 4000Hz (covers 95% of speech content)
       freqs = (self.theta / 220.0) * 200 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 4000/200)), self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
@@ -78,6 +74,7 @@ Reference: [PyTorch Documentation - torch.polar]https:pytorch.orgdocsstablegener
 
       # original
       freqs = (self.theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+
 
 Standard RoPE: 1, 0.1, 0.01, 0.001... (arbitrary geometric)
 This RoPE: 80Hz, 100Hz, 140Hz... (perceptually meaningful)
