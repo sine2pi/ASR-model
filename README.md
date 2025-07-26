@@ -45,11 +45,21 @@ Here are the abbreviated steps for replacing theta and radius in the rotary forw
 
 ```python
 
-    self.theta = nn.Parameter((torch.tensor(32000, device=device, dtype=dtype)), requires_grad=True)  
+    self.theta = nn.Parameter((torch.tensor(10000, device=device, dtype=dtype)), requires_grad=True)  
 
-     freqs = (self.theta/220.0) * 700 * (
-         torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), 
-                 self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+# This performs significantly better than standard 
+
+   pos = torch.arange(ctx, device=device, dtype=dtype) 
+   freqs = (self.theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+   freqs = pos[:, None] * freqs
+
+# standard
+        # pos = torch.arange(ctx, dtype=torch.float32, device=device).unsqueeze(1)
+        # dim = torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device).unsqueeze(0)
+        # freqs = pos / (self.theta ** (dim / self.head_dim))
+        # dim = torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device).unsqueeze(0)
+
+
 
     def _apply_radii(self, freqs, f0, ctx):
         if self.radii and f0 is not None:
