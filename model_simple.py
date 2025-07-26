@@ -17,6 +17,13 @@ dtype = torch.float32
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
+PATH = 'E:/hf'
+os.environ['HF_HOME'] = PATH
+os.environ['HF_DATASETS_CACHE'] = PATH
+os.environ['TORCH_HOME'] = PATH
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 @dataclass
 class Dimensions:
     vocab: int
@@ -55,9 +62,9 @@ class rotary(nn.Module):
         x1 = x1.view(orig_shape)
         return torch.cat([x1.type_as(x), x2], dim=-1)
 
-class attention(nn.Module):
+class attentionb(nn.Module):
     def __init__(self, dims: int, head: int):
-        super(attention, self).__init__()
+        super(attentionb, self).__init__()
         self.dims = dims
         self.head = head
         self.head_dim = dims // head
@@ -65,53 +72,37 @@ class attention(nn.Module):
         self.k = nn.Linear(dims, dims, bias=False).to(device, dtype)
         self.v = nn.Linear(dims, dims).to(device, dtype)
         self.o = nn.Linear(dims, dims).to(device, dtype)
-        self.rope = rotary(dims=dims, head=head)
-        self.lny = nn.LayerNorm(self.head_dim, bias = False)  
-        self.lnx = nn.LayerNorm(dims, bias = False)
-        
+        self.rope = rotary(dims=dims, head=head)  
+        self.lna = nn.LayerNorm(dims, bias = False)
+        self.lnb = nn.LayerNorm(self.head_dim, bias = False)       
+
     def forward(self, x: Tensor, xa = None, mask = None):
-        q = self.q(self.lnx(x))
-        k = self.k(self.lnx(x if xa is None else xa))
-        v = self.v(self.lnx(x if xa is None else xa))
+        q = self.q(self.lna(x))
+        k = self.k(self.lna(x if xa is None else xa))
+        v = self.v(self.lna(x if xa is None else xa))
         q = q.view(*q.shape[:2], self.head, -1).permute(0, 2, 1, 3)
         k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
         v = v.view(*v.shape[:2], self.head, -1).permute(0, 2, 1, 3)
         q = self.rope(q, q.shape[2])
         k = self.rope(k, k.shape[2]) 
-        a = scaled_dot_product_attention(self.lny(q), self.lny(k), v, is_causal=mask is not None and q.shape[1] > 1)
+        a = scaled_dot_product_attention(self.lnb(q), self.lnb(k), v, is_causal=mask is not None and q.shape[1] > 1)
         out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
         return self.o(out)
 
-class tgate(nn.Module):
-    def __init__(self, dims, num_types=4):
-        super().__init__()
-        self.gates = nn.ModuleList([nn.Sequential(Linear(dims, 1), nn.Sigmoid()) for _ in range(num_types)])
-        self.classifier = nn.Sequential(Linear(dims, num_types), nn.Softmax(dim=-1))
-    def forward(self, x):
-        types = self.classifier(x)
-        gates = torch.stack([gate(x) for gate in self.gates], dim=-1)
-        cgate = torch.sum(gates * types.unsqueeze(2), dim=-1)
-        return cgate
-
-class Residual(nn.Module):
-    _seen = set()  
+class Residual(nn.Module): 
     def __init__(self, dims: int, head: int, act: str = "silu"):
         super().__init__()
-        self.ln = nn.LayerNorm(dims, bias = False)
-        self.blend = nn.Parameter(torch.tensor(0.5)) 
-        self.attn = attention(dims, head)
-        self.mlp = nn.Sequential(Linear(dims, dims*4), get_activation(act), Linear(dims*4, dims))
-        self.tgate = tgate(dims=dims, num_types=4*2)
 
-    def forward(self, x, xa=None, mask=None) -> Tensor:
-        xb = x + self.attn(self.ln(x), xa=None, mask=mask)
+        self.lna = nn.LayerNorm(dims, bias=False)  
+        self.attnb = attentionb(dims, head)
+        self.attna = attention(dims, head, max_iterations=3)
+        self.mlp = nn.Sequential(Linear(dims, dims*4), get_activation(act), Linear(dims*4, dims))
+
+    def forward(self, x, xa = None, mask = None) -> Tensor:  
+        x = x + self.attnb(self.lna(x), xa=None, mask=mask)
         if xa is not None:
-            x = x + self.attn(self.ln(x), xa=xa, mask=None) 
-            b = torch.sigmoid(self.blend)
-            x = b * xb + (1 - b) * x
-        out = self.mlp(self.ln(x))
-        gate = self.tgate(self.ln(x)) 
-        x = x + gate * out
+            x = x + self.attna(self.lna(x), xa, mask=None, use_sliding_window=True, win_size=256, span_len=512)  #focusb
+        x = x + self.mlp(self.lna(x))
         return x
 
 class processor(nn.Module):
@@ -121,7 +112,7 @@ class processor(nn.Module):
         self.blend = nn.Parameter(torch.tensor(0.5, device=device, dtype=dtype), requires_grad=True)
         self.token = nn.Embedding(vocab, dims, device=device, dtype=dtype)
         self.positional = nn.Parameter(torch.empty(ctx, dims, device=device, dtype=dtype), requires_grad=True)
-        self.positional_sin = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
+        self.posin = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
 
         act_fn = get_activation(act)        
         self.encoder = nn.Sequential(
@@ -134,20 +125,36 @@ class processor(nn.Module):
         mask = torch.empty(ctx, ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x, xa) -> Tensor:    
+    def forward(self, x, xa, sequential=False) -> Tensor:    
 
         x = self.token(x.long()) + self.positional[:x.shape[1]]    
         xa = self.encoder(xa).permute(0, 2, 1)
-        xa = xa + self.positional_sin(xa.shape[1], xa.shape[-1], 10000.0).to(device, dtype)
+        xa = xa + self.posin(xa.shape[1], xa.shape[-1], 36000.0).to(device, dtype)
+
         for b in chain(self.bA or []):
             xa = b(x=xa, xa=None, mask=None)
+
         for b in chain(self.bB or []):
             x = b(x=x, xa=None, mask=self.mask)
             x = b(x, xa=xa, mask=None)
+            # if sequential:
+            #     x = y
+            # else:
+            #     a = torch.sigmoid(self.blend)
+            #     x = a * y + (1 - a) * x 
+
         x = nn.functional.dropout(x, p=0.001, training=self.training)
         x = self.ln(x)        
         x = x @ torch.transpose(self.token.weight.to(dtype), 0, 1).float()
         return x
+   
+    def init_weights(self):
+        print("Initializing model weights...")
+        self.apply(self._init_weights)
+        print("Initialization summary:")
+        for module_type, count in self.init_counts.items():
+            if count > 0:
+                print(f"{module_type}: {count}")
    
 class Model(nn.Module):
     def __init__(self, param: Dimensions):
@@ -211,3 +218,92 @@ class Model(nn.Module):
             if count > 0:
                 print(f"{module_type}: {count}")
 
+def main():
+    token = ""
+    log_dir = os.path.join('D:/newmodel/output/logs/', datetime.now().strftime('%m-%d_%H_%M_%S'))
+    os.makedirs(log_dir, exist_ok=True)
+    tokenizer = setup_tokenizer("D:/newmodel/mod5/tokenizer.json") 
+
+    extract_args = {
+        "waveform": False,
+        "spec": False,
+        "f0": False,
+        "f0t": False,
+        "pitch": True,
+        "harmonics": False,
+        "aperiodics": False,
+        "phase_mod": False,
+        "crepe": False,        
+        "sample_rate": 16000,
+        "hop_length": 256,
+        "mode": "mean",
+        "debug": False,
+    }
+
+    param = Dimensions(
+        vocab=40000,
+        mels=128,
+        ctx=2048,
+        dims=512,
+        head=4,
+        layer=4,
+        act="swish",
+        )
+
+    train_dataset, test_dataset = prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, streaming=False,
+        load_saved=False, save_dataset=False, cache_dir=None, extract_args=extract_args, max_ctx=param.ctx)
+
+    model = Model(param).to('cuda')
+    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    from functools import partial
+    metrics_fn = partial(compute_metrics, print_pred=True, num_samples=1, tokenizer=tokenizer, model=model)
+
+    training_args = Seq2SeqTrainingArguments(
+        output_dir=log_dir,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+        max_steps=1000,
+        eval_steps=100,
+        save_steps=1000,
+        warmup_steps=100,
+        logging_steps=10,
+        logging_dir=log_dir,
+        logging_strategy="steps",
+        eval_strategy="steps",
+        save_strategy="no",
+        report_to=["tensorboard"],
+        push_to_hub=False,
+        save_total_limit=1,
+        label_names=["labels"],
+        save_safetensors=False,
+        eval_on_start=False,
+        batch_eval_metrics=False,
+        disable_tqdm=False,
+        include_tokens_per_second=True,
+        include_num_input_tokens_seen=True,
+        learning_rate=0.00025,
+        weight_decay=0.025,
+    )
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=training_args.learning_rate, eps=1e-8, weight_decay=training_args.weight_decay, betas=(0.9, 0.999), 
+    amsgrad=False, foreach=False, fused=False, capturable=False, differentiable=False, maximize=False)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=training_args.max_steps, eta_min=1e-9, last_epoch=-1)
+
+    trainer = Seq2SeqTrainer(
+        args=training_args,
+        model=model,
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,
+        data_collator=DataCollator(tokenizer=tokenizer),
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        compute_metrics=metrics_fn,
+        optimizers=(optimizer, scheduler)
+    )
+
+    model.init_weights()
+    trainer.train()
+if __name__ == "__main__":
+
+    main()
