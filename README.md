@@ -55,9 +55,9 @@ Here are the abbreviated steps for replacing theta and radius in the rotary forw
 
 # standard
         # pos = torch.arange(ctx, dtype=torch.float32, device=device).unsqueeze(1)
-        # dim = torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device).unsqueeze(0)
+        # dim = torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device)
         # freqs = pos / (self.theta ** (dim / self.head_dim))
-        # dim = torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device).unsqueeze(0)
+        # dim = torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device)
 
 
 
