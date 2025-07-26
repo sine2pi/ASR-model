@@ -8,6 +8,8 @@ from typing import Optional, Dict
 import numpy as np
 from datetime import datetime
 from dataclasses import dataclass
+from transformers.trainer_seq2seq import Seq2SeqTrainer
+from transformers.training_args_seq2seq import Seq2SeqTrainingArguments
 from torch.nn.functional import scaled_dot_product_attention
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -120,9 +122,8 @@ class attentiona(nn.Module):
 
     def _focus(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None):
         z = default(xa, x)
+        
         q, k, v = create_qkv(self.dims, self.head, self.q, self.k, self.v, self.lna(x), self.lna(z))
-        # q=self.lnb(q)
-        # k=self.lnb(k)
         iteration = 0
         prev_attn = torch.zeros_like(q)
         attn_out = torch.zeros_like(q)
@@ -229,6 +230,7 @@ class attentiona(nn.Module):
 class attentionb(nn.Module):
     def __init__(self, dims: int, head: int):
         super(attentionb, self).__init__()
+        
         self.q,  self.k,  self.v,  self.o, self.lna, self.lnb = qkv_init(dims, head)
         self.dims = dims
         self.head = head
@@ -342,7 +344,7 @@ class Model(nn.Module):
     def _init_weights(self, module):
         self.init_counts = {
             "Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0,
-            "Conv2d": 0, "processor": 0, "attention": 0, "Residual": 0}
+            "Conv2d": 0, "processor": 0, "attentiona": 0, "attentionb": 0, "Residual": 0}
         for name, module in self.named_modules():
             if isinstance(module, RMSNorm):
                 nn.init.ones_(module.weight)
@@ -363,11 +365,10 @@ class Model(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
                 self.init_counts["Conv2d"] += 1
-            elif isinstance(module, attention):
-                self.init_counts["attention"] += 1
-            elif isinstance(module, Residual):
-                self.init_counts["Residual"] += 1
-            elif isinstance(module, processor):
+            elif isinstance(module, attentiona):
+                self.init_counts["attentiona"] += 1
+            elif isinstance(module, attentionb):
+                self.init_counts["attentionb"] += 1
                 self.init_counts["processor"] += 1
 
     def init_weights(self):
