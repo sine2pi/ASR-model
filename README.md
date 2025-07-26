@@ -67,8 +67,22 @@ Reference: [PyTorch Documentation - torch.polar]https:pytorch.orgdocsstablegener
         # freqs = pos / (self.theta ** (dim / self.head_dim))
         # dim = torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device)
 ```
+      # 200Hz - 4000Hz (covers 95% of speech content)
+      freqs = (self.theta / 220.0) * 200 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 4000/200)), self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+      
+      # 150Hz - 6000Hz (covers speech + some emotion/intonation)
+      freqs = (self.theta / 220.0) * 150 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 6000/150)), self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+      
+      # 80Hz - 2000Hz (focus on fundamental frequencies + first few harmonics)
+      freqs = (self.theta / 220.0) * 80 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 2000/80)), self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
 
+      # original
+      freqs = (self.theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
 
+Standard RoPE: 1, 0.1, 0.01, 0.001... (arbitrary geometric)
+This RoPE: 80Hz, 100Hz, 140Hz... (perceptually meaningful)
+
+----
     def _apply_radii(self, freqs, f0, ctx):
         if self.radii and f0 is not None:
             radius = f0.to(device, dtype)
