@@ -8,22 +8,12 @@ from typing import Optional, Dict
 import numpy as np
 from datetime import datetime
 from dataclasses import dataclass
-from transformers.trainer_seq2seq import Seq2SeqTrainer
-from transformers.training_args_seq2seq import Seq2SeqTrainingArguments
 from torch.nn.functional import scaled_dot_product_attention
-from echoutils import *
-# from focusb import *
+
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
-
-PATH = 'E:/hf'
-os.environ['HF_HOME'] = PATH
-os.environ['HF_DATASETS_CACHE'] = PATH
-os.environ['TORCH_HOME'] = PATH
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 @dataclass
 class Dimensions:
@@ -388,92 +378,3 @@ class Model(nn.Module):
             if count > 0:
                 print(f"{module_type}: {count}")
 
-def main():
-    token = ""
-    log_dir = os.path.join('D:/newmodel/output/logs/', datetime.now().strftime('%m-%d_%H_%M_%S'))
-    os.makedirs(log_dir, exist_ok=True)
-    tokenizer = setup_tokenizer("D:/newmodel/mod5/tokenizer.json") 
-
-    extract_args = {
-        "waveform": False,
-        "spec": False,
-        "f0": False,
-        "f0t": False,
-        "pitch": True,
-        "harmonics": False,
-        "aperiodics": False,
-        "phase_mod": False,
-        "crepe": False,        
-        "sample_rate": 16000,
-        "hop_length": 256,
-        "mode": "mean",
-        "debug": False,
-    }
-
-    param = Dimensions(
-        vocab=40000,
-        mels=128,
-        ctx=2048,
-        dims=512,
-        head=4,
-        layer=4,
-        act="swish",
-        )
-
-    train_dataset, test_dataset = prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, streaming=False,
-        load_saved=False, save_dataset=False, cache_dir=None, extract_args=extract_args, max_ctx=param.ctx)
-
-    model = Model(param).to('cuda')
-    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    from functools import partial
-    metrics_fn = partial(compute_metrics, print_pred=True, num_samples=1, tokenizer=tokenizer, model=model)
-
-    training_args = Seq2SeqTrainingArguments(
-        output_dir=log_dir,
-        per_device_train_batch_size=1,
-        per_device_eval_batch_size=1,
-        max_steps=1000,
-        eval_steps=100,
-        save_steps=1000,
-        warmup_steps=100,
-        logging_steps=10,
-        logging_dir=log_dir,
-        logging_strategy="steps",
-        eval_strategy="steps",
-        save_strategy="no",
-        report_to=["tensorboard"],
-        push_to_hub=False,
-        save_total_limit=1,
-        label_names=["labels"],
-        save_safetensors=False,
-        eval_on_start=False,
-        batch_eval_metrics=False,
-        disable_tqdm=False,
-        include_tokens_per_second=True,
-        include_num_input_tokens_seen=True,
-        learning_rate=0.00025,
-        weight_decay=0.025,
-    )
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=training_args.learning_rate, eps=1e-8, weight_decay=training_args.weight_decay, betas=(0.9, 0.999), 
-    amsgrad=False, foreach=False, fused=False, capturable=False, differentiable=False, maximize=False)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=training_args.max_steps, eta_min=1e-9, last_epoch=-1)
-
-    trainer = Seq2SeqTrainer(
-        args=training_args,
-        model=model,
-        train_dataset=train_dataset,
-        eval_dataset=test_dataset,
-        data_collator=DataCollator(tokenizer=tokenizer),
-        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-        compute_metrics=metrics_fn,
-        optimizers=(optimizer, scheduler)
-    )
-
-    model.init_weights()
-    trainer.train()
-if __name__ == "__main__":
-
-    main()
