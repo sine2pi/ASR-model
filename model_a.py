@@ -269,8 +269,6 @@ class processor(nn.Module):
     def __init__(self, vocab: int, mels: int, ctx: int, dims: int, head: int, layer: int, act: str = "gelu"): 
         super(processor, self).__init__()
 
-        self.ln = nn.LayerNorm(dims, device=device, dtype=dtype)
-        self.blend = nn.Parameter(torch.tensor(0.5, device=device, dtype=dtype), requires_grad=True)
         self.token = nn.Embedding(vocab, dims, device=device, dtype=dtype)
         self.positional = nn.Parameter(torch.empty(ctx, dims, device=device, dtype=dtype), requires_grad=True)
         self.posin = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
@@ -286,6 +284,7 @@ class processor(nn.Module):
 
         mask = torch.empty(ctx, ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
+        self.ln = nn.LayerNorm(dims, device=device, dtype=dtype)
 
     def forward(self, x, xa, sequential=False) -> Tensor:    
 
@@ -298,12 +297,7 @@ class processor(nn.Module):
 
         for b in chain(self.bB or []):
             x = b(x=x, xa=None, mask=self.mask)
-            y = b(x, xa=xa, mask=None)
-            if sequential:
-                x = y
-            else:
-                a = torch.sigmoid(self.blend)
-                x = a * y + (1 - a) * x 
+            x = b(x, xa=xa, mask=None)
 
         x = nn.functional.dropout(x, p=0.001, training=self.training)
         x = self.ln(x)        
