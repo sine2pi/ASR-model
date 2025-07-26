@@ -104,7 +104,7 @@ class LocalAttentionModule(nn.Module):
 
 class attentiona(nn.Module):
     def __init__(self, dims: int, head: int, max_iters: int = 3, threshold: float = 0.01, factor: float = 0.1, dropout: float = 0.1):
-        super(attention, self).__init__()
+        super(attentiona, self).__init__()
         
         self.q,  self.k,  self.v,  self.o, self.lna, self.lnb = qkv_init(dims, head)
         self.dims = dims
