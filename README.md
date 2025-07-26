@@ -41,13 +41,21 @@ So, for each element:
 
 Reference: [PyTorch Documentation - torch.polar]https:pytorch.orgdocsstablegeneratedtorch.polar.html
 
-Here are the abbreviated steps for replacing theta and radius in the rotary forward:
+
+
+
+<img width="349" height="577" alt="standard" src="https://github.com/user-attachments/assets/450f814f-5e9c-4599-8f85-9c5620c42394" />
+
+
+
+<img width="400" height="500" alt="standardl" src="https://github.com/user-attachments/assets/6197a6a4-c778-443c-9a04-62f99d01fdac" />
+
 
 ```python
 
-    self.theta = nn.Parameter((torch.tensor(10000, device=device, dtype=dtype)), requires_grad=True)  
 
-# This performs significantly better than standard 
+
+# Modified freq calculation:
 
    pos = torch.arange(ctx, device=device, dtype=dtype) 
    freqs = (self.theta / 220.0) * 700 * (torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
@@ -58,7 +66,7 @@ Here are the abbreviated steps for replacing theta and radius in the rotary forw
         # dim = torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device)
         # freqs = pos / (self.theta ** (dim / self.head_dim))
         # dim = torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device)
-
+```
 
 
     def _apply_radii(self, freqs, f0, ctx):
@@ -67,37 +75,6 @@ Here are the abbreviated steps for replacing theta and radius in the rotary forw
             return torch.polar(radius.unsqueeze(-1), freqs), radius
         else:
             return torch.polar(torch.ones_like(freqs), freqs), None
-
-
- def compute_pitch_tokens(wav, sample_rate, labels, mode="mean"):
-     import pyworld as pw
-     wavnp = wav.numpy().astype(np.float64)
-     f0_np, t = pw.dio(wavnp, sample_rate, frame_period=hop_length / sample_rate * 1000)
-     f0_np = pw.stonemask(wavnp, f0_np, t, sample_rate)
-     t = torch.from_numpy(t)
-     audio_duration = len(wav) / sample_rate
-     T = len(labels)
-     tok_dur_sec = audio_duration / T
-     token_starts = torch.arange(T) * tok_dur_sec
-     token_ends = token_starts + tok_dur_sec
-     start_idx = torch.searchsorted(t, token_starts, side="left")
-     end_idx = torch.searchsorted(t, token_ends, side="right")
-     pitch_tok = torch.zeros(T, dtype=torch.float32)
-     for i in range(T):
-         lo, hi = start_idx[i], max(start_idx[i]+1, end_idx[i]) # type: ignore
-         segment = f0_np[lo:hi]
-         if mode == "mean":
-             pitch_tok[i] = segment.mean()
-         elif mode == "median":
-             pitch_tok[i] = torch.median(segment)
-         else:
-             pitch_tok[i] = segment[-1]
-     pitch_tok[pitch_tok < 100.0] = 0.0
-     bos_pitch = pitch_tok[0] if len(pitch_tok) > 0 else 0.0
-     f0t_tensor = torch.cat([torch.tensor([bos_pitch]), pitch_tok])
-     f0t_tensor = torch.where(f0t_tensor == 0.0, torch.zeros_like(f0t_tensor), (f0t_tensor - 71.0) / (500.0 - 71.0))
-     return pitch_tokens
-
 
 
 ```python
