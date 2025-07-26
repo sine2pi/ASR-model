@@ -243,7 +243,7 @@ def main():
         )
 
     train_dataset, test_dataset = prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, streaming=False,
-        load_saved=False, save_dataset=False, cache_dir=None, extract_args=None, max_ctx=param.ctx)
+        load_saved=False, save_dataset=False, cache_dir=None, extract_args=extract_args, max_ctx=param.ctx)
 
     model = Model(param).to('cuda')
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
