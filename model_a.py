@@ -39,8 +39,6 @@ class rotary(nn.Module):
         return 200 * mel_scale / 1000 
 
     def forward(self, x, ctx) -> Tensor:
-        # theta = x.clone().mean().abs()
-        # print(theta)
         freqs = (self.theta / 220.0) * self.freqs_base
         pos = torch.arange(ctx, device=device, dtype=dtype) 
         freqs = pos[:, None] * freqs
@@ -55,6 +53,16 @@ class rotary(nn.Module):
         x1 = x1.view(orig_shape)
         return torch.cat([x1.type_as(x), x2], dim=-1)
 
+def shape(dims, head, q, k, v):
+    head_dim = dims // head
+    scale = head_dim ** -0.25
+    q = q * scale
+    k = k * scale
+    v = v
+    def _shape(tensor):
+        return tensor.view(*tensor.shape[:2], head, -1).permute(0, 2, 1, 3).contiguous()
+    return _shape(q), _shape(k), _shape(v)
+
 def qkv_init(dims: int, head: int):
     head_dim = dims // head
     q = nn.Linear(dims, dims)
@@ -62,58 +70,48 @@ def qkv_init(dims: int, head: int):
     v = nn.Linear(dims, dims)
     o = nn.Linear(dims, dims)
     lna = nn.LayerNorm(dims, bias=False)  
-    lnb = nn.LayerNorm(head_dim, bias=False)
-    return q, k, v, o, lna, lnb
-
-def create_qkv(dims, head, q, k, v, x, xa):
-    head_dim = dims // head
-    scale = head_dim ** -0.25
-    q = q(x) * scale
-    k = k(xa) * scale
-    v = v(xa)
-    batch, ctx, dims = x.shape
-    def _shape(tensor):
-        return tensor.view(batch, ctx, head, head_dim).transpose(1, 2).contiguous()
-    return _shape(q), _shape(k), _shape(v)
+    lnb = nn.LayerNorm(dims, bias=False)      
+    lnc = nn.LayerNorm(head_dim, bias=False)
+    lnd = nn.LayerNorm(head_dim, bias=False)    
+    return q, k, v, o, lna, lnb, lnc, lnd
 
 def calculate_attention(q, k, v, mask=None, temp=1.0):
     scaled_q = q
     if temp != 1.0 and temp > 0:
         scaled_q = q * (1.0 / temp)**.5
-        # print(temp)
     out = scaled_dot_product_attention(scaled_q, k, v, is_causal=mask is not None and q.shape[1] > 1)        
     return out
 
 class LocalOut(nn.Module):
-    def __init__(self, head_dim: int):
+    def __init__(self, dims: int, head: int):
         super().__init__()
-        self.head_dim = head_dim
+        head_dim = dims // head
         self.query_module = nn.Linear(head_dim, head_dim)
         self.key_module = nn.Linear(head_dim, head_dim)
         self.value_module = nn.Linear(head_dim, head_dim)
         self.out_proj = nn.Linear(head_dim, head_dim)
-    
-    def _reshape_to_output(self, x):
-        return x
 
-class attentiona(nn.Module):
+    def _reshape_to_output(self, attn_output: Tensor) -> Tensor:
+        batch, _, ctx, _ = attn_output.shape
+        return attn_output.transpose(1, 2).contiguous().view(batch, ctx, self.dims)        
+
+class attentionb(nn.Module):
     def __init__(self, dims: int, head: int, max_iter: int = 3, threshold: float = 0.01, factor: float = 0.1, dropout: float = 0.1, temp = 1.0):
-        super(attentiona, self).__init__()
-        self.q,  self.k,  self.v,  self.o, self.lna, self.lnb = qkv_init(dims, head)
+        super(attentionb, self).__init__()
+        self.q,  self.k,  self.v,  self.o, self.lna, self.lnb, self.lnc, self.lnd  = qkv_init(dims, head)
         self.dims = dims
         self.head = head
-        self.head_dim = dims // head
         self.max_iter = max_iter
         self.threshold = nn.Parameter(torch.tensor(threshold))
         self.temp = nn.Parameter(torch.tensor(temp), requires_grad=True)        
         self.factor = nn.Parameter(torch.tensor(factor))
-        self.lnc = nn.LayerNorm(self.head_dim, bias=False)
-        self.lnd = nn.LayerNorm(self.head_dim, bias=False)     
-        self.attn_local = LocalOut(self.head_dim)   
+        self.alocal = LocalOut(dims, head)   
 
     def _focus(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None):
-        z = default(xa, x)
-        q, k, v = create_qkv(self.dims, self.head, self.q, self.k, self.v, self.lna(x), self.lna(z))    
+        q = self.q(self.lna(x))
+        k = self.k(self.lnb(x if xa is None else xa))
+        v = self.v(self.lnb(x if xa is None else xa))
+        q, k, v = shape(self.dims, self.head, q, k, v) 
 
         iteration = 0
         temp = self.temp.item()
@@ -133,9 +131,9 @@ class attentiona(nn.Module):
             qiter = qcur[:, :, :eff_span, :]
             kiter = k[:, :, :eff_span, :]
             viter = v[:, :, :eff_span, :]
-            q = self.attn_local.query_module(qiter)
-            k = self.attn_local.key_module(kiter)
-            v = self.attn_local.value_module(viter)
+            q = self.alocal.query_module(qiter)
+            k = self.alocal.key_module(kiter)
+            v = self.alocal.value_module(viter)
 
             iter_mask = None
             if mask is not None:
@@ -202,21 +200,21 @@ class attentiona(nn.Module):
             output, _ = self._focus(x, xa, mask)
             return output
 
-class attentionb(nn.Module):
+class attentiona(nn.Module):
     def __init__(self, dims: int, head: int):
-        super(attentionb, self).__init__()
-        self.q,  self.k,  self.v,  self.o, self.lna, self.lnb = qkv_init(dims, head)
+        super(attentiona, self).__init__()
+        self.q,  self.k,  self.v,  self.o, self.lna, self.lnb, self.lnc, self.lnd  = qkv_init(dims, head)
         self.dims = dims
         self.head = head
-        self.head_dim = dims // head
-        self.rope = rotary(dims=dims, head=head)    
-
+        self.rope = rotary(dims=dims, head=head)
     def forward(self, x: Tensor, xa = None, mask = None):
-        z = default(xa, x)
-        q, k, v = create_qkv(self.dims, self.head, self.q, self.k, self.v, self.lna(x), self.lna(z))      
+        q = self.q(self.lna(x))
+        k = self.k(self.lnb(x if xa is None else xa))
+        v = self.v(self.lnb(x if xa is None else xa))
+        q, k, v = shape(self.dims, self.head, q, k, v)    
         q = self.rope(q, q.shape[2])
         k = self.rope(k, k.shape[2]) 
-        a = scaled_dot_product_attention(self.lnb(q), self.lnb(k), v, is_causal=mask is not None and q.shape[1] > 1)
+        a = scaled_dot_product_attention(self.lnc(q), self.lnd(k), v, is_causal=mask is not None and q.shape[1] > 1)
         out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
         return self.o(out)
 
@@ -225,14 +223,15 @@ class Residual(nn.Module):
         super().__init__()
 
         self.lna = nn.LayerNorm(dims, bias=False)  
-        self.attnb = attentionb(dims, head)
-        self.attna = attentiona(dims, head, max_iter=3)
+        self.attna = attentiona(dims, head)
+        self.attnb = attentionb(dims, head, max_iter=3)
         self.mlp = nn.Sequential(Linear(dims, dims*4), get_activation(act), Linear(dims*4, dims))
 
     def forward(self, x, xa = None, mask = None) -> Tensor:   
-        x = x + self.attnb(self.lna(x), None, mask)
+        x = x + self.attna(self.lna(x), mask=mask)
         if xa is not None:
-            x = x + self.attna(self.lna(x), xa, None, use_sliding_win=True, win_size=500, span_len=1500)  
+            x = x + self.attna(self.lna(x), xa, mask=None)            
+            x = x + self.attnb(self.lna(x), xa, mask=None, use_sliding_win=True, win_size=256, span_len=512)  
         x = x + self.mlp(self.lna(x))
         return x
 
@@ -242,6 +241,7 @@ class processor(nn.Module):
 
         self.lna = nn.LayerNorm(dims)
         self.lnb = nn.LayerNorm(dims)
+        self.lnc = nn.LayerNorm(dims)        
         self.token_emb = nn.Embedding(vocab, dims)
         self.positions = nn.Parameter(torch.empty(ctx, dims), requires_grad=True)
         self.audio_emb = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
@@ -264,14 +264,13 @@ class processor(nn.Module):
         xa = xa + self.audio_emb(xa.shape[1], xa.shape[-1], 36000.0).to(device, dtype)
 
         for b in chain(self.bA or []):
-            xa = b(self.lna(xa), None, None)
-            x  = b(x, None, self.mask)
-            x  = b(x, xa, None)
-            xc = b(torch.cat([x, xa], dim=1), xa=xa, mask=self.mask) if modal else None    
+            xa = b(self.lna(xa))
+            x = b(self.lnb(x), xa=xa, mask=self.mask)
+            xc = b(torch.cat([x, xa], dim=1), xa=None, mask=self.mask) if modal else None    
             x  = b(x=xc[:, :x.shape[1]], xa=xc[:, x.shape[1]:], mask=None) if modal else x
 
         x = nn.functional.dropout(x, p=0.001, training=self.training)
-        x = self.lnb(x)        
+        x = self.lnc(x)        
         x = x @ torch.transpose(self.token_emb.weight.to(dtype), 0, 1).float()
         return x
 
