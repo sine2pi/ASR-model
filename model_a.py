@@ -9,7 +9,7 @@ import numpy as np
 from datetime import datetime
 from dataclasses import dataclass
 from torch.nn.functional import scaled_dot_product_attention
-
+from echoutils import *
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 warnings.filterwarnings("ignore")
@@ -31,7 +31,7 @@ class rotary(nn.Module):
         self.dims = dims
         self.head = head
         self.head_dim = dims // head
-        self.theta = nn.Parameter((torch.tensor(10000, device=device, dtype=dtype)), requires_grad=True)  
+        self.theta = nn.Parameter((torch.tensor(36000, device=device, dtype=dtype)), requires_grad=True)  
         self.register_buffer('freqs_base', self._compute_freqs_base(), persistent=False)
 
     def _compute_freqs_base(self):
@@ -39,6 +39,8 @@ class rotary(nn.Module):
         return 200 * mel_scale / 1000 
 
     def forward(self, x, ctx) -> Tensor:
+        # theta = x.clone().mean().abs()
+        # print(theta)
         freqs = (self.theta / 220.0) * self.freqs_base
         pos = torch.arange(ctx, device=device, dtype=dtype) 
         freqs = pos[:, None] * freqs
@@ -74,11 +76,11 @@ def create_qkv(dims, head, q, k, v, x, xa):
         return tensor.view(batch, ctx, head, head_dim).transpose(1, 2).contiguous()
     return _shape(q), _shape(k), _shape(v)
 
-def calculate_attention(q, k, v, mask=None, temperature=1.0):
+def calculate_attention(q, k, v, mask=None, temp=1.0):
     scaled_q = q
-    if temperature != 1.0 and temperature > 0:
-        scaled_q = q * (1.0 / temperature)**.5
-
+    if temp != 1.0 and temp > 0:
+        scaled_q = q * (1.0 / temp)**.5
+        # print(temp)
     out = scaled_dot_product_attention(scaled_q, k, v, is_causal=mask is not None and q.shape[1] > 1)        
     return out
 
@@ -95,7 +97,7 @@ class LocalOut(nn.Module):
         return x
 
 class attentiona(nn.Module):
-    def __init__(self, dims: int, head: int, max_iter: int = 3, threshold: float = 0.01, factor: float = 0.1, dropout: float = 0.1):
+    def __init__(self, dims: int, head: int, max_iter: int = 3, threshold: float = 0.01, factor: float = 0.1, dropout: float = 0.1, temp = 1.0):
         super(attentiona, self).__init__()
         self.q,  self.k,  self.v,  self.o, self.lna, self.lnb = qkv_init(dims, head)
         self.dims = dims
@@ -103,17 +105,18 @@ class attentiona(nn.Module):
         self.head_dim = dims // head
         self.max_iter = max_iter
         self.threshold = nn.Parameter(torch.tensor(threshold))
+        self.temp = nn.Parameter(torch.tensor(temp), requires_grad=True)        
         self.factor = nn.Parameter(torch.tensor(factor))
-        self.dropout = dropout 
         self.lnc = nn.LayerNorm(self.head_dim, bias=False)
         self.lnd = nn.LayerNorm(self.head_dim, bias=False)     
-        self.attn_local = LocalOut(self.head_dim)
+        self.attn_local = LocalOut(self.head_dim)   
 
     def _focus(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None):
         z = default(xa, x)
         q, k, v = create_qkv(self.dims, self.head, self.q, self.k, self.v, self.lna(x), self.lna(z))    
 
         iteration = 0
+        temp = self.temp.item()
         prev_out = torch.zeros_like(q)
         attn_out = torch.zeros_like(q)
         threshold = self.threshold.item()
@@ -121,7 +124,7 @@ class attentiona(nn.Module):
         qcur = q
 
         while iteration < self.max_iter:
-            eff_span = min(x.shape[1], qcur.size(1), k.size(1))
+            eff_span = min(qcur.shape[1], k.shape[1])
             if xa is not None:
                 eff_span = min(eff_span, xa.shape[1])
             if eff_span == 0: 
@@ -143,7 +146,7 @@ class attentiona(nn.Module):
 
             attn_iter = calculate_attention(
                 self.lnc(q), self.lnd(k), v,
-                mask=iter_mask)
+                mask=iter_mask, temp=temp)
 
             iter_out = torch.zeros_like(qcur)
             iter_out[:, :, :eff_span, :] = attn_iter
@@ -157,21 +160,22 @@ class attentiona(nn.Module):
             qcur = qcur + iter_out
             attn_out = iter_out
             iteration += 1
+            temp += 0.005
 
         output = attn_out.permute(0, 2, 1, 3).flatten(start_dim=2)
         return self.o(output), None
 
     def _slide_win_local(self, x: Tensor, win_size: int, span_len: int, mask: Optional[Tensor] = None) -> Tensor:
 
-        batch, ctx, dims = x.size()
+        batch, ctx, dims = x.shape
         output = torch.zeros_like(x)
         num_win = (ctx + win_size - 1) // win_size
 
         for i in range(num_win):
             qstart = i * win_size
             qend = min(qstart + win_size, ctx)
-            current_win_qlen = qend - qstart
-            if current_win_qlen == 0: 
+            win_qlen = qend - qstart
+            if win_qlen == 0: 
                 continue
 
             kstart = max(0, qend - span_len)
@@ -186,10 +190,7 @@ class attentiona(nn.Module):
                 elif mask.dim() == 2:
                     win_mask = mask[qstart:qend, kstart:kend]
 
-            attn_out, _ = self._focus(
-                x=qwin,
-                xa=kwin,
-                mask=win_mask)
+            attn_out, _ = self._focus(x=qwin, xa=kwin, mask=win_mask)
             output[:, qstart:qend, :] = attn_out
         return output
 
@@ -239,8 +240,8 @@ class processor(nn.Module):
     def __init__(self, vocab: int, mels: int, ctx: int, dims: int, head: int, layer: int, act: str = "gelu"): 
         super(processor, self).__init__()
 
-        self.ln = nn.LayerNorm(dims)
-        self.blend = nn.Parameter(torch.tensor(0.5), requires_grad=True)
+        self.lna = nn.LayerNorm(dims)
+        self.lnb = nn.LayerNorm(dims)
         self.token_emb = nn.Embedding(vocab, dims)
         self.positions = nn.Parameter(torch.empty(ctx, dims), requires_grad=True)
         self.audio_emb = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
@@ -252,7 +253,7 @@ class processor(nn.Module):
             Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
 
         self.bA = nn.ModuleList([Residual(dims, head, act_fn) for _ in range(layer)])
-        
+
         mask = torch.empty(ctx, ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
@@ -263,14 +264,14 @@ class processor(nn.Module):
         xa = xa + self.audio_emb(xa.shape[1], xa.shape[-1], 36000.0).to(device, dtype)
 
         for b in chain(self.bA or []):
-            xa = b(xa, None, None)
+            xa = b(self.lna(xa), None, None)
             x  = b(x, None, self.mask)
             x  = b(x, xa, None)
             xc = b(torch.cat([x, xa], dim=1), xa=xa, mask=self.mask) if modal else None    
             x  = b(x=xc[:, :x.shape[1]], xa=xc[:, x.shape[1]:], mask=None) if modal else x
 
         x = nn.functional.dropout(x, p=0.001, training=self.training)
-        x = self.ln(x)        
+        x = self.lnb(x)        
         x = x @ torch.transpose(self.token_emb.weight.to(dtype), 0, 1).float()
         return x
 
