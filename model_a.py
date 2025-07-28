@@ -264,8 +264,9 @@ class processor(nn.Module):
         xa = xa + self.audio_emb(xa.shape[1], xa.shape[-1], 36000.0).to(device, dtype)
 
         for b in chain(self.bA or []):
-            xa = b(self.lna(xa))
-            x = b(self.lnb(x), xa=xa, mask=self.mask)
+            xa = b(x=xa, xa=None, mask=None)
+            x  = b(x=x, xa=None, mask=self.mask)
+            x  = b(x=x, xa=xa, mask=None)
             xc = b(torch.cat([x, xa], dim=1), xa=None, mask=self.mask) if modal else None    
             x  = b(x=xc[:, :x.shape[1]], xa=xc[:, x.shape[1]:], mask=None) if modal else x
 
