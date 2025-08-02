@@ -1,15 +1,12 @@
-import os
+
 import warnings
 import logging
 from itertools import chain
 import torch
-import torch.nn.functional as F
 from torch import nn, Tensor, einsum
-from typing import Optional, List, Tuple, Union
-
+from typing import Optional
 import numpy as np
 from dataclasses import dataclass
-
 from torch.nn.functional import scaled_dot_product_attention
 from einops import rearrange
 
@@ -26,71 +23,6 @@ def sinusoids(ctx, dims, max_tscale=10000):
     position = torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=1) 
     positional_embedding = nn.Parameter(position, requires_grad=True)
     return positional_embedding
-
-def valid(default_value, *items):
-    for item in items:
-        if item is not None:
-            return item
-    return default_value
-
-def dict_to(d, device, dtype=dtype):
-    return {k: v.to(device, dtype) if isinstance(v, torch.Tensor) else v 
-            for k, v in d.items()}
-    
-
-class Conv1d(nn.Conv1d):
-    def _conv_forward(
-        self, x: Tensor, weight: Tensor, bias) -> Tensor:
-        return super()._conv_forward(x, weight.to(x.device, x.dtype), None if bias is None else bias.to(x.device, x.dtype))
-
-class Conv2d(nn.Conv2d):
-    def _conv_forward(
-        self, x: Tensor, weight: Tensor, bias) -> Tensor:
-        return super()._conv_forward(x, weight.to(x.device, x.dtype), None if bias is None else bias.to(x.device, x.dtype))
-
-class Linear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True) -> None:
-        super(Linear, self).__init__()
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
-        torch.nn.init.xavier_uniform_(self.linear.weight)
-        if bias:
-            torch.nn.init.zeros_(self.linear.bias)
-    def forward(self, x: Tensor) -> Tensor:
-        return self.linear(x)
-    
-class RMSNorm(nn.Module):
-    def __init__(self, dims: Union[int, Tensor, List, Tuple], 
-                 eps = 1e-8, elementwise_affine = True):
-        super(RMSNorm, self).__init__()
-        if isinstance(dims, int):
-            self.normalized_shape = (dims,)
-        else:
-            self.normalized_shape = tuple(dims)
-        self.eps = eps
-        self.elementwise_affine = elementwise_affine
-        if self.elementwise_affine:
-            self.weight = nn.Parameter(torch.empty(self.normalized_shape))  # type: ignore
-            torch.nn.init.ones_(self.weight)  
-        else:
-            self.register_parameter("weight", None)
-    def forward(self, x):
-        return F.rms_norm(x, self.normalized_shape, self.weight, self.eps)  # type: ignore
-    
-def LayerNorm(x: Tensor, normalized_shape: Union[int, Tensor, List, Tuple],
-               weight: Optional[Tensor] = None, bias: Optional[Tensor] = None,
-               eps: float = 1e-5) -> Tensor:
-    return F.layer_norm(x, normalized_shape, weight, bias, eps)  # type: ignore
-
-def get_device():
-    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-def get_dtype():
-    return torch.float32 if torch.cuda.is_available() else torch.float64
-
-def l2norm(tensor):
-    dtype = tensor.dtype
-    normed = F.normalize(tensor, dim = -1)
-    return normed.type(dtype)
 
 def get_activation(act: str) -> nn.Module:
     act_map = {
@@ -109,16 +41,6 @@ def get_activation(act: str) -> nn.Module:
 
 def there_is_a(val):
     return val is not None
-
-def to(t):
-    return {'device': t.device, 'dtype': t.dtype}
-
-PATH = 'E:/hf'
-os.environ['HF_HOME'] = PATH
-os.environ['HF_DATASETS_CACHE'] = PATH
-os.environ['TORCH_HOME'] = PATH
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 @dataclass
 class Dimensions:
@@ -187,17 +109,9 @@ def calculate_attention(q, k, v, mask=None, temp=1.0):
     scaled_q = q
     if temp != 1.0 and temp > 0:
         scaled_q = q * (1.0 / temp)**.5
+        print(temp)
     out = scaled_dot_product_attention(scaled_q, k, v, is_causal=mask is not None and q.shape[1] > 1)        
     return out
-
-# def calculate_attention(q_norm, k_norm, v_iter, mask=None, temp=1.0):
-#     d_k = q_norm.size(-1)
-#     scores = torch.matmul(q_norm, k_norm.transpose(-2, -1)) / (torch.sqrt(torch.tensor(d_k, dtype=torch.float32)) / temp)
-#     if mask is not None:
-#         scores = scores.masked_fill(mask == 0, float('-inf'))
-#     attention_weights = F.softmax(scores, dim=-1)
-#     output = torch.matmul(attention_weights, v_iter)
-#     return output
 
 class LocalOut(nn.Module):
     def __init__(self, dims: int, head: int):
@@ -215,26 +129,26 @@ class LocalOut(nn.Module):
 
 class attentionb(nn.Module):
     def __init__(self, dims: int, head: int, max_iter: int = 3, 
-    threshold: float = 0.01, factor: float = 0.1, dropout: float = 0.1, temp = 1.0, use_win=False):
+    threshold: float = 0.01, factor: float = 0.1, dropout: float = 0.1, temp = 1.0):
         super(attentionb, self).__init__()
 
         self.head = head
         self.dims = dims
-        head_dim = dims // head
+        self.head_dim = dims // head
+        self.win = 0
 
         self.que = nn.Linear(dims, dims, bias=False) 
         self.kv = nn.Linear(dims, dims * 2, bias=False)
         self.out = nn.Linear(dims, dims, bias=False)
 
         self.lna = nn.LayerNorm(dims) 
-        self.lnb = nn.LayerNorm(head_dim) 
+        self.lnb = nn.LayerNorm(self.head_dim) 
         self.rope = rotary(dims, head) 
-        self.use_win = use_win
 
         self.max_iter = max_iter
-        self.threshold = nn.Parameter(torch.tensor(threshold))
+        self.threshold = nn.Parameter(torch.tensor(threshold), requires_grad=True)
         self.temp = nn.Parameter(torch.tensor(temp), requires_grad=True)        
-        self.factor = nn.Parameter(torch.tensor(factor))
+        self.factor = nn.Parameter(torch.tensor(factor), requires_grad=True)
         self.local = LocalOut(dims, head)   
 
     def update_win(self, win_size=None):
@@ -246,109 +160,109 @@ class attentionb(nn.Module):
             return win_size
         return None
 
-    def _focus(self, x, xa = None, mask = None, use_win = False):
+    def _focus(self, x, xa = None, mask = None, win_size=None):
 
         q = self.que(self.lna(x))
-        k, v = self.kv(self.lna(x if xa is None else xa)).chunk(2, dim=-1)
+        k, v = self.kv(self.lna(x if not xa else xa)).chunk(2, dim=-1)
         q, k, v = map(lambda t: rearrange(t, 'b c (h d) -> b h c d', h = self.head), (q, k, v))
-        _, _, ctx, _ = q.shape        
+      
         self.scale = q.shape[-1] ** -0.35
         q = self.rope(q)
         k = self.rope(k)
 
-        if use_win:  
-            iteration = 0
-            temp = self.temp.item()
-            prev_out = torch.zeros_like(q)
-            attn_out = torch.zeros_like(q)
-            threshold = self.threshold.item()
-            factor = self.factor.item()
-            curq = q
+        iteration = 0
+        temp = self.temp
+        prev_out = torch.zeros_like(q)
+        attn_out = torch.zeros_like(q)
+        threshold = self.threshold
+        factor = self.factor
+        curq = q #if curq is None else curq
+        
+        while iteration < self.max_iter:
+            eff_span = min(curq.shape[1], k.shape[1])
+            if xa is not None:
+                eff_span = min(eff_span, xa.shape[1])
+            if eff_span == 0: 
+                break
 
-            while iteration < self.max_iter:
-                eff_span = min(curq.shape[1], k.shape[1])
-                if xa is not None:
-                    eff_span = min(eff_span, xa.shape[1])
-                if eff_span == 0: 
-                    break
+            qiter = curq[:, :, :eff_span, :]
+            kiter = k[:, :, :eff_span, :]
+            viter = v[:, :, :eff_span, :]
+            q = self.local.q_hd(qiter)
+            k = self.local.k_hd(kiter)
+            v = self.local.v_hd(viter)
 
-                qiter = curq[:, :, :eff_span, :]
-                kiter = k[:, :, :eff_span, :]
-                viter = v[:, :, :eff_span, :]
-                q = self.local.q_hd(qiter)
-                k = self.local.k_hd(kiter)
-                v = self.local.v_hd(viter)
+            iter_mask = None
+            if mask is not None:
+                if mask.dim() == 4: 
+                    iter_mask = mask[:, :, :eff_span, :eff_span]
+                elif mask.dim() == 2: 
+                    iter_mask = mask[:eff_span, :eff_span]
 
-                iter_mask = None
-                if mask is not None:
-                    if mask.dim() == 4: 
-                        iter_mask = mask[:, :, :eff_span, :eff_span]
-                    elif mask.dim() == 2: 
-                        iter_mask = mask[:eff_span, :eff_span]
+            attn_iter = calculate_attention(
+                self.lnb(q), self.lnb(k), v,
+                mask=iter_mask, temp=temp)
 
-                attn_iter = calculate_attention(
-                    self.lnb(q), self.lnb(k), v,
-                    mask=iter_mask, temp=temp)
-
-                iter_out = torch.zeros_like(curq)
-                iter_out[:, :, :eff_span, :] = attn_iter
-                diff = torch.abs(iter_out - prev_out).mean()
-                dthresh = threshold + factor * diff
-                if diff < dthresh and iteration > 0:
-                    attn_out = iter_out
-                    break
-
-                prev_out = iter_out.clone()
-                curq = curq + iter_out
+            iter_out = torch.zeros_like(curq)
+            iter_out[:, :, :eff_span, :] = attn_iter
+            diff = torch.abs(iter_out - prev_out).mean()
+            dthresh = threshold + factor * diff
+            if diff < dthresh and iteration > 0:
                 attn_out = iter_out
-                iteration += 1
-                temp += 0.005
-        else:
-            attn_out = scaled_dot_product_attention(self.lnc(q), self.lnd(k), v, is_causal=mask is not None and ctx >1)
-        wv = attn_out.permute(0, 2, 1, 3).flatten(start_dim=2)
-        qk=None
-        return self.out(wv), qk
+                break
 
-    def _slide_win_local(self, x, mask = None, use_win = True) -> Tensor:
+            prev_out = iter_out.clone()
+            curq = curq + iter_out
+            attn_out = iter_out
+            # if win_size is not None:
+            #     if win_size > self.win:
+            #         temp += 0.005
+            #     else:
+            #         temp -= 0.005
+            #     self.win = win_size   
+            iteration += 1
+
+        out = attn_out.permute(0, 2, 1, 3).flatten(start_dim=2)
+        return out
+
+    def _slide_win_local(self, x, mask = None) -> Tensor:
 
         win = self.update_win()
-        win_size = win if win is not None else 128
-        span_len = win_size + win_size // 10
+        win_size = win if win is not None else self.head_dim
+        span_len = win_size + win_size // self.head
 
         _, ctx, _ = x.shape
-        output = torch.zeros_like(x)
+        out = torch.zeros_like(x)
         windows = (ctx + win_size - 1) // win_size
 
         for i in range(windows):
             qstart = i * win_size
             qend = min(qstart + win_size, ctx)
-            win_qlen = qend - qstart
-            if win_qlen == 0: 
+            qlen = qend - qstart
+            if qlen == 0: 
                 continue
 
             kstart = max(0, qend - span_len)
-            kend = qend
             qwin = x[:, qstart:qend, :]
-            kwin = x[:, kstart:kend, :]
+            kwin = x[:, kstart:qend, :]
 
             win_mask = None
             if mask is not None:
                 if mask.dim() == 4:
-                    win_mask = mask[:, :, qstart:qend, kstart:kend]
+                    win_mask = mask[:, :, qstart:qend, kstart:qend]
                 elif mask.dim() == 2:
-                    win_mask = mask[qstart:qend, kstart:kend]
+                    win_mask = mask[qstart:qend, kstart:qend]
 
-            attn_out, _ = self._focus(x=qwin, xa=kwin, mask=win_mask, use_win=True)
-            output[:, qstart:qend, :] = attn_out
-        return output
+            attn_out = self._focus(x=qwin, xa=kwin, mask=win_mask, win_size=win_size)
+            out[:, qstart:qend, :] = attn_out
+        return out
 
-    def forward(self, x, xa = None, mask = None, use_win: bool = False):
-        if use_win:
-            return self._slide_win_local(x, mask, use_win=True)
-        else:
-            output, _ = self._focus(x, xa, mask, use_win=False)
-            return output
-
+    def forward(self, x, xa = None, mask = None):
+            x = self._slide_win_local(x, mask=None)
+            xa = self._slide_win_local(xa, mask=None)
+            output = self._focus(x, xa, mask=None)
+            return self.out(output)
+       
 class attentiona(nn.Module):
     def __init__(self, dims: int, head: int, dropout_rate: float = 0.1, cross_talk=False):
         super().__init__()
@@ -370,8 +284,8 @@ class attentiona(nn.Module):
 
         q = self.que(self.ln(x))
         k, v = self.kv(self.ln(x if xa is None else xa)).chunk(2, dim=-1)
-        q, k, v = map(lambda t: rearrange(t, 'b c (h d) -> b h c d', h = self.head), (q, k, v))
 
+        q, k, v = map(lambda t: rearrange(t, 'b c (h d) -> b h c d', h = self.head), (q, k, v))
         scale = q.shape[-1] ** -0.5
 
         q = self.rope(q)
@@ -388,26 +302,6 @@ class attentiona(nn.Module):
         wv = einsum('b h k q, b h q d -> b h k d', qk, v) 
         wv = rearrange(wv, 'b h c d -> b c (h d)')
         out = self.out(wv)
-
-        if self.cross_talk:
-            qk, v = self.kv(self.ln(x)).chunk(2, dim=-1) 
-            qka, va = self.kv(self.ln(x if xa is None else xa)).chunk(2, dim=-1)
-            qk, qka, v, va = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.head), (qk, qka, v, va))
-            qk = einsum('b h i d, b h j d -> b h i j', qk, qka)
-            if there_is_a(mask):
-                i, j = qk.shape[-2:]
-                mask = torch.ones(i, j, device=device, dtype=torch.bool).triu(j - i + 1)
-                qk = qk.masked_fill(mask, -torch.finfo(qk.dtype).max)
-            x = qk.softmax(dim = -1)
-            xa = qk.softmax(dim = -2)
-            x = self.x(x)
-            xa = self.xa(xa)
-            x = einsum('b h i j, b h j d -> b h i d', x, va)
-            xa = einsum('b h j i, b h j d -> b h i d', xa, v)
-            x, xa = map(lambda t: rearrange(t, 'b h n d -> b n (h d)'), (x, xa))
-            out = self.out(x)  # outxa = self.out(xa) 
-           
-        return out, qk
 
 class attentiond(nn.Module):
     def __init__(self, dims: int, head: int):
@@ -464,11 +358,10 @@ class residual(nn.Module):
 
         self.lna = nn.LayerNorm(dims, bias=False)           
         self.atta = attentiona(dims, head)
-        self.attb = attentiona(dims, head)
+        self.attb = attentionb(dims, head, max_iter=1)        
         # self.attc = attentiona(dims, head, cross_talk=True)
-        self.attb = attentionb(dims, head, max_iter=1, use_win=True, temp=1.0)
-        self.tgate = tgate(dims, num_types=4)
 
+        self.tgate = tgate(dims, num_types=4)
         self.mlp = nn.Sequential(nn.Linear(dims, dims*4), get_activation(act), nn.Linear(dims*4, dims))
 
     def forward(
@@ -479,9 +372,7 @@ class residual(nn.Module):
     ):
         x = x + self.atta(x, mask=mask)[0]  
         if xa is not None:
-            x = x + self.attb(x, xa, mask=None)[0]  
-            # x = x + self.attc(x, xa, mask=None)[0]  
-            # x = x + self.attd(x, xa, mask=None)[0]  
+            x = x + self.attb(x, xa, mask=None)
         x = x + self.tgate(x)
         x = x + self.mlp(self.lna(x))
         return x
@@ -507,7 +398,7 @@ class processor(nn.Module):
         mask = torch.empty(ctx, ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x, xa, sequential=False, modal=True, kv_cache=None) -> Tensor:    
+    def forward(self, x, xa, sequential=False, modal=False, kv_cache=None) -> Tensor:    
 
         if xa.dim() == 2:
             xa = xa.unsqueeze(0)
@@ -554,7 +445,7 @@ class Model(nn.Module):
                 module.update_win(win_size)
 
     def adjust_window(self, loss, ctx):
-        self.win_size = ((ctx // self.param.head)) #based on loss but not on the graph itself which is the idea
+        self.win_size = ((ctx // self.param.head))
         if loss < self.best_loss:
             win_size = (self.win_size * self.factor) #.clamp(0, ctx - 1)
         else:   
