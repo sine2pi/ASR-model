@@ -1,22 +1,8 @@
 
 ASR model + pitch aware relative positional embeddings. 
 
-### Decrease WER significantly compared to standard inverse frequency. 'eval_wer': 35.3
+Everything here is an experiment. Nothing in these repositories are intended for production.
 
-    def _compute_freqs_base(self):
-        mel_scale = torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 4000/200)), self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1
-        return 200 * mel_scale / 1000 
-
-### Standared inv freqs: 'eval_wer': 61.6
-     freqs = 1.0 / (self.theta ** (torch.arange(0, self.head_dim, 2, device=device, dtype=dtype) / (self.head_dim // 2)))
-
-     
-
-<img width="1363" height="732" alt="pitch_spectrogram" src="https://github.com/user-attachments/assets/ceb65e94-7df4-41b7-aa3d-c4aa4c6c0717" />
-
-<img width="233" height="77" alt="legend" src="https://github.com/user-attachments/assets/fad84550-a199-43b3-8471-d011a9fd6f94" />
-
-https://huggingface.co/Sin2pi/asr-model/tensorboard
 
 Questions:
 
