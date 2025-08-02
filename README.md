@@ -2,7 +2,7 @@
 ASR model + pitch aware relative positional embeddings. 
 
 Nothing in these repositories are intended for production.
-This particular model uses internal dynamic local attention windowing for variable length sequence in the cross attention, cross modal, and cross talking steps of which all are decoder causal however the model does away with the decoder encoder distinctions in favor of a more unified less transformer like design. For the moment, the local attention window is set to ctx // head and auto adjusts up or down based on loss by some factor x.
+This particular model uses internal dynamic local attention windowing for variable length sequence in the cross attention, cross modal, and cross talking steps of which all are decoder causal however the model does away with the decoder encoder distinctions in favor of a more unified less transformer like design. For the moment, the local attention window is set to ctx // head and auto adjusts up or down based on loss by some factor x but remains off the graph itself.
 
 
 
