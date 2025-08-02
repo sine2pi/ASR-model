@@ -3,17 +3,133 @@ import warnings
 import logging
 from itertools import chain
 import torch
-from torch import nn, Tensor
-from typing import Optional, Dict
+import torch.nn.functional as F
+from torch import nn, Tensor, einsum
+from typing import Optional, List, Tuple, Union
+
 import numpy as np
-from datetime import datetime
 from dataclasses import dataclass
+
 from torch.nn.functional import scaled_dot_product_attention
-from echoutils import *
+from einops import rearrange
+
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
+
+def sinusoids(ctx, dims, max_tscale=10000):
+    assert dims % 2 == 0
+    pos = torch.log(torch.tensor(float(max_tscale))) / (dims // 2 - 1)
+    tscales = torch.exp(-pos * torch.arange(dims // 2, device=device, dtype=torch.float32))
+    scaled = torch.arange(ctx, device=device, dtype=torch.float32).unsqueeze(1) * tscales.unsqueeze(0)
+    position = torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=1) 
+    positional_embedding = nn.Parameter(position, requires_grad=True)
+    return positional_embedding
+
+def valid(default_value, *items):
+    for item in items:
+        if item is not None:
+            return item
+    return default_value
+
+def dict_to(d, device, dtype=dtype):
+    return {k: v.to(device, dtype) if isinstance(v, torch.Tensor) else v 
+            for k, v in d.items()}
+    
+def exists(v):
+    return v is not None
+
+def default(v, b):
+    return v if exists(v) else b
+
+class Conv1d(nn.Conv1d):
+    def _conv_forward(
+        self, x: Tensor, weight: Tensor, bias) -> Tensor:
+        return super()._conv_forward(x, weight.to(x.device, x.dtype), None if bias is None else bias.to(x.device, x.dtype))
+
+class Conv2d(nn.Conv2d):
+    def _conv_forward(
+        self, x: Tensor, weight: Tensor, bias) -> Tensor:
+        return super()._conv_forward(x, weight.to(x.device, x.dtype), None if bias is None else bias.to(x.device, x.dtype))
+
+class Linear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True) -> None:
+        super(Linear, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        torch.nn.init.xavier_uniform_(self.linear.weight)
+        if bias:
+            torch.nn.init.zeros_(self.linear.bias)
+    def forward(self, x: Tensor) -> Tensor:
+        return self.linear(x)
+    
+class RMSNorm(nn.Module):
+    def __init__(self, dims: Union[int, Tensor, List, Tuple], 
+                 eps = 1e-8, elementwise_affine = True):
+        super(RMSNorm, self).__init__()
+        if isinstance(dims, int):
+            self.normalized_shape = (dims,)
+        else:
+            self.normalized_shape = tuple(dims)
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if self.elementwise_affine:
+            self.weight = nn.Parameter(torch.empty(self.normalized_shape))  # type: ignore
+            torch.nn.init.ones_(self.weight)  
+        else:
+            self.register_parameter("weight", None)
+    def forward(self, x):
+        return F.rms_norm(x, self.normalized_shape, self.weight, self.eps)  # type: ignore
+    
+def LayerNorm(x: Tensor, normalized_shape: Union[int, Tensor, List, Tuple],
+               weight: Optional[Tensor] = None, bias: Optional[Tensor] = None,
+               eps: float = 1e-5) -> Tensor:
+    return F.layer_norm(x, normalized_shape, weight, bias, eps)  # type: ignore
+
+def get_device():
+    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+def get_dtype():
+    return torch.float32 if torch.cuda.is_available() else torch.float64
+
+def l2norm(tensor):
+    dtype = tensor.dtype
+    normed = F.normalize(tensor, dim = -1)
+    return normed.type(dtype)
+
+def get_activation(act: str) -> nn.Module:
+    act_map = {
+        "gelu": nn.GELU(), 
+        "relu": nn.ReLU(), 
+        "sigmoid": nn.Sigmoid(), 
+        "tanh": nn.Tanh(), 
+        "swish": nn.SiLU(), 
+        "tanhshrink": nn.Tanhshrink(), 
+        "softplus": nn.Softplus(), 
+        "softshrink": nn.Softshrink(), 
+        "leaky_relu": nn.LeakyReLU(), 
+        "elu": nn.ELU()
+    }
+    return act_map.get(act, nn.GELU())
+
+def there_is_a(val):
+    return val is not None
+
+def exists(val):
+    return val is not None
+
+def default(value, d):
+    return d if not exists(value) else value
+
+def to(t):
+    return {'device': t.device, 'dtype': t.dtype}
+
+PATH = 'E:/hf'
+os.environ['HF_HOME'] = PATH
+os.environ['HF_DATASETS_CACHE'] = PATH
+os.environ['TORCH_HOME'] = PATH
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 @dataclass
 class Dimensions:
@@ -25,22 +141,47 @@ class Dimensions:
     layer: int
     act: str
 
+def qkv_init(dims, head):
+    head_dim = dims // head
+    q = nn.Linear(dims, dims)
+    k = nn.Linear(dims, dims)
+    v = nn.Linear(dims, dims)
+    o = nn.Linear(dims, dims)
+    lna = nn.LayerNorm(dims)
+    lnb = nn.LayerNorm(dims)
+    lnc = nn.LayerNorm(head_dim)
+    lnd = nn.LayerNorm(head_dim)
+    return q, k, v, o, lna, lnb, lnc, lnd
+
+def shape(dims, head, q, k, v):
+    batch_size = q.shape[0]
+    seq_len_q = q.shape[1]
+    seq_len_kv = k.shape[1]
+    head_dim = dims // head
+
+    q = q.view(batch_size, seq_len_q, head, head_dim).transpose(1, 2)
+    k = k.view(batch_size, seq_len_kv, head, head_dim).transpose(1, 2)
+    v = v.view(batch_size, seq_len_kv, head, head_dim).transpose(1, 2)
+    return q, k, v
+
 class rotary(nn.Module):
     def __init__(self, dims, head):
         super(rotary, self).__init__()
         self.dims = dims
         self.head = head
         self.head_dim = dims // head
-        self.theta = nn.Parameter((torch.tensor(36000, device=device, dtype=dtype)), requires_grad=True)  
+
+        self.theta = nn.Parameter((torch.tensor(10000, device=device, dtype=dtype)), requires_grad=True)  
         self.register_buffer('freqs_base', self._compute_freqs_base(), persistent=False)
 
     def _compute_freqs_base(self):
         mel_scale = torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 4000/200)), self.head_dim // 2, device=device, dtype=dtype) / 2595) - 1
         return 200 * mel_scale / 1000 
 
-    def forward(self, x, ctx) -> Tensor:
-        freqs = (self.theta / 220.0) * self.freqs_base
-        pos = torch.arange(ctx, device=device, dtype=dtype) 
+    def forward(self, x) -> Tensor:
+        freqs = (self.theta / 220.0) * self.freqs_base 
+
+        pos = torch.arange(x.shape[2], device=device, dtype=dtype) 
         freqs = pos[:, None] * freqs
         freqs=torch.polar(torch.ones_like(freqs), freqs)
 
@@ -53,28 +194,6 @@ class rotary(nn.Module):
         x1 = x1.view(orig_shape)
         return torch.cat([x1.type_as(x), x2], dim=-1)
 
-def shape(dims, head, q, k, v):
-    head_dim = dims // head
-    scale = head_dim ** -0.25
-    q = q * scale
-    k = k * scale
-    v = v
-    def _shape(tensor):
-        return tensor.view(*tensor.shape[:2], head, -1).permute(0, 2, 1, 3).contiguous()
-    return _shape(q), _shape(k), _shape(v)
-
-def qkv_init(dims: int, head: int):
-    head_dim = dims // head
-    q = nn.Linear(dims, dims)
-    k = nn.Linear(dims, dims, bias=False)
-    v = nn.Linear(dims, dims)
-    o = nn.Linear(dims, dims)
-    lna = nn.LayerNorm(dims, bias=False)  
-    lnb = nn.LayerNorm(dims, bias=False)      
-    lnc = nn.LayerNorm(head_dim, bias=False)
-    lnd = nn.LayerNorm(head_dim, bias=False)    
-    return q, k, v, o, lna, lnb, lnc, lnd
-
 def calculate_attention(q, k, v, mask=None, temp=1.0):
     scaled_q = q
     if temp != 1.0 and temp > 0:
@@ -82,94 +201,136 @@ def calculate_attention(q, k, v, mask=None, temp=1.0):
     out = scaled_dot_product_attention(scaled_q, k, v, is_causal=mask is not None and q.shape[1] > 1)        
     return out
 
+# def calculate_attention(q_norm, k_norm, v_iter, mask=None, temp=1.0):
+#     d_k = q_norm.size(-1)
+#     scores = torch.matmul(q_norm, k_norm.transpose(-2, -1)) / (torch.sqrt(torch.tensor(d_k, dtype=torch.float32)) / temp)
+#     if mask is not None:
+#         scores = scores.masked_fill(mask == 0, float('-inf'))
+#     attention_weights = F.softmax(scores, dim=-1)
+#     output = torch.matmul(attention_weights, v_iter)
+#     return output
+
 class LocalOut(nn.Module):
     def __init__(self, dims: int, head: int):
         super().__init__()
-        head_dim = dims // head
-        self.query_module = nn.Linear(head_dim, head_dim)
-        self.key_module = nn.Linear(head_dim, head_dim)
-        self.value_module = nn.Linear(head_dim, head_dim)
-        self.out_proj = nn.Linear(head_dim, head_dim)
+        self.head_dim = dims // head
+        self.dims = dims
+        self.q_hd = nn.Linear(self.head_dim, self.head_dim)
+        self.k_hd = nn.Linear(self.head_dim, self.head_dim)
+        self.v_hd = nn.Linear(self.head_dim, self.head_dim)
+        self.out = nn.Linear(self.head_dim, self.head_dim)
 
     def _reshape_to_output(self, attn_output: Tensor) -> Tensor:
         batch, _, ctx, _ = attn_output.shape
-        return attn_output.transpose(1, 2).contiguous().view(batch, ctx, self.dims)        
+        return attn_output.transpose(1, 2).contiguous().view(batch, ctx, self.dims)      
 
 class attentionb(nn.Module):
-    def __init__(self, dims: int, head: int, max_iter: int = 3, threshold: float = 0.01, factor: float = 0.1, dropout: float = 0.1, temp = 1.0):
+    def __init__(self, dims: int, head: int, max_iter: int = 3, 
+    threshold: float = 0.01, factor: float = 0.1, dropout: float = 0.1, temp = 1.0, use_win=False):
         super(attentionb, self).__init__()
-        self.q,  self.k,  self.v,  self.o, self.lna, self.lnb, self.lnc, self.lnd  = qkv_init(dims, head)
-        self.dims = dims
+
         self.head = head
+        self.dims = dims
+        head_dim = dims // head
+
+        self.que = nn.Linear(dims, dims, bias=False) 
+        self.kv = nn.Linear(dims, dims * 2, bias=False)
+        self.out = nn.Linear(dims, dims, bias=False)
+
+        self.lna = nn.LayerNorm(dims) 
+        self.lnb = nn.LayerNorm(head_dim) 
+        self.rope = rotary(dims, head) 
+        self.use_win = use_win
+
         self.max_iter = max_iter
         self.threshold = nn.Parameter(torch.tensor(threshold))
         self.temp = nn.Parameter(torch.tensor(temp), requires_grad=True)        
         self.factor = nn.Parameter(torch.tensor(factor))
-        self.alocal = LocalOut(dims, head)   
+        self.local = LocalOut(dims, head)   
 
-    def _focus(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None):
-        q = self.q(self.lna(x))
-        k = self.k(self.lnb(x if xa is None else xa))
-        v = self.v(self.lnb(x if xa is None else xa))
-        q, k, v = shape(self.dims, self.head, q, k, v) 
+    def update_win(self, win_size=None):
+        if win_size is not None:
+            self.win_size = win_size
+            return win_size
+        elif hasattr(self, 'win_size') and self.win_size is not None:
+            win_size = self.win_size
+            return win_size
+        return None
 
-        iteration = 0
-        temp = self.temp.item()
-        prev_out = torch.zeros_like(q)
-        attn_out = torch.zeros_like(q)
-        threshold = self.threshold.item()
-        factor = self.factor.item()
-        qcur = q
+    def _focus(self, x, xa = None, mask = None, use_win = False):
 
-        while iteration < self.max_iter:
-            eff_span = min(qcur.shape[1], k.shape[1])
-            if xa is not None:
-                eff_span = min(eff_span, xa.shape[1])
-            if eff_span == 0: 
-                break
+        q = self.que(self.lna(x))
+        k, v = self.kv(self.lna(default(xa, x))).chunk(2, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b c (h d) -> b h c d', h = self.head), (q, k, v))
+        _, _, ctx, _ = q.shape        
+        self.scale = q.shape[-1] ** -0.35
+        q = self.rope(q)
+        k = self.rope(k)
 
-            qiter = qcur[:, :, :eff_span, :]
-            kiter = k[:, :, :eff_span, :]
-            viter = v[:, :, :eff_span, :]
-            q = self.alocal.query_module(qiter)
-            k = self.alocal.key_module(kiter)
-            v = self.alocal.value_module(viter)
+        if use_win:  
+            iteration = 0
+            temp = self.temp.item()
+            prev_out = torch.zeros_like(q)
+            attn_out = torch.zeros_like(q)
+            threshold = self.threshold.item()
+            factor = self.factor.item()
+            curq = q
 
-            iter_mask = None
-            if mask is not None:
-                if mask.dim() == 4: 
-                    iter_mask = mask[:, :, :eff_span, :eff_span]
-                elif mask.dim() == 2: 
-                    iter_mask = mask[:eff_span, :eff_span]
+            while iteration < self.max_iter:
+                eff_span = min(curq.shape[1], k.shape[1])
+                if xa is not None:
+                    eff_span = min(eff_span, xa.shape[1])
+                if eff_span == 0: 
+                    break
 
-            attn_iter = calculate_attention(
-                self.lnc(q), self.lnd(k), v,
-                mask=iter_mask, temp=temp)
+                qiter = curq[:, :, :eff_span, :]
+                kiter = k[:, :, :eff_span, :]
+                viter = v[:, :, :eff_span, :]
+                q = self.local.q_hd(qiter)
+                k = self.local.k_hd(kiter)
+                v = self.local.v_hd(viter)
 
-            iter_out = torch.zeros_like(qcur)
-            iter_out[:, :, :eff_span, :] = attn_iter
-            diff = torch.abs(iter_out - prev_out).mean()
-            dthresh = threshold + factor * diff
-            if diff < dthresh and iteration > 0:
+                iter_mask = None
+                if mask is not None:
+                    if mask.dim() == 4: 
+                        iter_mask = mask[:, :, :eff_span, :eff_span]
+                    elif mask.dim() == 2: 
+                        iter_mask = mask[:eff_span, :eff_span]
+
+                attn_iter = calculate_attention(
+                    self.lnb(q), self.lnb(k), v,
+                    mask=iter_mask, temp=temp)
+
+                iter_out = torch.zeros_like(curq)
+                iter_out[:, :, :eff_span, :] = attn_iter
+                diff = torch.abs(iter_out - prev_out).mean()
+                dthresh = threshold + factor * diff
+                if diff < dthresh and iteration > 0:
+                    attn_out = iter_out
+                    break
+
+                prev_out = iter_out.clone()
+                curq = curq + iter_out
                 attn_out = iter_out
-                break
+                iteration += 1
+                temp += 0.005
+        else:
+            attn_out = scaled_dot_product_attention(self.lnc(q), self.lnd(k), v, is_causal=mask is not None and ctx >1)
+        wv = attn_out.permute(0, 2, 1, 3).flatten(start_dim=2)
+        qk=None
+        return self.out(wv), qk
 
-            prev_out = iter_out.clone()
-            qcur = qcur + iter_out
-            attn_out = iter_out
-            iteration += 1
-            temp += 0.005
+    def _slide_win_local(self, x, mask = None, use_win = True) -> Tensor:
 
-        output = attn_out.permute(0, 2, 1, 3).flatten(start_dim=2)
-        return self.o(output), None
+        win = self.update_win()
+        win_size = win if win is not None else 128
+        span_len = win_size + win_size // 10
 
-    def _slide_win_local(self, x: Tensor, win_size: int, span_len: int, mask: Optional[Tensor] = None) -> Tensor:
-
-        batch, ctx, dims = x.shape
+        _, ctx, _ = x.shape
         output = torch.zeros_like(x)
-        num_win = (ctx + win_size - 1) // win_size
+        windows = (ctx + win_size - 1) // win_size
 
-        for i in range(num_win):
+        for i in range(windows):
             qstart = i * win_size
             qend = min(qstart + win_size, ctx)
             win_qlen = qend - qstart
@@ -188,50 +349,151 @@ class attentionb(nn.Module):
                 elif mask.dim() == 2:
                     win_mask = mask[qstart:qend, kstart:kend]
 
-            attn_out, _ = self._focus(x=qwin, xa=kwin, mask=win_mask)
+            attn_out, _ = self._focus(x=qwin, xa=kwin, mask=win_mask, use_win=True)
             output[:, qstart:qend, :] = attn_out
         return output
 
-    def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, 
-                use_sliding_win: bool = False, win_size: int = 512, span_len: int = 1024) -> Tensor:
-        if use_sliding_win:
-            return self._slide_win_local(x, win_size, span_len, mask)
+    def forward(self, x, xa = None, mask = None, use_win: bool = False):
+        if use_win:
+            return self._slide_win_local(x, mask, use_win=True)
         else:
-            output, _ = self._focus(x, xa, mask)
+            output, _ = self._focus(x, xa, mask, use_win=False)
             return output
 
 class attentiona(nn.Module):
-    def __init__(self, dims: int, head: int):
-        super(attentiona, self).__init__()
-        self.q,  self.k,  self.v,  self.o, self.lna, self.lnb, self.lnc, self.lnd  = qkv_init(dims, head)
-        self.dims = dims
+    def __init__(self, dims: int, head: int, dropout_rate: float = 0.1, cross_talk=False):
+        super().__init__()
         self.head = head
-        self.rope = rotary(dims=dims, head=head)
-    def forward(self, x: Tensor, xa = None, mask = None):
-        q = self.q(self.lna(x))
-        k = self.k(self.lnb(x if xa is None else xa))
-        v = self.v(self.lnb(x if xa is None else xa))
-        q, k, v = shape(self.dims, self.head, q, k, v)    
-        q = self.rope(q, q.shape[2])
-        k = self.rope(k, k.shape[2]) 
-        a = scaled_dot_product_attention(self.lnc(q), self.lnd(k), v, is_causal=mask is not None and q.shape[1] > 1)
-        out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
-        return self.o(out)
+        self.dims = dims
+        self.cross_talk = cross_talk
 
-class Residual(nn.Module): 
+        self.que = nn.Linear(dims, dims, bias=False) 
+        self.kv = nn.Linear(dims, dims * 2, bias=False)
+        self.out = nn.Linear(dims, dims, bias=False)
+
+        self.ln = nn.LayerNorm(dims) 
+        self.rope = rotary(dims, head) 
+
+        self.x = nn.Conv2d(head, head, 1, bias = False) if cross_talk else None
+        self.xa = nn.Conv2d(head, head, 1, bias = False) if cross_talk else None
+
+    def forward(self, x, xa = None, mask = None):
+
+        q = self.que(self.ln(x))
+        k, v = self.kv(self.ln(x if xa is None else xa)).chunk(2, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b c (h d) -> b h c d', h = self.head), (q, k, v))
+
+        scale = q.shape[-1] ** -0.5
+
+        q = self.rope(q)
+        k = self.rope(k)
+
+        qk = einsum('b h k d, b h q d -> b h k q', q, k) * scale 
+
+        if there_is_a(mask):
+            i, j = qk.shape[-2:]
+            mask = torch.ones(i, j, device = q.device, dtype = torch.bool).triu(j - i + 1)
+            qk = qk.masked_fill(mask,  -torch.finfo(qk.dtype).max)
+
+        qk = torch.nn.functional.softmax(qk, dim=-1)
+        wv = einsum('b h k q, b h q d -> b h k d', qk, v) 
+        wv = rearrange(wv, 'b h c d -> b c (h d)')
+        out = self.out(wv)
+
+        if self.cross_talk:
+            qk, v = self.kv(self.ln(x)).chunk(2, dim=-1) 
+            qka, va = self.kv(self.ln(x if xa is None else xa)).chunk(2, dim=-1)
+            qk, qka, v, va = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.head), (qk, qka, v, va))
+            qk = einsum('b h i d, b h j d -> b h i j', qk, qka)
+            if there_is_a(mask):
+                i, j = qk.shape[-2:]
+                mask = torch.ones(i, j, device=device, dtype=torch.bool).triu(j - i + 1)
+                qk = qk.masked_fill(mask, -torch.finfo(qk.dtype).max)
+            x = qk.softmax(dim = -1)
+            xa = qk.softmax(dim = -2)
+            x = self.x(x)
+            xa = self.xa(xa)
+            x = einsum('b h i j, b h j d -> b h i d', x, va)
+            xa = einsum('b h j i, b h j d -> b h i d', xa, v)
+            x, xa = map(lambda t: rearrange(t, 'b h n d -> b n (h d)'), (x, xa))
+            out = self.out(x)  # outxa = self.out(xa) 
+           
+        return out, qk
+
+class attentiond(nn.Module):
+    def __init__(self, dims: int, head: int):
+        super().__init__()
+        self.head = head
+        self.dims = dims
+
+        self.que = nn.Linear(dims, dims, bias=False) 
+        self.kv = nn.Linear(dims, dims * 2, bias=False)
+        self.out = nn.Linear(dims, dims, bias=False)
+
+        self.ln = nn.LayerNorm(dims) 
+        self.rope = rotary(dims, head) 
+
+        self.x = nn.Conv2d(head, head, 1, bias = False)
+        self.xa = nn.Conv2d(head, head, 1, bias = False) 
+
+    def forward(self, x, xa = None, mask = None):
+
+        qk, v = self.kv(self.ln(x)).chunk(2, dim=-1) 
+        qka, va = self.kv(self.ln(x if xa is None else xa)).chunk(2, dim=-1)
+        qk, qka, v, va = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.head), (qk, qka, v, va))
+        qk = einsum('b h i d, b h j d -> b h i j', qk, qka)
+        if there_is_a(mask):
+            i, j = qk.shape[-2:]
+            mask = torch.ones(i, j, device=device, dtype=torch.bool).triu(j - i + 1)
+            qk = qk.masked_fill(mask, -torch.finfo(qk.dtype).max)
+        x = qk.softmax(dim = -1)
+        xa = qk.softmax(dim = -2)
+        x = self.x(x)
+        xa = self.xa(xa)
+        x = einsum('b h i j, b h j d -> b h i d', x, va)
+        xa = einsum('b h j i, b h j d -> b h i d', xa, v)
+        x, xa = map(lambda t: rearrange(t, 'b h n d -> b n (h d)'), (x, xa))
+        out = self.out(x)  
+        outxa = self.out(xa) 
+           
+        return out, outxa, qk
+
+class tgate(nn.Module):
+    def __init__(self, dims, num_types=4):
+        super().__init__()
+        self.gates = nn.ModuleList([nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()) for _ in range(num_types)])
+        self.classifier = nn.Sequential(nn.Linear(dims, num_types), nn.Softmax(dim=-1))
+    def forward(self, x):
+        types = self.classifier(x)
+        gates = torch.stack([gate(x) for gate in self.gates], dim=-1)
+        cgate = torch.sum(gates * types.unsqueeze(2), dim=-1)
+        return cgate
+
+class residual(nn.Module): 
     def __init__(self, dims: int, head: int, act: str = "silu"):
         super().__init__()
 
-        self.lna = nn.LayerNorm(dims, bias=False)  
-        self.attna = attentiona(dims, head)
-        self.attnb = attentionb(dims, head, max_iter=3)
-        self.mlp = nn.Sequential(Linear(dims, dims*4), get_activation(act), Linear(dims*4, dims))
+        self.lna = nn.LayerNorm(dims, bias=False)           
+        self.atta = attentiona(dims, head)
+        self.attb = attentiona(dims, head)
+        # self.attc = attentiona(dims, head, cross_talk=True)
+        self.attb = attentionb(dims, head, max_iter=1, use_win=True, temp=1.0)
+        self.tgate = tgate(dims, num_types=4)
 
-    def forward(self, x, xa = None, mask = None) -> Tensor:   
-        x = x + self.attna(self.lna(x), mask=mask)
+        self.mlp = nn.Sequential(nn.Linear(dims, dims*4), get_activation(act), nn.Linear(dims*4, dims))
+
+    def forward(
+        self,
+        x: Tensor,
+        xa: Optional[Tensor] = None,
+        mask: Optional[Tensor] = None,
+    ):
+        x = x + self.atta(x, mask=mask)[0]  
         if xa is not None:
-            x = x + self.attna(self.lna(x), xa, mask=None)            
-            x = x + self.attnb(self.lna(x), xa, mask=None, use_sliding_win=True, win_size=256, span_len=512)  
+            x = x + self.attb(x, xa, mask=None)[0]  
+            # x = x + self.attc(x, xa, mask=None)[0]  
+            # x = x + self.attd(x, xa, mask=None)[0]  
+        x = x + self.tgate(x)
         x = x + self.mlp(self.lna(x))
         return x
 
@@ -239,50 +501,48 @@ class processor(nn.Module):
     def __init__(self, vocab: int, mels: int, ctx: int, dims: int, head: int, layer: int, act: str = "gelu"): 
         super(processor, self).__init__()
 
-        self.lna = nn.LayerNorm(dims)
-        self.lnb = nn.LayerNorm(dims)
-        self.lnc = nn.LayerNorm(dims)        
-        self.token_emb = nn.Embedding(vocab, dims)
+        self.ln = nn.LayerNorm(dims)        
+        self.token = nn.Embedding(vocab, dims)
+        self.audio = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)        
         self.positions = nn.Parameter(torch.empty(ctx, dims), requires_grad=True)
-        self.audio_emb = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
 
         act_fn = get_activation(act)        
-        self.audio_enc = nn.Sequential(
-            Conv1d(1, dims, kernel_size=3, stride=1, padding=1), act_fn,
-            Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), act_fn,
-            Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
+        self.encoder = nn.Sequential(
+            nn.Conv1d(1, dims, kernel_size=3, stride=1, padding=1), act_fn,
+            nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), act_fn,
+            nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
 
-        self.bA = nn.ModuleList([Residual(dims, head, act_fn) for _ in range(layer)])
+        self.blocka = nn.ModuleList([residual(dims, head, act_fn) for _ in range(layer)])
+        self.blockm = nn.ModuleList([residual(dims, head, act_fn) for _ in range(layer // 2)])
 
         mask = torch.empty(ctx, ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x, xa, sequential=False, modal=False) -> Tensor:    
+    def forward(self, x, xa, sequential=False, modal=True, kv_cache=None) -> Tensor:    
 
-        x  = self.token_emb(x.long()) + self.positions[:x.shape[1]]    
-        xa = self.audio_enc(xa).permute(0, 2, 1)
-        xa = xa + self.audio_emb(xa.shape[1], xa.shape[-1], 36000.0).to(device, dtype)
+        if xa.dim() == 2:
+            xa = xa.unsqueeze(0)
 
-        for b in chain(self.bA or []):
-            xa = b(x=xa, xa=None, mask=None)
-            x  = b(x=x, xa=None, mask=self.mask)
-            x  = b(x=x, xa=xa, mask=None)
-            xc = b(torch.cat([x, xa], dim=1), xa=None, mask=self.mask) if modal else None    
-            x  = b(x=xc[:, :x.shape[1]], xa=xc[:, x.shape[1]:], mask=None) if modal else x
+        offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
+        x = (self.token(x.long()) + self.positions[offset : offset + x.shape[-1]])
+
+        xa = self.encoder(xa).permute(0, 2, 1)
+        xa = xa + self.audio(xa.shape[1], xa.shape[-1], 36000.0).to(device, dtype)
+
+        for block in chain(self.blocka or []):
+            xa = block(xa, mask=None)
+            x  = block(x, mask=self.mask)
+            x  = block(x, xa, mask=None)
+
+        for block in chain(self.blockm or []):
+            xm = block(torch.cat([x, xa], dim=1), torch.cat([x, xa], dim=1), mask=None) if modal else None    
+            x  = block(xm[:, :x.shape[1]], xm[:, x.shape[1]:], mask=None) if modal else x
 
         x = nn.functional.dropout(x, p=0.001, training=self.training)
-        x = self.lnc(x)        
-        x = x @ torch.transpose(self.token_emb.weight.to(dtype), 0, 1).float()
-        return x
+        x = self.ln(x)        
+        x = x @ torch.transpose(self.token.weight.to(dtype), 0, 1).float()
+        return x 
 
-    def init_weights(self):
-        print("Initializing model weights...")
-        self.apply(self._init_weights)
-        print("Initialization summary:")
-        for module_type, count in self.init_counts.items():
-            if count > 0:
-                print(f"{module_type}: {count}")
-   
 class Model(nn.Module):
     def __init__(self, param: Dimensions):
         super().__init__()
@@ -296,14 +556,34 @@ class Model(nn.Module):
             layer=param.layer,
             act=param.act)       
         
-    def forward(self,
-        labels=None, input_ids=None, pitch: Optional[torch.Tensor]=None) -> Dict[str, Optional[torch.Tensor]]:
+        self.best_loss = float('inf')
+        self.factor = nn.Parameter(torch.tensor(2), requires_grad=False)
+
+    def update(self, win_size):
+        for name, module in self.processor.named_modules():
+            if isinstance(module, (attentionb)):
+                module.update_win(win_size)
+
+    def adjust_window(self, loss, ctx):
+        self.win_size = ((ctx // self.param.head)) #based on loss but not on the graph itself which is the idea
+        if loss < self.best_loss:
+            win_size = (self.win_size * self.factor) #.clamp(0, ctx - 1)
+        else:   
+            win_size = (self.win_size // self.factor).clamp(0, self.win_size - 1)
+        self.win_size = win_size
+        self.best_loss = loss  
+        self.update(win_size)
+        return win_size
+   
+    def forward(self, labels=None, input_ids=None, pitch=None, pitch_tokens=None, spectrogram=None):
+
         x = input_ids
-        xa = pitch if pitch is not None else torch.zeros(1, 1, self.param.mels, device=device, dtype=dtype)
+        xa = pitch if pitch is not None else spectrogram         # xb = pitch_tokens     
         logits = self.processor(x, xa)
         loss = None
         if labels is not None:
-            loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1))
+            loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=0)
+        self.adjust_window(loss=loss.item(), ctx=xa.shape[2])
         return {"logits": logits, "loss": loss} 
 
     def _init_weights(self, module):
@@ -311,26 +591,29 @@ class Model(nn.Module):
             "Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0,
             "Conv2d": 0, "processor": 0, "attention": 0, "Residual": 0}
         for name, module in self.named_modules():
-            if isinstance(module, RMSNorm):
+            if isinstance(module, nn.RMSNorm):
                 nn.init.ones_(module.weight)
                 self.init_counts["RMSNorm"] += 1
+            if isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                self.init_counts["LayerNorm"] += 1                
             elif isinstance(module, nn.Linear):
                 if module.weight is not None:
                     nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
                 self.init_counts["Linear"] += 1
-            elif isinstance(module, Conv1d):
+            elif isinstance(module, nn.Conv1d):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
                 self.init_counts["Conv1d"] += 1
-            elif isinstance(module, Conv2d):
+            elif isinstance(module, nn.Conv2d):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
                 self.init_counts["Conv2d"] += 1
-            elif isinstance(module, Residual):
+            elif isinstance(module, residual):
                 self.init_counts["Residual"] += 1
             elif isinstance(module, processor):
                 self.init_counts["processor"] += 1
@@ -342,3 +625,20 @@ class Model(nn.Module):
         for module_type, count in self.init_counts.items():
             if count > 0:
                 print(f"{module_type}: {count}")
+
+    def install_kv_cache_hooks(self, cache: Optional[dict] = None):
+        cache = {**cache} if cache is not None else {}
+        hooks = []
+        def save_to_cache(module, _, output):
+            if module not in cache or output.shape[1] > self.param.ctx:
+                cache[module] = output
+            else:
+                cache[module] = torch.cat([cache[module], output], dim=1).detach()
+            return cache[module]
+
+        def install_hooks(layer: nn.Module):
+            if isinstance(layer, attentiona):
+                hooks.append(layer.k.register_forward_hook(save_to_cache))
+                hooks.append(layer.v.register_forward_hook(save_to_cache))
+        self.processor.apply(install_hooks)
+        return cache, hooks
