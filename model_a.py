@@ -37,11 +37,6 @@ def dict_to(d, device, dtype=dtype):
     return {k: v.to(device, dtype) if isinstance(v, torch.Tensor) else v 
             for k, v in d.items()}
     
-def exists(v):
-    return v is not None
-
-def default(v, b):
-    return v if exists(v) else b
 
 class Conv1d(nn.Conv1d):
     def _conv_forward(
@@ -114,12 +109,6 @@ def get_activation(act: str) -> nn.Module:
 
 def there_is_a(val):
     return val is not None
-
-def exists(val):
-    return val is not None
-
-def default(value, d):
-    return d if not exists(value) else value
 
 def to(t):
     return {'device': t.device, 'dtype': t.dtype}
@@ -260,7 +249,7 @@ class attentionb(nn.Module):
     def _focus(self, x, xa = None, mask = None, use_win = False):
 
         q = self.que(self.lna(x))
-        k, v = self.kv(self.lna(default(xa, x))).chunk(2, dim=-1)
+        k, v = self.kv(self.lna(x if xa is None else xa)).chunk(2, dim=-1)
         q, k, v = map(lambda t: rearrange(t, 'b c (h d) -> b h c d', h = self.head), (q, k, v))
         _, _, ctx, _ = q.shape        
         self.scale = q.shape[-1] ** -0.35
