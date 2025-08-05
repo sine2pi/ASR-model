@@ -290,8 +290,12 @@ class attentiona(nn.Module):
         k = self.rope(k)
 
         qk = einsum('b h k d, b h q d -> b h k q', q, k) * scale 
-        # qk = torch.nn.functional.softmax(qk, dim=-1)
-        qk = taylor_softmax(qk, order=2)        
+
+        if there_is_a(mask):
+            mask = mask[:qk.shape[2], :qk.shape[2]]
+            qk = qk.masked_fill(mask.bool(), -torch.inf)      
+
+        qk = taylor_softmax(qk, order=2)                # qk = torch.nn.functional.softmax(qk, dim=-1)
 
         wv = einsum('b h k q, b h q d -> b h k d', qk, v) 
         wv = rearrange(wv, 'b h c d -> b c (h d)')
@@ -320,6 +324,7 @@ class attentiond(nn.Module):
         qka, va = self.kv(self.ln(x if xa is None else xa)).chunk(2, dim=-1)
         qk, qka, v, va = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.head), (qk, qka, v, va))
         qk = einsum('b h q d, b h k d -> b h q k', qk, qka)
+
         if there_is_a(mask):
             mask = mask[:qk.shape[2], :qk.shape[2]]
             qk = qk.masked_fill(mask.bool(), -torch.inf)            
@@ -394,7 +399,7 @@ class processor(nn.Module):
         mask = torch.empty(ctx, ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x, xa, xb, sequential=False, modal=False, kv_cache=None, blend=False) -> Tensor:    
+    def forward(self, x, xa, xb, sequential=False, modal=False, blend=False, kv_cache=None) -> Tensor:    
 
         if xa.dim() == 2:
             xa = xa.unsqueeze(0)
