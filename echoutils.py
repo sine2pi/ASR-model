@@ -4,8 +4,7 @@ import pyworld as pw
 import numpy as np
 import torchaudio
 import torch.nn.functional as F
-from datasets import load_dataset
-from datasets import Audio
+from datasets import load_dataset, Audio
 from dataclasses import dataclass
 from typing import Any, List, Dict
 import math
@@ -13,28 +12,57 @@ import matplotlib.pyplot as plt
 import torch.nn as nn
 import torch.nn.init as init
 from torch import Tensor
-from typing import Any, List, Dict, Optional, Union, Tuple
+from typing import Optional, Union, Tuple
 from torch.nn.functional import scaled_dot_product_attention
-
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 
-def shape(self, tensor: torch.Tensor, ctx: int, batch: int):
-    return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
+class LayerNorm(nn.Module):
+    def __init__(self, emb_dim):
+        super().__init__()
+        self.eps = 1e-5
+        self.scale = nn.Parameter(torch.ones(emb_dim))
+        self.shift = nn.Parameter(torch.zeros(emb_dim))
 
-def reshape_to_output(self, attn_output, batch, ctx):
-    return attn_output.permute(0, 2, 1, 3).reshape(batch, ctx, self.dims).contiguous()
+    def forward(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        norm_x = (x - mean) / torch.sqrt(var + self.eps)
+        return self.scale * norm_x + self.shift
 
-def create_attention_mask(batch_size, ctx, is_causal=True, padding_mask=None, device=None):
-    if is_causal:
-        mask = torch.triu(torch.ones((ctx, ctx), device=device), diagonal=0)
-        mask = mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, ctx, ctx)
-    else:
-        mask = torch.zeros((batch_size, 1, ctx, ctx), device=device)
-    if padding_mask is not None:
-        padding_mask = padding_mask.unsqueeze(1).unsqueeze(2).bool()
-        mask = (mask.bool() | (~padding_mask)).float()
-    return mask
+class GELU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return 0.5 * x * (1 + torch.tanh(
+            torch.sqrt(torch.tensor(2.0 / torch.pi)) * 
+            (x + 0.044715 * torch.pow(x, 3))
+        ))
+
+def sinusoids(ctx, dims, max_tscale=10000):
+    assert dims % 2 == 0
+    pos = torch.log(torch.tensor(float(max_tscale))) / (dims // 2 - 1)
+    tscales = torch.exp(-pos * torch.arange(dims // 2, device=device, dtype=torch.float32))
+    scaled = torch.arange(ctx, device=device, dtype=torch.float32).unsqueeze(1) * tscales.unsqueeze(0)
+    position = torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=1) 
+    positional_embedding = nn.Parameter(position, requires_grad=True)
+    return positional_embedding
+
+def get_activation(act: str) -> nn.Module:
+    act_map = {
+        "gelu": nn.GELU(), 
+        "relu": nn.ReLU(), 
+        "sigmoid": nn.Sigmoid(), 
+        "tanh": nn.Tanh(), 
+        "swish": nn.SiLU(), 
+        "tanhshrink": nn.Tanhshrink(), 
+        "softplus": nn.Softplus(), 
+        "softshrink": nn.Softshrink(), 
+        "leaky_relu": nn.LeakyReLU(), 
+        "elu": nn.ELU()
+    }
+    return act_map.get(act, nn.GELU())
 
 def cos_sim(q: Tensor, k: Tensor, v: Tensor, mask) -> Tensor:
     q_norm = torch.nn.functional.normalize(q, dim=-1, eps=1e-12)
@@ -44,6 +72,22 @@ def cos_sim(q: Tensor, k: Tensor, v: Tensor, mask) -> Tensor:
     weights = F.softmax(qk_cosine, dim=-1)
     out = torch.matmul(weights, v)
     return out
+
+def taylor_softmax_2nd_order(x):
+    exp_approx = 1 + x + (x**2) / 2
+    return exp_approx / torch.sum(exp_approx, dim=-1, keepdim=True)
+
+def taylor_softmax_approximation(x, order=2):
+    if order == 0:
+        return torch.ones_like(x) / x.size(-1) 
+    elif order == 1:
+        numerator = 1 + x
+    elif order == 2:
+        numerator = 1 + x + 0.5 * x**2
+    else:
+        raise NotImplementedError("Higher orders are not implemented yet.")
+    denominator = torch.sum(numerator, dim=-1, keepdim=True)
+    return numerator / denominator
 
 def rbf_scores(q, k, rbf_sigma=1.0, rbf_ratio=0.0):
     dot_scores = torch.matmul(q, k.transpose(-1, -2))
@@ -72,214 +116,206 @@ def mask_win(text_ctx, aud_ctx):
 def maskc(ctx, device):
     return torch.tril(torch.ones(ctx, ctx, device=device, dtype=dtype), diagonal=0)
 
-def qkv_init(dims: int, head: int):
+def create_attention_mask(batch_size, ctx, is_causal=True, padding_mask=None, device=None):
+    if is_causal:
+        mask = torch.triu(torch.ones((ctx, ctx), device=device), diagonal=0)
+        mask = mask.expand(batch_size, 1, ctx, ctx)
+    else:
+        mask = torch.zeros((batch_size, 1, ctx, ctx), device=device)
+    if padding_mask is not None:
+        padding_mask = padding_mask.unsqueeze(1).unsqueeze(2).bool()
+        mask = (mask.bool() | (~padding_mask)).float()
+    return mask
+
+def calculate_attention(q, k, v, mask=None, temp=1.0):
+    scaled_q = q
+    if temp != 1.0 and temp > 0:
+        scaled_q = q * (1.0 / temp)**.5
+    out = scaled_dot_product_attention(scaled_q, k, v, is_causal=mask is not None and q.shape[1] > 1)        
+    return out
+
+def calculate_attentionb(q_norm, k_norm, v_iter, mask=None, temp=1.0):
+    d_k = q_norm.size(-1)
+    scores = torch.matmul(q_norm, k_norm.transpose(-2, -1)) / (torch.sqrt(torch.tensor(d_k, dtype=torch.float32)) / temp)
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, float('-inf'))
+    attention_weights = F.softmax(scores, dim=-1)
+    output = torch.matmul(attention_weights, v_iter)
+    return output
+
+class LocalOut(nn.Module):
+    def __init__(self, dims: int, head: int):
+        super().__init__()
+        self.head_dim = dims // head
+        self.dims = dims
+        self.q_module = nn.Linear(self.head_dim, self.head_dim)
+        self.k_module = nn.Linear(self.head_dim, self.head_dim)
+        self.v_module = nn.Linear(self.head_dim, self.head_dim)
+        self.o_proj = nn.Linear(self.head_dim, self.head_dim)
+
+    def _reshape_to_output(self, attn_output: Tensor) -> Tensor:
+        batch, _, ctx, _ = attn_output.shape
+        return attn_output.transpose(1, 2).contiguous().view(batch, ctx, self.dims)      
+
+def qkv_init(dims, head):
     head_dim = dims // head
-    scale = head_dim ** -0.5
     q = nn.Linear(dims, dims)
-    k = nn.Linear(dims, dims, bias=False)
+    k = nn.Linear(dims, dims)
     v = nn.Linear(dims, dims)
     o = nn.Linear(dims, dims)
-    return q, k, v, o, scale
+    lna = nn.LayerNorm(dims)
+    lnb = nn.LayerNorm(dims)
+    lnc = nn.LayerNorm(head_dim)
+    lnd = nn.LayerNorm(head_dim)
+    return q, k, v, o, lna, lnb, lnc, lnd
 
-def create_qkv(q, k, v, x, xa=None, head=8):
-    head_dim = q.out_features // head
-    scale = head_dim ** -0.5
+def shape(dims, head, q, k, v):
+    batch_size = q.shape[0]
+    seq_len_q = q.shape[1]
+    seq_len_kv = k.shape[1]
+    head_dim = dims // head
+
+    q = q.view(batch_size, seq_len_q, head, head_dim).transpose(1, 2)
+    k = k.view(batch_size, seq_len_kv, head, head_dim).transpose(1, 2)
+    v = v.view(batch_size, seq_len_kv, head, head_dim).transpose(1, 2)
+    return q, k, v
+
+def create_qkv(dims, head, q, k, v, x, xa):
+    head_dim = dims // head
+    scale = head_dim ** -0.25
     q = q(x) * scale
-    k = k(xa if xa is not None else x) * scale
-    v = v(xa if xa is not None else x)
-    batch, ctx, _ = q.shape
+    k = k(xa) * scale
+    v = v(xa)
+    batch, ctx, dims = x.shape
     def _shape(tensor):
         return tensor.view(batch, ctx, head, head_dim).transpose(1, 2).contiguous()
     return _shape(q), _shape(k), _shape(v)
 
-def calculate_attention(q, k, v, mask=None, temperature=1.0, is_causal=True):
-    batch, head, ctx, dims = q.shape
-    attn_mask = None
-    if mask is not None:
-        if mask.dim() <= 3:
-            attn_mask = create_attention_mask(
-                batch_size=batch,
-                ctx=ctx,
-                is_causal=is_causal,
-                padding_mask=mask if mask.dim() > 1 else None,
-                device=q.device)
-        else:
-            attn_mask = mask
-    scaled_q = q
-    if temperature != 1.0 and temperature > 0:
-        scaled_q = q * (1.0 / temperature)**.5
-    a = scaled_dot_product_attention(scaled_q, k, v, attn_mask=attn_mask, is_causal=is_causal if attn_mask is None else False)
-    out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
-    return out, None
+# def calculate_attention(q, k, v, mask=None, temp=1.0):
+#     scaled_q = q
+#     if temp != 1.0 and temp > 0:
+#         scaled_q = q * (1.0 / temp)**.5
+#     out = scaled_dot_product_attention(scaled_q, k, v, is_causal=mask is not None and q.shape[1] > 1)        
+#     return out
 
-class LocalAttentionModule(nn.Module):
-    def __init__(self, head_dim: int):
-        super().__init__()
-        self.head_dim = head_dim
-        self.query_module = nn.Linear(head_dim, head_dim)
-        self.key_module = nn.Linear(head_dim, head_dim)
-        self.value_module = nn.Linear(head_dim, head_dim)
-        self.out_proj = nn.Linear(head_dim, head_dim)
+# class LocalOut(nn.Module):
+#     def __init__(self, dims: int, head: int):
+#         super().__init__()
+#         head_dim = dims // head
+#         self.head_dim = head_dim
+#         self.query_module = nn.Linear(head_dim, head_dim)
+#         self.key_module = nn.Linear(head_dim, head_dim)
+#         self.value_module = nn.Linear(head_dim, head_dim)
+#         self.out_proj = nn.Linear(head_dim, head_dim)
     
-    def _reshape_to_output(self, x):
-        return x
+#     def _reshape_to_output(self, x):
+#         return x
 
-class attention(nn.Module):
-    def __init__(self, dims: int, head: int, max_iterations: int = 3, threshold: float = 0.01, s_factor: float = 0.1, dropout: float = 0.1):
-        super(attention, self).__init__()
-        self.dims = dims
-        self.head = head
-        self.head_dim = dims // head
-        self.max_iterations = max_iterations
-        self.threshold = nn.Parameter(torch.tensor(threshold))
-        self.s_factor = nn.Parameter(torch.tensor(s_factor))
-        self.dropout = dropout
-        
-        self.q = nn.Linear(dims, dims)
-        self.k = nn.Linear(dims, dims, bias=False)
-        self.v = nn.Linear(dims, dims)
-        self.o = nn.Linear(dims, dims)
+# class attentiona(nn.Module):
+#     def __init__(self, dims: int, head: int, max_iter: int = 3, threshold: float = 0.01, factor: float = 0.1, dropout: float = 0.1, temp = 1.0):
+#         super(attentiona, self).__init__()
+#         self.q,  self.k,  self.v,  self.o, self.lna, self.lnb = qkv_init(dims, head)
+#         self.dims = dims
+#         self.head = head
+#         self.head_dim = dims // head
+#         self.max_iter = max_iter
+#         self.threshold = nn.Parameter(torch.tensor(threshold))
+#         self.temp = nn.Parameter(torch.tensor(temp), requires_grad=True)        
+#         self.factor = nn.Parameter(torch.tensor(factor))
+#         self.lnc = nn.LayerNorm(self.head_dim, bias=False)
+#         self.lnd = nn.LayerNorm(self.head_dim, bias=False)     
+#         self.attn_local = LocalOut(self.head_dim)   
 
-        self.lna = nn.LayerNorm(dims, bias=False)
-        self.lnb = nn.LayerNorm(dims, bias=False)      
-        self.lnc = nn.LayerNorm(self.head_dim, bias=False)
-        self.lnd = nn.LayerNorm(self.head_dim, bias=False)     
+#     def _focus(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None):
+#         z = default(xa, x)
+#         q, k, v = create_qkv(self.dims, self.head, self.q, self.k, self.v, self.lna(x), self.lna(z))    
 
-        self.attn_local = LocalAttentionModule(self.head_dim)
+#         iteration = 0
+#         temp = self.temp.item()
+#         prev_out = torch.zeros_like(q)
+#         attn_out = torch.zeros_like(q)
+#         threshold = self.threshold.item()
+#         factor = self.factor.item()
+#         qcur = q
 
-    def _focus(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None):
-        q = self.q(self.lna(x))
-        k = self.k(self.lnb(x if xa is None else xa))
-        v = self.v(self.lnb(x if xa is None else xa))
-        
-        query = q.view(*q.shape[:2], self.head, -1).permute(0, 2, 1, 3)
-        key = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
-        value = v.view(*v.shape[:2], self.head, -1).permute(0, 2, 1, 3)
+#         while iteration < self.max_iter:
+#             eff_span = min(qcur.shape[1], k.shape[1])
+#             if xa is not None:
+#                 eff_span = min(eff_span, xa.shape[1])
+#             if eff_span == 0: 
+#                 break
 
-        iteration = 0
-        prev_attn_out = torch.zeros_like(query)
-        attn_out = torch.zeros_like(query)
-        threshold = self.threshold.item()
-        s_factor = self.s_factor.item()
+#             qiter = qcur[:, :, :eff_span, :]
+#             kiter = k[:, :, :eff_span, :]
+#             viter = v[:, :, :eff_span, :]
+#             q = self.attn_local.query_module(qiter)
+#             k = self.attn_local.key_module(kiter)
+#             v = self.attn_local.value_module(viter)
 
-        q_current = query
+#             iter_mask = None
+#             if mask is not None:
+#                 if mask.dim() == 4: 
+#                     iter_mask = mask[:, :, :eff_span, :eff_span]
+#                 elif mask.dim() == 2: 
+#                     iter_mask = mask[:eff_span, :eff_span]
 
-        while iteration < self.max_iterations:
-            eff_span = min(x.shape[1], q_current.size(1), key.size(1))
-            if xa is not None:
-                eff_span = min(eff_span, xa.shape[1])
+#             attn_iter = calculate_attention(
+#                 self.lnc(q), self.lnd(k), v,
+#                 mask=iter_mask, temp=temp)
 
-            if eff_span == 0: 
-                break
+#             iter_out = torch.zeros_like(qcur)
+#             iter_out[:, :, :eff_span, :] = attn_iter
+#             diff = torch.abs(iter_out - prev_out).mean()
+#             dthresh = threshold + factor * diff
+#             if diff < dthresh and iteration > 0:
+#                 attn_out = iter_out
+#                 break
 
-            q_iter = q_current[:, :, :eff_span, :]
-            k_iter = key[:, :, :eff_span, :]
-            v_iter = value[:, :, :eff_span, :]
+#             prev_out = iter_out.clone()
+#             qcur = qcur + iter_out
+#             attn_out = iter_out
+#             iteration += 1
+#             temp += 0.005
 
-            q_proj = self.attn_local.query_module(q_iter)
-            k_proj = self.attn_local.key_module(k_iter)
-            v_proj = self.attn_local.value_module(v_iter)
+#         output = attn_out.permute(0, 2, 1, 3).flatten(start_dim=2)
+#         return self.o(output), None
 
-            iter_mask = None
-            if mask is not None:
-                if mask.dim() == 4: 
-                    iter_mask = mask[:, :, :eff_span, :eff_span]
-                elif mask.dim() == 2: 
-                    iter_mask = mask[:eff_span, :eff_span]
+    # def _slide_win_local(self, x: Tensor, win_size: int, span_len: int, mask: Optional[Tensor] = None) -> Tensor:
 
-            attn_output_iter, _ = calculate_attention(
-                q_proj, k_proj, v_proj,
-                mask=iter_mask,
-                is_causal=True
-            )
+    #     batch, ctx, dims = x.shape
+    #     output = torch.zeros_like(x)
+    #     num_win = (ctx + win_size - 1) // win_size
 
-            attn_out_span = self.attn_local._reshape_to_output(attn_output_iter)
-            if attn_out_span.dim() == 4:
-                b, h, s, d = attn_out_span.shape
-                projected_attn_out_span = self.attn_local.out_proj(attn_out_span.view(-1, d)).view(b, h, s, -1)
-            elif attn_out_span.dim() == 3:
-                b, s, d = attn_out_span.shape
-                if d == self.head_dim:
-                    projected_attn_out_span = self.attn_local.out_proj(attn_out_span.view(-1, d)).view(b, 1, s, -1)
-                elif d == self.head * self.head_dim:
-                    projected_attn_out_span = attn_out_span.view(b, self.head, s, self.head_dim)
-                else:
-                    raise RuntimeError(f"Cannot reshape attn_out_span of shape {attn_out_span.shape} to [b, h, s, head_dim]")
-            else:
-                raise RuntimeError(f"Unexpected attn_out_span shape: {attn_out_span.shape}")
+    #     for i in range(num_win):
+    #         qstart = i * win_size
+    #         qend = min(qstart + win_size, ctx)
+    #         win_qlen = qend - qstart
+    #         if win_qlen == 0: 
+    #             continue
 
-            current_iter_out = torch.zeros_like(q_current)
-            current_iter_out[:, :, :eff_span, :] = projected_attn_out_span
+    #         kstart = max(0, qend - span_len)
+    #         kend = qend
+    #         qwin = x[:, qstart:qend, :]
+    #         kwin = x[:, kstart:kend, :]
 
-            diff = torch.abs(current_iter_out - prev_attn_out).mean()
-            dynamic_threshold = threshold + s_factor * diff
+    #         win_mask = None
+    #         if mask is not None:
+    #             if mask.dim() == 4:
+    #                 win_mask = mask[:, :, qstart:qend, kstart:kend]
+    #             elif mask.dim() == 2:
+    #                 win_mask = mask[qstart:qend, kstart:kend]
 
-            if diff < dynamic_threshold and iteration > 0:
-                attn_out = current_iter_out
-                break
+    #         attn_out, _ = self._focus(x=qwin, xa=kwin, mask=win_mask)
+    #         output[:, qstart:qend, :] = attn_out
+    #     return output
 
-            prev_attn_out = current_iter_out.clone()
-            q_current = q_current + current_iter_out
-            attn_out = current_iter_out
-
-            iteration += 1
-
-        output = attn_out.permute(0, 2, 1, 3).flatten(start_dim=2)
-        return self.o(output), None
-
-    def _slide_win_local(self, x: Tensor, win_size: int, span_len: int,
-                         mask: Optional[Tensor] = None, is_causal: bool = False) -> Tensor:
-        batch, ctx, dims = x.size()
-        output = torch.zeros_like(x)
-
-        num_windows = (ctx + win_size - 1) // win_size
-
-        for i in range(num_windows):
-            q_start = i * win_size
-            q_end = min(q_start + win_size, ctx)
-            current_window_q_len = q_end - q_start
-            if current_window_q_len == 0: 
-                continue
-
-            kv_start = max(0, q_end - span_len)
-            kv_end = q_end
-            query_win = x[:, q_start:q_end, :]
-            key_win = x[:, kv_start:kv_end, :]
-
-            window_mask = None
-            if mask is not None:
-                if mask.dim() == 4:
-                    window_mask = mask[:, :, q_start:q_end, kv_start:kv_end]
-                elif mask.dim() == 2:
-                    window_mask = mask[q_start:q_end, kv_start:kv_end]
-
-            attn_out_win, _ = self._focus(
-                x=query_win,
-                xa=key_win,
-                mask=window_mask
-            )
-
-            output[:, q_start:q_end, :] = attn_out_win
-
-        return output
-
-    def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, 
-                use_sliding_window: bool = False, win_size: int = 512, span_len: int = 1024) -> Tensor:
-        if use_sliding_window:
-            return self._slide_win_local(x, win_size, span_len, mask)
-        else:
-            output, _ = self._focus(x, xa, mask)
-            return output
-
-# attn = attention(dims=512, head=8, max_iterations=3)
-
-# x = torch.randn(2, 100, 512)
-# output = attn(x)
-
-# xa = torch.randn(2, 50, 512)
-# output = attn(x, xa=xa)
-
-# output = attn(x, use_sliding_window=True, win_size=256, span_len=512)      
+    # def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, 
+    #             use_sliding_win: bool = False, win_size: int = 512, span_len: int = 1024) -> Tensor:
+    #     if use_sliding_win:
+    #         return self._slide_win_local(x, win_size, span_len, mask)
+    #     else:
+    #         output, _ = self._focus(x, xa, mask)
+    #         return output
    
 class KVCache(nn.Module):
     def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
@@ -374,138 +410,6 @@ def get_generation_config(param):
         use_cache=False,
         return_timestamps=False)
 
-# class rotary(nn.Module):
-#     def __init__(self, dims, head, max_ctx=1500, radii=False, debug: List[str] = [], use_pbias=False, axial=False, spec_shape=None):
-
-#         super(rotary, self).__init__()
-#         self.use_pbias = use_pbias
-#         self.dims = dims
-#         self.head = head
-#         self.head_dim = dims // head
-#         self.radii = radii
-#         self.debug = debug
-#         self.counter = 0
-#         self.last_theta = None
-#         self.axial = axial
-
-#         self.bias = nn.Parameter(torch.zeros(max_ctx, dims // 2), requires_grad=True if use_pbias else False)
-#         theta = (torch.tensor(10000, device=device, dtype=dtype))
-#         self.theta = nn.Parameter(theta, requires_grad=True)    
-#         self.theta_values = []
-
-#         if axial and spec_shape is not None:
-#             time_frames, freq_bins = spec_shape
-#             self.time_frames = time_frames
-#             self.freq_bins = freq_bins
-            
-#             time_theta = 50.0
-#             time_freqs = 1.0 / (time_theta ** (torch.arange(0, dims, 4)[:(dims // 4)].float() / dims))
-#             self.register_buffer('time_freqs', time_freqs)
-            
-#             freq_theta = 100.0
-#             freq_freqs = 1.0 / (freq_theta ** (torch.arange(0, dims, 4)[:(dims // 4)].float() / dims))
-#             self.register_buffer('freq_freqs', freq_freqs)
-
-#     def pitch_bias(self, f0):
-#         if f0 is None:
-#             return None
-#         f0_flat = f0.squeeze().float()
-#         f0_norm = (f0_flat - f0_flat.mean()) / (f0_flat.std() + 1e-8)
-#         f0_sim = torch.exp(-torch.cdist(f0_norm.unsqueeze(1), 
-#                                     f0_norm.unsqueeze(1)))
-#         return f0_sim.unsqueeze(0).unsqueeze(0)
-
-#     def theta_freqs(self, theta):
-#         if theta.dim() == 0:
-#             theta = theta.unsqueeze(0)
-#         freq = (theta.unsqueeze(-1) / 220.0) * 700 * (
-#             torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), 
-#                     self.head_dim // 2, device=theta.device, dtype=theta.dtype) / 2595) - 1) / 1000
-#         return freq
-
-#     def _apply_radii(self, freqs, f0, ctx):
-#         if self.radii and f0 is not None:
-#             radius = f0.to(device, dtype)
-#             L = radius.shape[0]
-#             if L != ctx:
-#                 feature = L / ctx
-#                 idx = torch.arange(ctx, device=f0.device)
-#                 idx = (idx * feature).long().clamp(0, L - 1)
-#                 radius = radius[idx]
-#                 return torch.polar(radius.unsqueeze(-1), freqs), radius
-#             else:
-#                 return torch.polar(radius.unsqueeze(-1), freqs), radius
-#         else:
-#             return torch.polar(torch.ones_like(freqs), freqs), None
-
-#     def check_f0(self, f0, f0t, ctx):
-#         if f0 is not None and f0.shape[1] == ctx:
-#             return f0
-#         elif f0t is not None and f0t.shape[1] == ctx:
-#             return f0t
-#         else:
-#             return None         
-
-#     def axial_freqs(self, ctx):
-#         if not self.axial:
-#             return None
-#         time_frames = self.time_frames
-#         freq_bins = self.freq_bins
-
-#         t = torch.arange(ctx, device=device, dtype=dtype)
-#         t_x = (t % time_frames).float()
-#         t_y = torch.div(t, time_frames, rounding_mode='floor').float()
-#         freqs_x = torch.outer(t_x, self.time_freqs)
-#         freqs_y = torch.outer(t_y, self.freq_freqs)
-#         freqs_cis_x = torch.polar(torch.ones_like(freqs_x), freqs_x)
-#         freqs_cis_y = torch.polar(torch.ones_like(freqs_y), freqs_y)
-#         return torch.cat([freqs_cis_x, freqs_cis_y], dim=-1)
-
-#     def forward(self, x=None, feats=None, feature=None, layer=None) -> Tensor:
-#         ctx=x
-#         f0 = feats.get("f0") if feats is not None else None 
-#         f0t = feats.get("f0t") if feats is not None else None 
-
-#         f0 = self.check_f0(f0, f0t, ctx)
-#         if f0 is not None:
-#             # if f0.dim() == 2:
-#             #     f0 = f0.squeeze(0) 
-#             theta = f0 + self.theta  
-#         else:
-#             theta = self.theta 
-#         freqs = self.theta_freqs(theta)
-#         t = torch.arange(ctx, device=device, dtype=dtype) # type: ignore
-#         freqs = t[:, None] * freqs
-#         freqs, radius = self._apply_radii(freqs, f0, ctx)
-
-#         if self.axial and feature == "spectrogram":
-#             freqs_2d = self.axial_freqs(ctx)
-#             if freqs_2d is not None:
-#                 return freqs_2d.unsqueeze(0)
-
-#         if "radius" in self.debug and self.counter == 10:
-#             print(f"  [{layer}] [Radius] {radius.shape if radius is not None else None} {radius.mean() if radius is not None else None} [Theta] {theta.mean() if theta is not None else None} [f0] {f0.shape if f0 is not None else None} [Freqs] {freqs.shape} {freqs.mean():.2f} [ctx] {ctx}")
-#         self.counter += 1
-#         return freqs.unsqueeze(0)
-
-#     @staticmethod
-#     def split(X: Tensor):
-#         half_dim = X.shape[-1] // 2
-#         return X[..., :half_dim], X[..., half_dim:]
-
-#     @staticmethod
-#     def apply_rotary(x, freqs):
-#         x1 = x[..., :freqs.shape[-1]*2]
-#         x2 = x[..., freqs.shape[-1]*2:]
-#         orig_shape = x1.shape
-#         if x1.ndim == 2:
-#             x1 = x1.unsqueeze(0)
-#         x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
-#         x1 = torch.view_as_complex(x1) * freqs
-#         x1 = torch.view_as_real(x1).flatten(-2)
-#         x1 = x1.view(orig_shape)
-#         return torch.cat([x1.type_as(x), x2], dim=-1)
-
 class feature_encoder(nn.Module):
     def __init__(self, mels, input_dims, dims, head, layer, act, features, feature=None, use_rope=False, spec_shape=None, debug=[], attend_feature=False, target_length=None):
         """
@@ -526,7 +430,7 @@ class feature_encoder(nn.Module):
         act_fn = get_activation(act)
 
         if self.attend_feature:
-            self.q, self.k, self.v, self.o, self.scale = qkv_init(dims, head)
+            # self.q, self.k, self.v, self.o, self.scale = qkv_init(dims, head)
             self.mlp = nn.Sequential(nn.Linear(dims, dims), nn.ReLU(), nn.Linear(dims, dims))
         else:
             self.q, self.k, self.v, self.o, self.scale = None, None, None, None, None
@@ -625,12 +529,12 @@ class feature_encoder(nn.Module):
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
         x = self.norm(x)
 
-        if self.attend_feature:
-            xa = feats[feature]  # pyright: ignore[reportOptionalSubscript]
-            if xa is not None:
-                q, k, v = create_qkv(self.q, self.k, self.v, x=xa, xa=x, head=self.head)
-                out, _ = calculate_attention(q, k, v, mask=None, temperature=1.0, is_causal=True)
-                x = x + out
+        # if self.attend_feature:
+        #     xa = feats[feature]  # pyright: ignore[reportOptionalSubscript]
+        #     if xa is not None:
+        #         q, k, v = create_qkv(self.q, self.k, self.v, x=xa, xa=x, head=self.head)
+        #         out, _ = calculate_attention(q, k, v, mask=None, temperature=1.0, is_causal=True)
+        #         x = x + out
 
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
         x = self.norm(x)
@@ -716,127 +620,7 @@ class PositionalEncoding(nn.Module):
         x = x + pe
         return x
 
-def plot_waveform(x=None, w=None, p=None, per=None, sample_idx=0, sr=16000, hop_length=160, 
-                                 title="", markers=None, marker_labels=None, 
-                                 show_voiced_regions=True, show_energy=False):
-    num_plots = sum([x is not None, w is not None, p is not None, per is not None])
-    if num_plots == 0:
-        raise ValueError("No data to plot. Please provide at least one input tensor.")
-    t_spans = []
-    
-    if w is not None:
-        w_np = w[sample_idx].detach().cpu().numpy()
-        if w_np.ndim > 1:
-            w_np = w_np.squeeze()
-        t_spans.append(len(w_np) / sr)
-    if x is not None:
-        x_np = x[sample_idx].detach().cpu().numpy()
-        if x_np.shape[0] < x_np.shape[1]:
-            x_np = x_np.T
-        t_spans.append(x_np.shape[0] * hop_length / sr)
-    if p is not None:
-        p_np = p[sample_idx].detach().cpu().numpy()
-        if p_np.ndim > 1:
-            p_np = p_np.squeeze()
-        t_spans.append(len(p_np) * hop_length / sr)
-    if per is not None:
-        per_np = per[sample_idx].detach().cpu().numpy()
-        if per_np.ndim > 1:
-            per_np = per_np.squeeze()
-        t_spans.append(len(per_np) * hop_length / sr)
-    max_t = max(t_spans) if t_spans else 0
-    fig, axs = plt.subplots(num_plots, 1, figsize=(14, 4*num_plots), sharex=True)
-    if num_plots == 1:
-        axs = [axs]
-    if show_voiced_regions and per is not None:
-        per_np = per[sample_idx].detach().cpu().numpy()
-        if per_np.ndim > 1:
-            per_np = per_np.squeeze()
-        t_per = np.arange(len(per_np)) * hop_length / sr
-        threshold = 0.5
-        for ax in axs:
-            for i in range(len(per_np)-1):
-                if per_np[i] > threshold:
-                    ax.axvspan(t_per[i], t_per[i+1], color='lightblue', alpha=0.2, zorder=0)
-    cu_ax = 0
-    if w is not None:
-        w_np = w[sample_idx].detach().cpu().numpy()
-        if w_np.ndim > 1:
-            w_np = w_np.squeeze()
-        t = np.arange(len(w_np)) / sr
-        axs[cu_ax].plot(t, w_np, color="tab:blue")
-        
-        if show_energy:
-            frame_length = hop_length
-            hop_length_energy = hop_length // 2
-            energy = []
-            for i in range(0, len(w_np)-frame_length, hop_length_energy):
-                frame = w_np[i:i+frame_length]
-                energy.append(np.sqrt(np.mean(frame**2)))
-            energy = np.array(energy)
-            energy = energy / np.max(energy) * 0.8 * max(abs(w_np.min()), abs(w_np.max()))  
-            t_energy = np.arange(len(energy)) * hop_length_energy / sr
-            axs[cu_ax].plot(t_energy, energy, color="red", alpha=0.7, label="Energy")
-            axs[cu_ax].legend(loc='upper right')
-        axs[cu_ax].set_title("Waveform")
-        axs[cu_ax].set_ylabel("Amplitude")
-        axs[cu_ax].set_xlim([0, max_t])
-        axs[cu_ax].grid(True, axis='x', linestyle='--', alpha=0.3)
-        cu_ax += 1
-    
-    if x is not None:
-        x_np = x[sample_idx].detach().cpu().numpy()
-        if x_np.shape[0] < x_np.shape[1]:
-            x_np = x_np.T
-        axs[cu_ax].imshow(x_np.T, aspect="auto", origin="lower", cmap="magma", 
-                                   extent=[0, x_np.shape[0]*hop_length/sr, 0, x_np.shape[1]])
-        axs[cu_ax].set_title("Spectrogram")
-        axs[cu_ax].set_ylabel("Mel Bin")
-        axs[cu_ax].set_xlim([0, max_t])
-        axs[cu_ax].grid(True, axis='x', linestyle='--', alpha=0.3)
-        cu_ax += 1
-    
-    if p is not None:
-        p_np = p[sample_idx].detach().cpu().numpy()
-        if p_np.ndim > 1:
-            p_np = p_np.squeeze()
-        t_p = np.arange(len(p_np)) * hop_length / sr
-        axs[cu_ax].plot(t_p, p_np, color="tab:green")
-        axs[cu_ax].set_title("Pitch")
-        axs[cu_ax].set_ylabel("Frequency (Hz)")
-        axs[cu_ax].set_xlim([0, max_t])
-        axs[cu_ax].grid(True, axis='both', linestyle='--', alpha=0.3)
-        axs[cu_ax].set_ylim([0, min(1000, p_np.max() * 1.2)])
-        cu_ax += 1
-    
-    if per is not None:
-        per_np = per[sample_idx].detach().cpu().numpy()
-        if per_np.ndim > 1:
-            per_np = per_np.squeeze()
-        t_per = np.arange(len(per_np)) * hop_length / sr
-        axs[cu_ax].plot(t_per, per_np, color="tab:red")
-        axs[cu_ax].set_title("Period (Voice Activity)")
-        axs[cu_ax].set_ylabel("periodocity")
-        axs[cu_ax].set_xlim([0, max_t])
-        axs[cu_ax].grid(True, axis='both', linestyle='--', alpha=0.3)
-        axs[cu_ax].set_ylim([-0.05, 1.05])
-        axs[cu_ax].axhline(y=0.5, color='k', linestyle='--', alpha=0.3)
-    
-    if markers is not None:
-        for i, t in enumerate(markers):
-            label = marker_labels[i] if marker_labels and i < len(marker_labels) else None
-            for ax in axs:
-                ax.axvline(x=t, color='k', linestyle='-', alpha=0.7, label=label if i == 0 else None)
-        if marker_labels:
-            axs[0].legend(loc='upper right', fontsize='small')
-    axs[-1].set_xlabel("t (s)")
-    fig.suptitle(title, fontsize=16)
-    plt.tight_layout(rect=[0, 0, 1, 0.97]) # type: ignore
-    plt.show()
-    return fig
-
 def valid(default_value, *items):
-    """Get first non-None item"""
     for item in items:
         if item is not None:
             return item
@@ -903,20 +687,6 @@ def get_dtype():
 
 def tox():
     return {"device": get_device(), "dtype": get_dtype()}
-
-class Sinusoids(nn.Module):
-    def __init__(self, ctx: int, dims: int, max_tscale=10000):
-        super().__init__()
-        position = torch.arange(start=0, end=ctx, dtype=dtype).unsqueeze(dim=1)
-        div_term = torch.exp(input=torch.arange(start=0, end=dims, step=2, dtype=dtype) * -(torch.log(torch.tensor(float(max_tscale))) / dims))
-        features = torch.zeros(ctx, dims)
-        features[:, 0::2] = torch.sin(position * div_term)
-        features[:, 1::2] = torch.cos(position* div_term)
-        self.register_buffer('sinusoid', tensor=features)
-        self.positional_embeddings = nn.Parameter(self.sinusoid.clone()) # type: ignore
-    def forward(self, positions):
-        position_embeddings = self.positional_embeddings[positions]
-        return position_embeddings
 
 def sinusoids(ctx, dims, max_tscale=10000):
     assert dims % 2 == 0
@@ -991,7 +761,6 @@ def confidence_indicator(pred_ids, model, features):
     return max_probs.mean(dim=1)
 
 def wer_reward(hyp, ref):
-
     hyp_words = hyp.split()
     ref_words = ref.split()
     d = [[0] * (len(ref_words)+1) for _ in range(len(hyp_words)+1)]
@@ -1085,12 +854,12 @@ def world_to_mel(sp, ap, sample_rate=16000, n_mels=128):
     ap_mel = torch.matmul(ap, mel_basis.T)  # (frames, 128)
     return sp_mel, ap_mel
 
-def extract_features(batch, tokenizer, waveform=False, spec=False, f0=False, f0t=False, pitch=False, harmonics=False, sample_rate=16000, hop_length=256, mode="mean", debug=False, phase_mod=False, crepe=False, aperiodics=False, dummy=False):
+def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=False, pitch=False, harmonics=False, sample_rate=16000, hop_length=256, mode="mean", debug=False, phase_mod=False, crepe=False, aperiodics=False, dummy=False):
 
-    import torch
-    import torchaudio
-    import torchaudio.functional as F
-    import torchaudio.transforms as T
+    # import torch
+    # import torchaudio
+    # import torchaudio.functional as F
+    # import torchaudio.transforms as T
 
     torch_windows = {
         'hann': torch.hann_window,
@@ -1104,7 +873,7 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, f0=False, f0t
         return {
             "spectrogram": torch.zeros((1, 128, 100)),
             "f0": torch.zeros((1, 100)),
-            "f0t": torch.zeros((1, 100)),
+            "pitch_tokens": torch.zeros((1, 100)),
             "pitch": torch.zeros((1, 100)),
             "harmonics": torch.zeros((1, 128, 100)),
             "aperiodics": torch.zeros((1, 128, 100)),
@@ -1116,9 +885,11 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, f0=False, f0t
 
     audio = batch["audio"]
     sample_rate = audio["sampling_rate"]
+    # audio_length = len(audio["array"]) / audio["sampling_rate"]
     labels = tokenizer.encode(batch["transcription"])
+    # sentence_length = len(batch["transcription"]) 
     wav = load_wave(wave_data=audio, sample_rate=sample_rate)
-
+    
     def crepe_predict(wav, sample_rate, viterbi=False):
         import torchcrepe
         wav = wav.numpy().astype(np.float32)
@@ -1151,6 +922,7 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, f0=False, f0t
             window=window_fn, center=True, pad_mode="reflect", power=1.0)
 
     def mel_spectrogram(wav, sample_rate):
+
         spectrogram_config = {
             "hop_length": 256,
             "f_min": 150,
@@ -1171,23 +943,10 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, f0=False, f0t
         log_mel = torch.clamp(mel_spectrogram, min=1e-10).log10()
         log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
         spectrogram_tensor = (log_mel + 4.0) / 4.0
-        spectrogram_tensor = torch.tensor(spectrogram_tensor)
         return spectrogram_tensor
 
     if spec: 
         spectrogram_tensor = mel_spectrogram(wav, sample_rate)
-        # transform = torchaudio.transforms.MelSpectrogram(**spectrogram_config)
-        # mel_spectrogram = transform(wav)
-        # log_mel = torch.clamp(mel_spectrogram, min=1e-10).log10()
-        # log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
-        # spectrogram_tensor = (log_mel + 4.0) / 4.0
-        # spectrogram_tensor = torch.tensor(spectrogram_tensor)
-    
-    # if spec:    
-        # if isinstance(wav, torch.Tensor):
-        #     wav = wav.to(device)
-        # spectrogram_tensor = mel_spectrogram(wav, sample_rate, **spectrogram_config)
-        # spectrogram_tensor = spectrogram_tensor.permute(1, 0)
 
     def mfcc(wav, sample_rate, n_mels=128, n_fft=1024, hop_length=256, window_fn=torch.hann_window):
         transform = torchaudio.transforms.MFCC(
@@ -1207,16 +966,16 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, f0=False, f0t
         mfcc_tensor = transform(wav)
         return mfcc_tensor
 
-    def compute_pitch(wav, sample_rate, hop_length=256):
-        # pitch = F.detect_pitch_frequency(wav, sample_rate)
-        # f0 = pitch
-        import pyworld as pw
-        wav_np = wav.numpy().astype(np.float64)
-        f0, t = pw.dio(wav_np, sample_rate, frame_period=hop_length / sample_rate * 1000)
-        f0 = pw.stonemask(wav_np, f0, t, sample_rate)
-        return f0, t
+    # def compute_pitch(wav, sample_rate, hop_length=256):
+    #     # pitch = F.detect_pitch_frequency(wav, sample_rate)
+    #     # f0 = pitch
+    #     import pyworld as pw
+    #     wav_np = wav.numpy().astype(np.float64)
+    #     f0, t = pw.dio(wav_np, sample_rate, frame_period=hop_length / sample_rate * 1000)
+    #     f0 = pw.stonemask(wav_np, f0, t, sample_rate)
+    #     return f0, t
 
-    def compute_harmonics_and_aperiodics(wav, f0, t, sample_rate):
+    def harmonics_and_aperiodics(wav, f0, t, sample_rate):
         import pyworld as pw
         wav_np = wav.numpy().astype(np.float64)
         sp = pw.cheaptrick(wav_np, f0, t, sample_rate, fft_size=256)
@@ -1229,17 +988,12 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, f0=False, f0t
         aperiodic_tensor = torch.where(aperiodic_tensor == 0.0, torch.zeros_like(aperiodic_tensor), aperiodic_tensor / 1.0)
         return harmonic_tensor, aperiodic_tensor
 
-    if f0 or f0t or pitch or harmonics or aperiodics:
+    if pitch or pitch_tokens or harmonics or aperiodics:
         wavnp = wav.numpy().astype(np.float64)
         f0_np, t = pw.dio(wavnp, sample_rate, frame_period=hop_length / sample_rate * 1000)
         f0_np = pw.stonemask(wavnp, f0_np, t, sample_rate)
 
-    if f0:
-        f0_tensor = torch.from_numpy(f0_np)
-    else:
-        f0_tensor = None
-
-    if f0t:
+    if pitch_tokens:
         wav = torch.from_numpy(wavnp)
         t2 = torch.from_numpy(t)
         audio_duration = len(wav) / sample_rate
@@ -1261,10 +1015,10 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, f0=False, f0t
                 pitch_tok[i] = segment[-1]
         pitch_tok[pitch_tok < 100.0] = 0.0
         bos_pitch = pitch_tok[0] if len(pitch_tok) > 0 else 0.0
-        f0t_tensor = torch.cat([torch.tensor([bos_pitch]), pitch_tok])
-        f0t_tensor = torch.where(f0t_tensor == 0.0, torch.zeros_like(f0t_tensor), (f0t_tensor - 71.0) / (500.0 - 71.0))
+        pitch_tokens_tensor = torch.cat([torch.tensor([bos_pitch]), pitch_tok])
+        pitch_tokens_tensor = torch.where(pitch_tokens_tensor == 0.0, torch.zeros_like(pitch_tokens_tensor), (pitch_tokens_tensor - 71.0) / (500.0 - 71.0))
     else:
-        f0t_tensor = None
+        pitch_tokens_tensor = None
 
     if phase_mod:
         tframe = torch.mean(t2[1:] - t2[:-1])
@@ -1277,11 +1031,9 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, f0=False, f0t
         phase = None
 
     if pitch:
-        p_tensor = F.detect_pitch_frequency(wav, sample_rate)
-        # p_tensor = compute_pitch(wav, sample_rate, hop_length=hop_length)[0]
-        # p_tensor = torch.from_numpy(p_tensor)
+        p_tensor = torchaudio.functional.detect_pitch_frequency(wav, sample_rate)
+        # p_tensor = torch.from_numpy(f0_np)
         # p_tensor = p_tensor.unsqueeze(0) 
-        # # p_tensor = torch.from_numpy(f0_np)
     else:
         p_tensor = None
 
@@ -1308,23 +1060,17 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, f0=False, f0t
             dummy_tensor = torch.ones_like(spectrogram_tensor)
         elif p_tensor is not None:
             dummy_tensor = torch.ones_like(p_tensor) 
-        elif f0_tensor is not None:
-            dummy_tensor = torch.ones_like(f0_tensor)
-        elif f0t_tensor is not None:
-            dummy_tensor = torch.ones_like(f0t_tensor)
+        elif pitch_tokens_tensor is not None:
+            dummy_tensor = torch.ones_like(pitch_tokens_tensor)
         else:
             batch_size = 128
             seq_len = 1024
             dummy_tensor = torch.ones(batch_size, seq_len)
             dummy_tensor = dummy_tensor.to(device)
-
     else:
         dummy_tensor = None
-
     if debug:
-      
-        print(f"['f0']: {f0_tensor.shape if f0 else None}") 
-        print(f"['f0t']: {f0t_tensor.shape if f0t else None}")
+        print(f"['pitch_tokens']: {pitch_tokens_tensor.shape if pitch_tokens else None}")
         print(f"['harmonic']: {harmonic_tensor.shape if harmonics else None}")
         print(f"['aperiodic']: {aperiodic_tensor.shape if aperiodics else None}")
         print(f"['spectrogram']: {spectrogram_tensor.shape if spec else None}")
@@ -1341,8 +1087,7 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, f0=False, f0t
     return {
         "waveform": wave_tensor if waveform else None,
         "spectrogram": spectrogram_tensor if spec else None,
-        "f0": f0_tensor if f0 else None,
-        "f0t": f0t_tensor if f0t else None,
+        "pitch_tokens": pitch_tokens_tensor if pitch_tokens else None,
         "pitch": p_tensor if pitch else None,
         "harmonic": harmonic_tensor if harmonics else None,
         "aperiodic": aperiodic_tensor if aperiodics else None,  
@@ -1354,6 +1099,78 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, f0=False, f0t
         "crepe_activation": crepe_activation if crepe else None,
         "dummy": dummy_tensor if dummy else None,
     }
+
+# class PEncoder(nn.Module): # pitch encoder
+#     def __init__(self, dims: int, head: int, layer: int, kernel_size: int, act: str, 
+#                  max_seq_len: int, input_dims: int = 1, use_rope=False): 
+#         super().__init__()
+        
+#         self.head = head
+#         self.head_dim = dims // head
+#         self.dims = dims
+#         self.use_rope=use_rope
+#         self.dropout_rate = 0.01 
+#         act_fn = get_activation(act)
+
+#         self.positional_encoding = nn.Parameter(torch.randn(1, max_seq_len, dims)) 
+
+#         if use_rope:
+#                 self.rope = rotary(dims=dims, head=head, radii=False, debug=[], use_pbias=False, axial=False, spec_shape=spec_shape)# type: ignore
+#         else:
+#             self.rope = None
+#             self.positional = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
+
+#         self.attend_pitch = False 
+#         if self.attend_pitch:
+#             self.mlp = nn.Sequential(
+#                 nn.Linear(dims, dims),
+#                 nn.ReLU(),
+#                 nn.Linear(dims, dims),
+#             )
+#         else:
+#             self.mlp = None
+
+#         self.pitch_encoder = nn.Sequential(
+#             nn.Conv1d(input_dims, dims, kernel_size=kernel_size, stride=1, padding=kernel_size // 2), act_fn,
+#             nn.Conv1d(dims, dims, kernel_size=kernel_size - 2, stride=1, padding=(kernel_size - 2) // 2), act_fn,
+#             nn.Conv1d(dims, dims, kernel_size=kernel_size - 4, stride=1, padding=(kernel_size - 4) // 2, groups=dims), act_fn
+#         )
+    
+#         def rope_to_feature(self, x, xa=None, mask=None, feats=None, feature="pitch", layer="PEncoder"):
+#             batch, ctx, dims = x.shape
+#             x = x.view(batch, ctx, head, self.head_dim).permute(0, 2, 1, 3)
+#             freqs = self.rope(ctx, feats=feats, feature=feature, layer=layer) # type: ignore
+#             x = self.rope.apply_rotary(x, freqs)# type: ignore
+#             x = x.permute(0, 2, 1, 3).contiguous().view(batch, ctx, dims)
+#             return x
+
+#         self.norm = nn.LayerNorm(dims) 
+
+#     def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, 
+#                 feats: Optional[Any] = None, feature: str = "pitch", layer: str = "PEncoder", 
+#                 audio_duration: Optional[float] = None, sample_rate: Optional[int] = None, 
+#                 labels_len: Optional[int] = None, f0_np: Optional[np.ndarray] = None, 
+#                 t2_np: Optional[np.ndarray] = None, mode: str = "mean") -> Tensor:
+        
+#         if x.dim() == 2 and feature == "pitch":
+#             x_processed = x.unsqueeze(1) # Input to pitch_encoder: (batch_size, 1, num_pitch_tokens)
+#             x_processed = self.pitch_encoder(x_processed)             # Output: (batch_size, dims, num_pitch_tokens)
+#             x = x_processed.permute(0, 2, 1) # Reassign to x for consistency
+
+#         if self.use_rope:
+#             pass # Placeholder for RoPE application
+    
+#         seq_len = x.shape[1]
+#         # x = x + self.positional_encoding[:, :seq_len, :] 
+#         x = x + sinusoids(x.shape[1], x.shape[-1], 36000).to(device, dtype)
+
+#         if self.mlp is not None:
+#             x = self.mlp(x)
+
+#         x = nn.functional.dropout(x, p=self.dropout_rate, training=self.training)
+#         x = self.norm(x)    
+
+#         return x
 
 def plot_waveform(waveform, sr, title="Waveform", ax=None):
     waveform = waveform.numpy()
@@ -1407,7 +1224,7 @@ def prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, st
         "waveform": False,
         "spec": False,
         "f0": False,
-        "f0t": False,
+        "pitch_tokens": False,
         "pitch": False,
         "harmonic": False,
         "aperiodic": False,
@@ -1439,40 +1256,30 @@ def prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, st
     if sanity_check:
         test = load_dataset(
             "google/fleurs", "en_us", token=token, split="test", trust_remote_code=True, streaming=streaming).cast_column("audio", Audio(sampling_rate=sample_rate)).take(1)
-
-        dataset = test.map(
-            lambda x: extract_features(x, tokenizer, **extract_args),
-            remove_columns=test.column_names)
-
+        dataset = test.map(lambda x: extract_features(x, tokenizer, **extract_args), remove_columns=test.column_names)
         train_dataset = dataset
         test_dataset = dataset
         return train_dataset, test_dataset
- 
     else:
-
         def filter_func(x):
             return (0 < len(x["transcription"]) < max_ctx and
                     len(x["audio"]["array"]) > 0 and
                     len(x["audio"]["array"]) < max_ctx * 160)
+
+        # raw_train  = load_dataset("mozilla-foundation/common_voice_17_0", "en", token=token, split="train", trust_remote_code=True, streaming=True).rename_column("sentence", "transcription")
+        # raw_test = load_dataset("mozilla-foundation/common_voice_17_0", "en", token=token, split="test", trust_remote_code=True, streaming=True).rename_column("sentence", "transcription").take(1000)
 
         raw_train = load_dataset(
             "google/fleurs", "en_us", token=token, split="train", trust_remote_code=True, streaming=streaming).take(1000)
         raw_test = load_dataset(
             "google/fleurs", "en_us", token=token, split="test", trust_remote_code=True, streaming=streaming).take(100)
 
-        raw_train = raw_train.filter(filter_func)
-        raw_test = raw_test.filter(filter_func)
-        raw_train = raw_train.cast_column("audio", Audio(sampling_rate=sample_rate))
-        raw_test = raw_test.cast_column("audio", Audio(sampling_rate=sample_rate))
-
-        train_dataset = raw_train.map(
-            lambda x: extract_features(x, tokenizer, **extract_args), remove_columns=raw_train.column_names)
-
-        test_dataset = raw_test.map(
-            lambda x: extract_features(x, tokenizer, **extract_args), remove_columns=raw_test.column_names)
+        raw_train = raw_train.filter(filter_func).cast_column("audio", Audio(sampling_rate=sample_rate))
+        raw_test = raw_test.filter(filter_func).cast_column("audio", Audio(sampling_rate=sample_rate))
+        train_dataset = raw_train.map(lambda x: extract_features(x, tokenizer, **extract_args), remove_columns=raw_train.column_names)
+        test_dataset = raw_test.map(lambda x: extract_features(x, tokenizer, **extract_args), remove_columns=raw_test.column_names)
         train_dataset.save_to_disk(cache_file_train) if save_dataset is True else None
         test_dataset.save_to_disk(cache_file_test) if save_dataset is True else None
-
         return train_dataset, test_dataset
 
 class tgate(nn.Module):
@@ -1488,7 +1295,7 @@ class tgate(nn.Module):
 
 def get_feature_encoder(feature: str, mels: int, input_dims: int, dims: int, head: int, layer: int, act=None, features=None) -> nn.Module:
     if feature == "spectrogram":
-        return FEncoder(mels=mels, input_dims=input_dims, dims=dims, head=head, layer=layer, act=act, feature=feature, features=features)
+        return FEncoder(mels=mels, input_dims=input_dims, dims=dims, head=head)
     elif feature == "waveform":
         return WEncoder(input_dims, dims, head, layer, act, feature, features)
     elif feature == "pitch":
@@ -1590,7 +1397,7 @@ class WEncoder(nn.Module): # waveform encoder
         return self.norm(x)
 
 class PEncoder(nn.Module): # pitch encoder
-    def __init__(self, input_dims, dims, head, layer, kernel_size, act, use_rope=False, debug=[], one_shot=False, spec_shape=None):
+    def __init__(self, input_dims, dims, head, layer, act, use_rope=False, debug=[], one_shot=False, spec_shape=None):
         super().__init__()
         
         self.head = head
@@ -1639,8 +1446,8 @@ class PEncoder(nn.Module): # pitch encoder
         # freqs = self.rope(f0.shape[1], feats=feats, feature=feature, layer=layer)
         if x.dim() == 2:
             x = x.unsqueeze(0)
-        if feature == "pitch":
-            x = self.pitch_encoder(x).permute(0, 2, 1)
+        # if feature == "pitch":
+        x = self.pitch_encoder(x).permute(0, 2, 1)
 
         if self.use_rope:
             x = self.rope_to_feature(x, xa=xa, mask=mask, feats=feats, feature=feature, layer=layer)
@@ -1654,7 +1461,8 @@ class PEncoder(nn.Module): # pitch encoder
                 q, k, v = create_qkv(self.q, self.k, self.v, x=xa, xa=x, head=self.head)
                 out, _ = calculate_attention(q, k, v, mask=None, temperature=1.0, is_causal=True)
                 x = x + out
-        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
+
+        # x = nn.functional.dropout(x, p=self.dropout, training=self.training)
         x = self.norm(x)    
         print(f"Pitch encoder: {x.shape} {feature}") if "fencoder" in self.debug else None
         return x
@@ -1677,6 +1485,7 @@ class DataCollator:
                 labels_list = [f["labels"] for f in features]
                 max_len = max(len(l) for l in labels_list)  # noqa: E741
                 all_ids, all_labels = [], []
+
                 for label in labels_list:
                     label_list = label.tolist() if isinstance(label, torch.Tensor) else label
                     decoder_input = [bos_token_id] + label_list
@@ -1690,7 +1499,8 @@ class DataCollator:
                 batch["input_ids"] = torch.tensor(all_ids, dtype=torch.long)
                 batch["labels"] = torch.tensor(all_labels, dtype=torch.long)
 
-            elif key in ["spectrogram", "waveform", "pitch", "harmonic", "aperiodic", "f0t", "f0", "phase", "crepe_time", "crepe_frequency", "crepe_confidence", "crepe_activation", "dummy"]:
+            elif key in ["spectrogram", "waveform", "pitch", "harmonic", "aperiodic", "pitch_tokens", "f0", "phase", "crepe_time", "crepe_frequency", "crepe_confidence", "crepe_activation", "dummy"]:
+
                 items = [f[key] for f in features if key in f]
                 items = [item for item in items if item is not None]
                 if not items:  
@@ -1709,6 +1519,78 @@ class DataCollator:
                 # if key == "spectrogram":
                 #     batch["spectrogram"] = batch[key]
         return batch
+
+# import tiktoken
+# import torch
+# from torch.utils.data import Dataset, DataLoader
+
+# class tokenize(Dataset):
+#     def __init__(self, txt, tokenizer, max_length, stride):
+
+#         self.input_ids = []
+#         self.labels = []
+
+#         token_ids = tokenizer.encode(txt, allowed_special={"<eos>"})
+
+#         for i in range(0, len(token_ids) - max_length, stride):
+
+#             input_chunk = token_ids[i:i + max_length]
+#             target_chunk = token_ids[i + 1: i + max_length + 1]
+#             self.input_ids.append(torch.tensor(input_chunk))
+#             self.labels.append(torch.tensor(target_chunk))
+
+#     def __len__(self):
+#         return len(self.input_ids)
+
+#     def __getitem__(self, idx):
+#         return self.input_ids[idx], self.labels[idx]
+
+# def create_dataloader_v1(txt, batch_size, max_length, stride, shuffle=True, drop_last=True, num_workers=0):
+#     tokenizer = tiktoken.get_encoding("gpt2")
+#     dataset = tokenize(txt, tokenizer, max_length, stride)
+#     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last, num_workers=num_workers)
+#     return dataloader
+
+# def custom_collate_fn(batch, tokenizer_pad_token_id):
+#     max_len_in_batch = max(len(seq) for seq in batch)
+
+#     padded_input_ids = []
+#     attention_masks = []
+#     for seq in batch:
+#         padded_seq = F.pad(seq, (0, max_len_in_batch - len(seq)), value=tokenizer_pad_token_id)
+#         attention_mask = torch.ones(max_len_in_batch)
+#         attention_mask[len(seq):] = 0 
+#         padded_input_ids.append(padded_seq)
+#         attention_masks.append(attention_mask)
+
+#     input_ids_tensor = torch.stack(padded_input_ids)
+#     attention_mask_tensor = torch.stack(attention_masks)
+#     labels_tensor = input_ids_tensor.clone() 
+
+#     return {
+#         'input_ids': input_ids_tensor,
+#         'attention_mask': attention_mask_tensor,
+#         'labels': labels_tensor
+#     }
+
+# with open("the-verdict.txt", "r", encoding="utf-8") as f:
+#     raw_text = f.read()
+
+# vocab_size = 50257
+# output_dim = 256
+# context_length = 1024
+
+# token_embedding_layer = torch.nn.Embedding(vocab_size, output_dim)
+# pos_embedding_layer = torch.nn.Embedding(context_length, output_dim)
+
+# batch_size = 8
+# max_length = 4
+# dataloader = create_dataloader_v1(
+#     raw_text,
+#     batch_size=batch_size,
+#     max_length=max_length,
+#     stride=max_length
+# )
 
 def levenshtein(reference_words, hypothesis_words):
     m, n = len(reference_words), len(hypothesis_words)
@@ -1738,8 +1620,9 @@ def wer_batch(references, hypotheses):
         total_words += len(ref_words)
     return (total_errors / total_words) * 100 if total_words > 0 else 0.0
 
-def compute_metrics(pred, tokenizer=None, model=None, print_pred=False, num_samples=0):
+def compute_metrics(pred, tokenizer=None, model=None, print_pred=False, num_samples=0, logits=None):
     def clean(ids, pad_token_id=0, bos_token_id=1, eos_token_id=2):
+        
         if isinstance(ids, torch.Tensor):
             ids = ids.tolist()
         if isinstance(ids[0], (list, torch.Tensor, np.ndarray)):
@@ -1769,7 +1652,7 @@ def compute_metrics(pred, tokenizer=None, model=None, print_pred=False, num_samp
             print(f"Pred: '{pred_str[i]}'")
             print(f"Label: '{label_str[i]}'")
             print("-" * 40)
-            
+    
     wer = wer_batch(label_str, pred_str)
     if model is not None:
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000
