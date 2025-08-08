@@ -1,10 +1,6 @@
 
 ASR model + pitch aware relative positional embeddings. 
 
-<img width="1300" height="700" alt="out" src="https://github.com/user-attachments/assets/d28cef1c-e53e-4a01-a80f-54246c43c22e" />
-
-- eval_wer: 3.539671682626539, 
-- epoch: 0.22, num_input_tokens_seen: 280750
 
 -- Pred: ' Joe Keaton disapproved of films, and Buster also had shopping about the medium.'
 
@@ -222,11 +218,12 @@ The Complex Frequency Result:
 
 
 
-
-
-
 ----
 
 
+<img width="1300" height="700" alt="out" src="https://github.com/user-attachments/assets/d28cef1c-e53e-4a01-a80f-54246c43c22e" />
+
+- eval_wer: 3.539671682626539, 
+- epoch: 0.22, num_input_tokens_seen: 280750
 
 
