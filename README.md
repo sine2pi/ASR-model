@@ -2,9 +2,6 @@
 ASR model + pitch aware relative positional embeddings. 
 
 
--- Pred: ' Joe Keaton disapproved of films, and Buster also had shopping about the medium.'
-
--- Label: ' Joe Keaton disapproved of films, and Buster also had reservations about the medium.'
 
 Questions:
 
@@ -227,3 +224,6 @@ The Complex Frequency Result:
 - epoch: 0.22, num_input_tokens_seen: 280750
 
 
+-- Pred: ' Joe Keaton disapproved of films, and Buster also had shopping about the medium.'
+
+-- Label: ' Joe Keaton disapproved of films, and Buster also had reservations about the medium.'
