@@ -4,6 +4,15 @@ import glob
 
 # hugging face sucks
 
+    # import aiohttp
+    # dataset = load_dataset(
+    #     "librispeech_asr",
+    #     "clean",
+    #     split=["train_clean_100", "test_clean"],
+    #     cache_dir=CACHE_DIR,
+    #     storage_options={'client_kwargs': {'timeout': aiohttp.ClientTimeout(total=3600, connect=60)}}
+    # ).rename_column("text", "transcription").cast_column("audio", Audio(sampling_rate=sample_rate))
+
 _URL = "http://www.openslr.org/12"
 _DL_URL = "http://www.openslr.org/resources/12/"
 
@@ -137,4 +146,5 @@ class LibrispeechASR(datasets.GeneratorBasedBuilder):
                 key += 1
             else:
                 print(f"Warning: No transcription found for audio file {audio_file_path}. Skipping.")
+
 
