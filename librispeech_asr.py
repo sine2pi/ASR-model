@@ -1,58 +1,40 @@
-
-"""Librispeech automatic speech recognition dataset."""
-
 import os
-
 import datasets
+import glob
 
-_CITATION = """\
-@inproceedings{panayotov2015librispeech,
-  title={Librispeech: an ASR corpus based on public domain audio books},
-  author={Panayotov, Vassil and Chen, Guoguo and Povey, Daniel and Khudanpur, Sanjeev},
-  booktitle={Acoustics, Speech and Signal Processing (ICASSP), 2015 IEEE International Conference on},
-  pages={5206--5210},
-  year={2015},
-  organization={IEEE}
-}
-"""
-
-_DESCRIPTION = """\
-LibriSpeech is a corpus of approximately 1000 hours of read English speech with sampling rate of 16 kHz,
-prepared by Vassil Panayotov with the assistance of Daniel Povey. The data is derived from read
-audiobooks from the LibriVox project, and has been carefully segmented and aligned.87
-"""
+# hugging face sucks
 
 _URL = "http://www.openslr.org/12"
 _DL_URL = "http://www.openslr.org/resources/12/"
 
-_DL_URLS = {"test": _DL_URL + "test-clean.tar.gz",
-            "train.100": _DL_URL + "train-clean-100.tar.gz",
-        }
+
+_DL_URLS = {
+    "clean": {
+        "train_clean_100": _DL_URL + "train-clean-100.tar.gz",
+        "test_clean": _DL_URL + "test-clean.tar.gz",
+        "dev_clean": _DL_URL + "dev-clean.tar.gz",
+    },
+}
+
 
 class LibrispeechASRConfig(datasets.BuilderConfig):
     """BuilderConfig for LibriSpeechASR."""
 
     def __init__(self, **kwargs):
-        """
-        Args:
-          data_dir: `string`, the path to the folder containing the files in the
-            downloaded .tar
-          citation: `string`, citation for the data set
-          url: `string`, url for information about the data set
-          **kwargs: keyword arguments forwarded to super.
-        """
         super(LibrispeechASRConfig, self).__init__(version=datasets.Version("2.1.0", ""), **kwargs)
+
 
 class LibrispeechASR(datasets.GeneratorBasedBuilder):
     """Librispeech dataset."""
 
     DEFAULT_WRITER_BATCH_SIZE = 256
-    DEFAULT_CONFIG_NAME = "all"
-    BUILDER_CONFIG = LibrispeechASRConfig(name="clean", description="'Clean' speech.")
+    DEFAULT_CONFIG_NAME = "clean"
+    BUILDER_CONFIGS = [
+        LibrispeechASRConfig(name="clean", description="'Clean' speech."),
+    ]
 
     def _info(self):
         return datasets.DatasetInfo(
-            description=_DESCRIPTION,
             features=datasets.Features(
                 {
                     "file": datasets.Value("string"),
@@ -65,68 +47,94 @@ class LibrispeechASR(datasets.GeneratorBasedBuilder):
             ),
             supervised_keys=("file", "text"),
             homepage=_URL,
-            citation=_CITATION,
         )
 
     def _split_generators(self, dl_manager):
-        archive_path = dl_manager.download(_DL_URLS)
-        # (Optional) In non-streaming mode, we can extract the archive locally to have actual local audio files:
-        local_extracted_archive = dl_manager.extract(archive_path) if not dl_manager.is_streaming else {}
+        if self.config.name == "clean":
+            urls_to_download = {
+                "train_clean_100": _DL_URLS["clean"]["train_clean_100"],
+                "test_clean": _DL_URLS["clean"]["test_clean"],
+            }
+        else:
+            raise ValueError(f"Configuration '{self.config.name}' not supported in this script version.")
 
-        train_split = [
+        archive_path = dl_manager.download(urls_to_download)
+        local_extracted_archive = dl_manager.extract(archive_path)
+
+        splits = []
+
+        splits.append(
             datasets.SplitGenerator(
-                name="train.100",
+                name="train_clean_100",
                 gen_kwargs={
-                    "local_extracted_archive": local_extracted_archive.get("train.100"),
-                    "files": dl_manager.iter_archive(archive_path["train.100"]),
-                },
-            ),
-        ]
-        test_split = [
-            datasets.SplitGenerator(
-                name=datasets.Split.TEST,
-                gen_kwargs={
-                    "local_extracted_archive": local_extracted_archive.get("test"),
-                    "files": dl_manager.iter_archive(archive_path["test"]),
+                    "path_to_extracted_archive": local_extracted_archive["train_clean_100"],
                 },
             )
-        ]
-        return train_split + test_split
+        )
 
-    def _generate_examples(self, files, local_extracted_archive):
-        """Generate examples from a LibriSpeech archive_path."""
+        splits.append(
+            datasets.SplitGenerator(
+                name="test_clean",
+                gen_kwargs={
+                    "path_to_extracted_archive": local_extracted_archive["test_clean"],
+                },
+            )
+        )
+        
+        return splits
+
+    def _generate_examples(self, path_to_extracted_archive):
+        
         key = 0
-        audio_data = {}
-        transcripts = []
-        for path, f in files:
-            if path.endswith(".flac"):
-                id_ = path.split("/")[-1][: -len(".flac")]
-                audio_data[id_] = f.read()
-            elif path.endswith(".trans.txt"):
+        
+        transcription_files = glob.glob(os.path.join(path_to_extracted_archive, "**", "*.trans.txt"), recursive=True)
+        
+        transcriptions_by_id = {}
+        for trans_file_path in transcription_files:
+            if "README.TXT" in os.path.basename(trans_file_path).upper():
+                continue
+            
+            with open(trans_file_path, "r", encoding="utf-8") as f:
                 for line in f:
+                    line = line.strip()
                     if line:
-                        line = line.decode("utf-8").strip()
-                        id_, transcript = line.split(" ", 1)
-                        audio_file = f"{id_}.flac"
-                        speaker_id, chapter_id = [int(el) for el in id_.split("-")[:2]]
-                        audio_file = (
-                            os.path.join(local_extracted_archive, audio_file)
-                            if local_extracted_archive
-                            else audio_file
-                        )
-                        transcripts.append(
-                            {
-                                "id": id_,
-                                "speaker_id": speaker_id,
-                                "chapter_id": chapter_id,
-                                "file": audio_file,
-                                "text": transcript,
-                            }
-                        )
-            if audio_data and len(audio_data) == len(transcripts):
-                for transcript in transcripts:
-                    audio = {"path": transcript["file"], "bytes": audio_data[transcript["id"]]}
-                    yield key, {"audio": audio, **transcript}
-                    key += 1
-                audio_data = {}
-                transcripts = []
+                        parts = line.split(" ", 1)
+                        if len(parts) == 2:
+                            utt_id, transcript = parts
+                            transcriptions_by_id[utt_id] = transcript
+                        else:
+                            print(f"Warning: Skipping malformed line in {trans_file_path}: {line}")
+                            
+        audio_files = glob.glob(os.path.join(path_to_extracted_archive, "**", "*.flac"), recursive=True)
+        
+        for audio_file_path in audio_files:
+            file_basename = os.path.basename(audio_file_path)
+            utt_id_from_file = file_basename[: -len(".flac")]
+            
+            if utt_id_from_file in transcriptions_by_id:
+                transcript = transcriptions_by_id[utt_id_from_file]
+                
+                parts = utt_id_from_file.split("-")
+                if len(parts) >= 2:
+                    try:
+                        speaker_id = int(parts[0])
+                        chapter_id = int(parts[1])
+                    except ValueError:
+                        print(f"Warning: Skipping utterance {utt_id_from_file} due to non-integer speaker/chapter ID.")
+                        continue
+                else:
+                    print(f"Warning: Skipping utterance {utt_id_from_file} due to unexpected ID format.")
+                    continue
+                
+                yield key, {
+                    "file": audio_file_path,
+                    "audio": audio_file_path,
+                    "text": transcript,
+                    "speaker_id": speaker_id,
+                    "chapter_id": chapter_id,
+                    "id": utt_id_from_file,
+                }
+                key += 1
+            else:
+                print(f"Warning: No transcription found for audio file {audio_file_path}. Skipping.")
+
