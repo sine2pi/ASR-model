@@ -283,109 +283,106 @@ class residual(nn.Module):
         # print(results['jumps'])
         # log['jumps'] = l
         return x
-  
+
 class skip_layer(nn.Module):
     def __init__(self, dims, head, layer, threshold=0.1):
         super().__init__()
-        self.layers = nn.ModuleList()
-        self.layer = layer
 
-        self.threshold = threshold
+        self.threshold = nn.Parameter(torch.tensor(threshold, device=device, dtype=dtype), requires_grad=True)
+        self.work_mem = nn.Parameter(torch.zeros(1, 1, dims), requires_grad=True)
+        self.mem_gate = nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid())
+        self.jump_weights = nn.Parameter(torch.tensor([0.1, 0.05, 0.01]), requires_grad=True)
+
         self.dims = dims
         self.head = head
         self.head_dim = dims // head
+        self.layer = layer
 
-        self.attention_module = attentiona(dims, head)
-        self.node_predictors = nn.ModuleList([
+        self.attention = attentiona(dims, head)
+        self.predict = nn.ModuleList([
             nn.Sequential(
                 nn.LayerNorm(dims),
                 nn.Linear(dims, 1),
                 nn.Sigmoid()
-            ) for _ in range(layer)
-        ])
-        
+            ) for _ in range(layer)])
+
+        self.layers = nn.ModuleList()
         for i in range(layer):
             self.layers.append(nn.ModuleDict({
                 'ln': nn.LayerNorm(dims),
                 'gate': nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()),
-                'adapter': nn.Linear(dims, dims) if i % 2 == 0 else None
-            }))
+                'adapter': nn.Linear(dims, dims) if i % 2 == 0 else None}))
         
         self.policy_net = nn.Sequential(
             nn.Linear(dims, 128),
             nn.ReLU(),
             nn.Linear(128, 3))
-        
-        self.jump_weights = nn.Parameter(torch.tensor([0.1, 0.05, 0.01]))
-        
-        n_mlp = dims * 4
+
         self.mlp_gate = nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid())
-        self.mlp = nn.Sequential(nn.Linear(dims, n_mlp), nn.GELU(), nn.Linear(n_mlp, dims))
+        self.mlp = nn.Sequential(nn.Linear(dims, dims * 4), nn.GELU(), nn.Linear(dims * 4, dims))
         self.mlp_ln =nn.LayerNorm(dims)
-        self.working_memory = nn.Parameter(torch.zeros(1, 1, dims))
-        self.memory_gate = nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid())
 
     def _calculate_shared_attention(self, x, mask=None):
-        return self.attention_module(x, xa=x, mask=None)
+        return self.attention(x, xa=x, mask=None)
 
-    def predict_node_importance(self, x, layer_idx):
-        importance = self.node_predictors[layer_idx](x)
-        return (importance > self.threshold).float()
+    def predict_choice(self, x, layer_idx):
+        choice = self.predict[layer_idx](x)
+        return (choice > self.threshold).float()
     
     def forward(self, x, xa=None, mask=None):
         batch, ctx = x.shape[:2]
 
-        working_memory = self.working_memory.expand(batch, -1, -1)
-        original_x = x
-        pooled_representation = x.mean(dim=1)
-        policy_logits = self.policy_net(pooled_representation)
+        work_mem = self.work_mem.expand(batch, -1, -1)
+        og_x = x
+        pooled_rep = x.mean(dim=1)
+        policy_logits = self.policy_net(pooled_rep)
         policy = F.softmax(policy_logits, dim=-1)
         
-        jump_history = []
+        history = []
         i = 0
         while i < self.layer:
             layer = self.layers[i]
-            node_importance = self.predict_node_importance(x, i)
-            if node_importance.mean() < 0.2 and i > 0:
+            choice = self.predict_choice(x, i)
+            if choice.mean() < 0.2 and i > 0:
                 i += 1
-                jump_history.append(i)
+                history.append(i)
                 continue
                 
-            norm_x = layer['ln'](x)
-            importance_mask_base = node_importance.unsqueeze(1).contiguous()
-            combined_custom_mask = None
+            x = layer['ln'](x)
+            mask_base = choice.unsqueeze(1).contiguous()
+            combined_mask = None
             if mask is None:
-                combined_custom_mask = importance_mask_base 
+                combined_mask = mask_base 
             else:
-                combined_custom_mask = mask.contiguous() * importance_mask_base
+                combined_mask = mask.contiguous() * mask_base
                 
-            if node_importance.mean() > 0.3:
-                attn_output = self._calculate_shared_attention(norm_x, mask=combined_custom_mask.contiguous())
+            if choice.mean() > 0.3:
+                attn_output = self._calculate_shared_attention(x, mask=combined_mask.contiguous())
                 if layer['adapter'] is not None:
                     attn_output = layer['adapter'](attn_output)
                 
-                gate_value = layer['gate'](norm_x)
+                gate_value = layer['gate'](x)
                 x = x + gate_value * attn_output
-                memory_gate = self.memory_gate(x)
-                working_memory = memory_gate * working_memory + (1 - memory_gate) * x.mean(dim=1, keepdim=True)
+                mem_gate = self.mem_gate(x)
+                work_mem = mem_gate * work_mem + (1 - mem_gate) * x.mean(dim=1, keepdim=True)
             
             jump_prob = policy[:, 1] if i < self.layer - 1 else torch.zeros_like(policy[:, 1])
-            should_jump = (torch.rand_like(jump_prob) < jump_prob).any()
+            jump = (torch.rand_like(jump_prob) < jump_prob).any()
             
-            if should_jump:
-                jump_length = torch.multinomial(policy, 1)[:, 0].max().item() + 1
-                i_next = min(i + jump_length, self.layer - 1)
-                skip_weight = self.jump_weights[min(jump_length-1, 2)]
-                x = x + skip_weight * original_x + (1-skip_weight) * working_memory
+            if jump:
+                distance = torch.multinomial(policy, 1)[:, 0].max().item() + 1
+                i_next = min(i + distance, self.layer - 1)
+                skip_weight = self.jump_weights[min(distance-1, 2)]
+                x = x + skip_weight * og_x + (1-skip_weight) * work_mem
                 i = i_next
-                jump_history.append(i)
+                history.append(i)
             else:
                 i += 1
         
-        mlp_importance = self.mlp_gate(x)
+        mlp_choice = self.mlp_gate(x)
         mlp_output = self.mlp(self.mlp_ln(x))
-        x = x + mlp_importance * mlp_output
-        return x, {'jumps': jump_history}
+        x = x + mlp_choice * mlp_output
+        return x, {'jumps': history}
         
 class processor(nn.Module):
     def __init__(self, tokens, mels, ctx, dims, head, head_dim, layer, act): 
