@@ -1,14 +1,14 @@
 
-![a](https://github.com/user-attachments/assets/015d4c11-cf65-4cdc-a1e6-11a4b2b2f98d)
+
+<img width="1000" height="500" alt="123123" src="https://github.com/user-attachments/assets/015d4c11-cf65-4cdc-a1e6-11a4b2b2f98d" />
+
+<img width="300" height="500" alt="123123" src="https://github.com/user-attachments/assets/e059bb1d-f21f-4835-bdf1-e78334dcc755" />
+
+<img width="80" height="80" alt="123123" src="https://github.com/user-attachments/assets/77991ecc-05f9-4784-af4e-b4a59ac6be07" />
 
 
 
-![b](https://github.com/user-attachments/assets/e059bb1d-f21f-4835-bdf1-e78334dcc755)
 
-![c](https://github.com/user-attachments/assets/77991ecc-05f9-4784-af4e-b4a59ac6be07)
-
-
-ASR model + pitch aware relative positional embeddings. 
 
 To explore the relationship between pitch and rotary embeddings, the model implements three complementary pitch based enhancements:
 
@@ -40,7 +40,6 @@ Reference: [PyTorch Documentation - torch.polar]https:pytorch.orgdocsstablegener
 
 
 
-https://huggingface.co/Sin2pi/asr-model/tensorboard
 ```python
 
 
@@ -214,12 +213,4 @@ The Complex Frequency Result:
 ----
 
 
-<img width="1300" height="700" alt="out" src="https://github.com/user-attachments/assets/d28cef1c-e53e-4a01-a80f-54246c43c22e" />
 
-- eval_wer: 3.539671682626539, 
-- epoch: 0.22, num_input_tokens_seen: 280750
-
-
--- Pred: ' Joe Keaton disapproved of films, and Buster also had shopping about the medium.'
-
--- Label: ' Joe Keaton disapproved of films, and Buster also had reservations about the medium.'
