@@ -1,18 +1,14 @@
 
+![a](https://github.com/user-attachments/assets/015d4c11-cf65-4cdc-a1e6-11a4b2b2f98d)
+
+
+
+![b](https://github.com/user-attachments/assets/e059bb1d-f21f-4835-bdf1-e78334dcc755)
+
+![c](https://github.com/user-attachments/assets/77991ecc-05f9-4784-af4e-b4a59ac6be07)
+
+
 ASR model + pitch aware relative positional embeddings. 
-
-
-
-Questions:
-
-   -How can we make attention mechanisms aware of speech-specific properties?
-   
-   -Can we incorporate acoustic information directly into positional encodings?
-   
-   -Does pitch-conditioning improve speech recognition?
-
----
-
 
 To explore the relationship between pitch and rotary embeddings, the model implements three complementary pitch based enhancements:
 
