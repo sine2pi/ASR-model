@@ -209,19 +209,10 @@ class Model(nn.Module):
         n.counts = {"Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0, "Conv2d": 0, "processor": 0, "attention": 0, "Residual": 0}
         for name, m in n.named_modules():
             if isinstance(m, nn.RMSNorm):
-                nn.init.ones_(m.weight)
                 n.counts["RMSNorm"] += 1
             if isinstance(m, nn.LayerNorm):
-                if m.weight is not None:
-                    nn.init.normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
                 n.counts["LayerNorm"] += 1                
             elif isinstance(m, nn.Linear):
-                if m.weight is not None:
-                    nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
                 n.counts["Linear"] += 1
 
     def init_weights(n):
