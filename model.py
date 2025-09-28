@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from transformers.trainer_seq2seq import Seq2SeqTrainer
 from transformers.training_args_seq2seq import Seq2SeqTrainingArguments
 from einops.layers.torch import Rearrange
-from echoutils4 import *
+from echoutils import *
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
