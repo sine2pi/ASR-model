@@ -205,7 +205,7 @@ class Model(nn.Module):
             loss = torch.nn.functional.cross_entropy(output.view(-1, output.shape[-1]), labels.view(-1), ignore_index=0)
         return {"logits": output, "loss": loss}
 
-    def _init_weights(n, m):
+    def _init_weights(n, m): # do not initialize weights or biases 
         n.counts = {"Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0, "Conv2d": 0, "processor": 0, "attention": 0, "Residual": 0}
         for name, m in n.named_modules():
             if isinstance(m, nn.RMSNorm):
