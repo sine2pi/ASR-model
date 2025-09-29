@@ -1,8 +1,9 @@
-import os, torch, numpy as np
+import os, torch
 from datasets import load_dataset, Audio
 from torch.nn.functional import scaled_dot_product_attention
 from torch import nn, Tensor
 from typing import Iterable
+import numpy as np
 from functools import partial
 from datetime import datetime
 from dataclasses import dataclass
@@ -27,6 +28,42 @@ class Dimensions:
     layer: int
     act: str
     norm_type: str
+    num_features: int = 0
+
+def sinusoids(ctx, dims, theta=THETA):
+    tscales = torch.exp(-torch.log(torch.tensor(float(theta))) / (dims // 2 - 1) * torch.arange(dims // 2, device=device, dtype=torch.float32))
+    scaled = torch.arange(ctx, device=device, dtype=torch.float32).unsqueeze(1) * tscales.unsqueeze(0)
+    positional_embedding = nn.Parameter(torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=1) , requires_grad=True)
+    return positional_embedding    
+
+class AudioEncoder(nn.Module):
+    def __init__(n, mels, dims, head, act, norm_type, norm=False, enc=False):
+        super().__init__()
+        
+        n.act_fn = get_activation(act)
+        n.conv1 = nn.Conv1d(mels, dims, kernel_size=3, stride=1, padding=1)
+        n.conv2 = nn.Conv1d(1, dims, kernel_size=3, stride=1, padding=1)
+        
+        n.encoder = nn.Sequential(
+            n.act_fn, nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), 
+            n.act_fn, nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), n.act_fn)   
+
+        theta = nn.Parameter(torch.tensor(THETA), requires_grad=True)
+        n.audio = lambda length, dims: sinusoids(length, dims, theta)
+        n.EncoderLayer = nn.TransformerEncoderLayer(d_model=dims, nhead=head, batch_first=True) if enc else nn.Identity()
+        n.ln = get_norm(norm_type, dims) if norm else nn.Identity()
+               
+    def forward(n, x):
+        if x.dim() == 2:
+            x = x.unsqueeze(0)   
+        if x.shape[1] > 1:      
+            x = n.conv1(x)
+        else:
+            x = n.conv2(x)
+        x = n.encoder(x).permute(0, 2, 1).contiguous().to(device, dtype)
+        x = x + n.audio(x.shape[1], x.shape[-1]).to(device, dtype)
+        x = n.ln(x)
+        return n.EncoderLayer(x)
 
 class rotary(nn.Module):
     def __init__(n, dims, head):
@@ -51,6 +88,7 @@ class rotary(nn.Module):
             return torch.polar(torch.ones_like(freqs).unsqueeze(0), freqs.unsqueeze(0))
 
     def forward(n, x, xa=None, mask=None):
+
         ctx = x.shape[2]
         t = torch.arange(ctx, device=device, dtype=dtype).float()
         freqs = torch.einsum('i,j->ij', t,  n._compute_freqs(mask))
@@ -81,14 +119,14 @@ class attention(nn.Module):
         n.ln = get_norm(norm_type, dims // head)
         n.rot = rotary(dims, head)
  
-    def forward(n, x, xa=None, mask=None, modal=False, pitch_tokens=None): 
+    def forward(n, x, xa=None, mask=None): 
 
         k, v = n.kv(x if xa is None else xa)
         q = n.q(x)
         q, k = n.rot(q, x, mask=None), n.rot(k, x if xa is None else xa, mask=None)
         a = scaled_dot_product_attention(n.ln(q), n.ln(k), v, is_causal=mask is not None)
 
-        if modal and xa is not None:
+        if n.modal and xa is not None:
             (ka, va), (kb, vb) = n.kv(x), n.kv(xa)
             qa, qb, ka, kb = n.rot(qa), n.rot(qb), n.rot(ka), n.rot(kb)
             b = scaled_dot_product_attention(n.ln(qa), n.ln(kb), vb, is_causal=mask is not None)
@@ -98,19 +136,19 @@ class attention(nn.Module):
             return n.out(a)
     
 class gate(nn.Module):
-    def __init__(n, dims, num_feature, num):
+    def __init__(n, dims, num_features, expand):
         super().__init__()
-        n.num_feature = num_feature
-        n.num = num
-        n.gates = nn.ModuleList([nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()) for _ in range(num_feature)])
-        n.features = nn.Sequential(nn.Linear(dims, num_feature), nn.Softmax(dim=-1))
-        n.top_features = nn.Linear(dims, num_feature)
+        num_features = num_features + 2 
+        n.expand = min(expand, max(1, num_features))
+        n.gates = nn.ModuleList([nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()) for _ in range(num_features)])
+        n.features = nn.Sequential(nn.Linear(dims, num_features), nn.Softmax(dim=-1))
+        n.top_features = nn.Linear(dims, num_features)
         n.alpha = nn.Parameter(torch.ones(1), requires_grad=True)
 
     def forward(n, x):
         soft_types = n.features(x)
         types = n.top_features(x)
-        n_types, n_indices = torch.topk(types, n.num, dim=-1)
+        n_types, n_indices = torch.topk(types, n.expand, dim=-1)
         values = F.softmax(n_types, dim=-1)
         s_types = torch.zeros_like(soft_types)
         s_types.scatter_(-1, n_indices, values)
@@ -119,27 +157,27 @@ class gate(nn.Module):
         return torch.sum(gates * features.unsqueeze(2), dim=-1)
 
 class residual(nn.Module):
-    def __init__(n, dims, head, layer, act, norm_type, expand=4):
+    def __init__(n, dims, head, layer, act, norm_type, num_features):
         super().__init__()
 
-        n.layer = layer
+        expand = max(1, min(4, num_features)) 
         n.ln = get_norm(norm_type, dims)
-        n.attn = attention(dims, head, norm_type)
-        n.gate = gate(dims, num_feature=4, num=2)
         n.act_fn = get_activation(act)
 
+        n.attn = attention(dims, head, norm_type)
+        n.gate = gate(dims, num_features, expand) if num_features > 0 else nn.Identity()
         n.mlp = nn.Sequential(get_norm(norm_type, dims), nn.Linear(dims, dims*expand), get_activation(act), nn.Linear(dims*expand, dims))
 
-    def forward(n, x, xa=None, mask=None, modal=False, pitch_tokens=None):
+    def forward(n, x, xa=None, mask=None):
 
-        x = x + n.attn(n.ln(x), mask=mask, modal=modal) 
+        x = x + n.attn(n.ln(x), mask=mask) 
         if xa is not None:
             xa = xa + n.gate(xa)
-            x = x + n.attn(n.ln(x), xa, modal=modal)
+            x = x + n.attn(n.ln(x), xa)
         return x + n.mlp(x)
 
 class processor(nn.Module):
-    def __init__(n, tokens, mels, ctx, dims, head, layer, act, norm_type): 
+    def __init__(n, tokens, mels, ctx, dims, head, layer, act, norm_type, num_features): 
         super().__init__()
 
         n.ln = get_norm(norm_type, dims)
@@ -150,21 +188,33 @@ class processor(nn.Module):
         n.dummy = torch.ones(1, ctx, dims, device=device, dtype=dtype)
 
         n.block: Iterable[residual] = nn.ModuleList(
-            [residual(dims=dims, head=head, layer=layer, act=act, norm_type=norm_type) for _ in range(layer)]) 
+            [residual(dims=dims, head=head, layer=layer, act=act, norm_type=norm_type, num_features=num_features) for _ in range(layer)]) 
+        
         n.register_buffer("mask", torch.empty(ctx, ctx).fill_(-np.inf).triu_(1), persistent=False)
 
-    def forward(n, x, xa=None, xb=None, xc=None, seq=False) -> Tensor:
+    def forward(n, x, xa=None, xb=None, xc=None, xd=None, xe=None, xf=None, xg=None, seq=False) -> Tensor:
 
         x = (n.token(x) + n.positions[:x.shape[-1]]).to(device, dtype)
 
         for i in n.block:
-            x  = i(x, mask=n.mask[:x.shape[1], :x.shape[1]])
-            x  = i(x, xa=i(xa if xa is not None else aorb(xb, n.dummy)))
-            x  = i(x, xa=i(xb if xb is not None else aorb(xa, n.dummy))) 
-            x  = i(x, xa=i(xc if xc is not None else aorb(xa, n.dummy)))
+            x = i(x, mask=n.mask[:x.shape[1], :x.shape[1]])
+
+            audio_inputs = [
+                (xa, xb),  
+                (xb, xa),
+                (xc, xa),
+                (xd, xa),
+                (xe, xa),
+                (xf, xa),
+                (xg, xa),
+            ]
+            
+            for audio_input, fallback in audio_inputs:
+                processed = i(audio_input if audio_input is not None else aorb(fallback, n.dummy))
+                x = i(x, xa=processed)
 
             xc = torch.cat([x, xa], dim=1)
-            xm = i(x=xc[:, :x.shape[1]], xa=xc[:, x.shape[1]:], modal=False)
+            xm = i(x=xc[:, :x.shape[1]], xa=xc[:, x.shape[1]:])
             x = xm if seq else torch.sigmoid(n.blend) * x + (1 - torch.sigmoid(n.blend)) * xm
 
         return (n.ln(x) @ torch.transpose(n.token.weight.to(dtype), 0, 1)).float()
@@ -174,6 +224,7 @@ class Model(nn.Module):
         super().__init__()
 
         n.param = param
+
         n.processor = processor(
             tokens=param.tokens,
             mels=param.mels,
@@ -183,6 +234,7 @@ class Model(nn.Module):
             layer=param.layer,
             act=param.act,
             norm_type=param.norm_type,
+            num_features=param.num_features,
             )
 
         n.encoder = AudioEncoder(param.mels, param.dims, param.head, param.act, param.norm_type, norm=False, enc=False)
@@ -193,19 +245,29 @@ class Model(nn.Module):
                 continue
             n.layer += 1        
 
-    def forward(n, labels=None, input_ids=None, spectrogram=None, waveform=None, pitch=None, pitch_tokens=None):
-
-        xa = n.encoder(spectrogram) if spectrogram is not None else None
-        xb = n.encoder(pitch) if pitch is not None else None       
-        xc = n.encoder(waveform) if waveform is not None else None
-
-        output = n.processor(input_ids, xa, xb, xc)
+    def forward(n, labels=None, input_ids=None, spectrogram=None, waveform=None, pitch=None, pitch_tokens=None, 
+            harmonics=None, aperiodics=None, phase=None, hilbert=None):
+     
+        features = {
+            'xa': spectrogram,
+            'xb': pitch,
+            'xc': waveform,
+            'xd': harmonics,
+            'xe': aperiodics,
+            'xf': phase,
+            'xg': hilbert
+        }
+        
+        encoded_features = {name: n.encoder(feature) if feature is not None else None for name, feature in features.items()}
+        xa, xb, xc, xd, xe, xf, xg = [encoded_features[f'x{c}'] for c in 'abcdefg']
+        output = n.processor(input_ids, xa, xb, xc, xd, xe, xf, xg)
         loss = None
         if labels is not None:
-            loss = torch.nn.functional.cross_entropy(output.view(-1, output.shape[-1]), labels.view(-1), ignore_index=0)
+            loss = torch.nn.functional.cross_entropy(output.view(-1, output.shape[-1]), 
+                                                    labels.view(-1), ignore_index=0)
         return {"logits": output, "loss": loss}
 
-    def _init_weights(n, m): # do not initialize weights or biases 
+    def _init_weights(n, m):
         n.counts = {"Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0, "Conv2d": 0, "processor": 0, "attention": 0, "Residual": 0}
         for name, m in n.named_modules():
             if isinstance(m, nn.RMSNorm):
@@ -223,11 +285,11 @@ class Model(nn.Module):
             if count > 0:
                 print(f"{module_type}: {count}")
 
-def prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, streaming=False, load_saved=False, save_dataset=False, cache_dir='./hf', extract_args=None, max_ctx=2048):
+def prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, streaming=False, load_saved=False, save_dataset=False, cache_dir='./cache', extract_args=None, max_ctx=2048):
 
     if load_saved:
         if cache_dir is None:
-            cache_dir = 'E:/cache'
+            cache_dir = './cache'
         else:
             cache_dir = cache_dir
 
@@ -264,21 +326,16 @@ def main():
     extract_args = {
         "waveform": False,
         "spectrogram": True,
-        "pitch_tokens":False,
-        "pitch": True,
+        "pitch": False,
+        "pitch_tokens": False,
         "harmonics": False,
         "aperiodics": False,
-        "sample_rate": 16000,
-        "hop_length": 160,
-        "mode": "mean",
-        "phase_mod": False,
+        "phase": False,
         "hilbert": False,
-        "debug": False,
-        "dummy_audio": False,
-        "dummy_text": False,
     }
 
-    param = Dimensions(tokens=40000, mels=128, ctx=2048, dims=512, head=4, layer=4, act="gelu", norm_type="layernorm")
+    num_features = sum(extract_args.values())
+    param = Dimensions(tokens=40000, mels=128, ctx=2048, dims=512, head=4, layer=4, act="gelu", norm_type="layernorm", num_features=num_features)
 
     train_dataset, test_dataset = prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, streaming=False,
         load_saved=False, save_dataset=False, cache_dir=None, extract_args=extract_args, max_ctx=param.ctx)
