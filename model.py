@@ -198,22 +198,17 @@ class processor(nn.Module):
 
         for i in n.block:
             x = i(x, mask=n.mask[:x.shape[1], :x.shape[1]])
+            x = i(x, xa=i(xa))
+            x = i(x, xa=i(aorb(xb, xa)))
+            x = i(x, xa=i(aorb(xc, xa)))
 
-            audio_inputs = [
-                (xa, xb),  
-                (xb, xa),
-                (xc, xa),
-                (xd, xa),
-                (xe, xa),
-                (xf, xa),
-                (xg, xa),
-            ]
-            
-            for audio_input, fallback in audio_inputs:
-                processed = i(audio_input if audio_input is not None else aorb(fallback, n.dummy))
-                x = i(x, xa=processed)
+            inputs = [(xa, xb),  (xb, xa), (xc, xa)]
 
-            xc = torch.cat([x, xa], dim=1)
+            for a, b in inputs:
+                xa = i(a if a is not None else b)
+                x  = i(x, xa=xa)
+
+            xc = torch.cat([x, sum(f for f in [xa, xb, xc] if f is not None)], dim=1)
             xm = i(x=xc[:, :x.shape[1]], xa=xc[:, x.shape[1]:])
             x = xm if seq else torch.sigmoid(n.blend) * x + (1 - torch.sigmoid(n.blend)) * xm
 
