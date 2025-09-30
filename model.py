@@ -1,4 +1,5 @@
-import os, torch
+import os, math, random, warnings, logging
+import torch
 from datasets import load_dataset, Audio
 from torch.nn.functional import scaled_dot_product_attention
 from torch import nn, Tensor
@@ -28,7 +29,6 @@ class Dimensions:
     layer: int
     act: str
     norm_type: str
-    num_features: int = 0
 
 def sinusoids(ctx, dims, theta=THETA):
     tscales = torch.exp(-torch.log(torch.tensor(float(theta))) / (dims // 2 - 1) * torch.arange(dims // 2, device=device, dtype=torch.float32))
@@ -81,14 +81,13 @@ class rotary(nn.Module):
 
     def radius(n, xa, freqs, mask=None):
         if mask is None:
-            per_step = n._head(xa).squeeze(-1)  
+            per_step = n._head(xa).squeeze(-1)
             radius = torch.clamp(per_step / 100.0, 0.5, 2.0)
             return torch.polar(radius.unsqueeze(-1), freqs.unsqueeze(0))
         else:
             return torch.polar(torch.ones_like(freqs).unsqueeze(0), freqs.unsqueeze(0))
 
     def forward(n, x, xa=None, mask=None):
-
         ctx = x.shape[2]
         t = torch.arange(ctx, device=device, dtype=dtype).float()
         freqs = torch.einsum('i,j->ij', t,  n._compute_freqs(mask))
@@ -136,19 +135,19 @@ class attention(nn.Module):
             return n.out(a)
     
 class gate(nn.Module):
-    def __init__(n, dims, num_features, expand):
+    def __init__(n, dims, num_feature, num):
         super().__init__()
-        num_features = num_features + 2 
-        n.expand = min(expand, max(1, num_features))
-        n.gates = nn.ModuleList([nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()) for _ in range(num_features)])
-        n.features = nn.Sequential(nn.Linear(dims, num_features), nn.Softmax(dim=-1))
-        n.top_features = nn.Linear(dims, num_features)
+        n.num_feature = num_feature
+        n.num = num
+        n.gates = nn.ModuleList([nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()) for _ in range(num_feature)])
+        n.features = nn.Sequential(nn.Linear(dims, num_feature), nn.Softmax(dim=-1))
+        n.top_features = nn.Linear(dims, num_feature)
         n.alpha = nn.Parameter(torch.ones(1), requires_grad=True)
 
     def forward(n, x):
         soft_types = n.features(x)
         types = n.top_features(x)
-        n_types, n_indices = torch.topk(types, n.expand, dim=-1)
+        n_types, n_indices = torch.topk(types, n.num, dim=-1)
         values = F.softmax(n_types, dim=-1)
         s_types = torch.zeros_like(soft_types)
         s_types.scatter_(-1, n_indices, values)
@@ -157,27 +156,25 @@ class gate(nn.Module):
         return torch.sum(gates * features.unsqueeze(2), dim=-1)
 
 class residual(nn.Module):
-    def __init__(n, dims, head, layer, act, norm_type, num_features):
+    def __init__(n, dims, head, layer, act, norm_type, expand=4):
         super().__init__()
 
-        expand = max(1, min(4, num_features)) 
         n.ln = get_norm(norm_type, dims)
         n.act_fn = get_activation(act)
 
         n.attn = attention(dims, head, norm_type)
-        n.gate = gate(dims, num_features, expand) if num_features > 0 else nn.Identity()
+        n.gate = gate(dims, num_feature=4, num=2)
         n.mlp = nn.Sequential(get_norm(norm_type, dims), nn.Linear(dims, dims*expand), get_activation(act), nn.Linear(dims*expand, dims))
 
     def forward(n, x, xa=None, mask=None):
-
         x = x + n.attn(n.ln(x), mask=mask) 
         if xa is not None:
             xa = xa + n.gate(xa)
-            x = x + n.attn(n.ln(x), xa)
+            x = x + n.attn(n.ln(x), xa=xa)
         return x + n.mlp(x)
 
 class processor(nn.Module):
-    def __init__(n, tokens, mels, ctx, dims, head, layer, act, norm_type, num_features): 
+    def __init__(n, tokens, mels, ctx, dims, head, layer, act, norm_type): 
         super().__init__()
 
         n.ln = get_norm(norm_type, dims)
@@ -188,8 +185,7 @@ class processor(nn.Module):
         n.dummy = torch.ones(1, ctx, dims, device=device, dtype=dtype)
 
         n.block: Iterable[residual] = nn.ModuleList(
-            [residual(dims=dims, head=head, layer=layer, act=act, norm_type=norm_type, num_features=num_features) for _ in range(layer)]) 
-        
+            [residual(dims=dims, head=head, layer=layer, act=act, norm_type=norm_type) for _ in range(layer)]) 
         n.register_buffer("mask", torch.empty(ctx, ctx).fill_(-np.inf).triu_(1), persistent=False)
 
     def forward(n, x, xa=None, xb=None, xc=None, xd=None, xe=None, xf=None, xg=None, seq=False) -> Tensor:
@@ -219,7 +215,6 @@ class Model(nn.Module):
         super().__init__()
 
         n.param = param
-
         n.processor = processor(
             tokens=param.tokens,
             mels=param.mels,
@@ -229,7 +224,6 @@ class Model(nn.Module):
             layer=param.layer,
             act=param.act,
             norm_type=param.norm_type,
-            num_features=param.num_features,
             )
 
         n.encoder = AudioEncoder(param.mels, param.dims, param.head, param.act, param.norm_type, norm=False, enc=False)
@@ -280,11 +274,11 @@ class Model(nn.Module):
             if count > 0:
                 print(f"{module_type}: {count}")
 
-def prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, streaming=False, load_saved=False, save_dataset=False, cache_dir='./cache', extract_args=None, max_ctx=2048):
+def prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, streaming=False, load_saved=False, save_dataset=False, cache_dir='E:/hf', extract_args=None, max_ctx=2048):
 
     if load_saved:
         if cache_dir is None:
-            cache_dir = './cache'
+            cache_dir = 'E:/cache'
         else:
             cache_dir = cache_dir
 
@@ -329,8 +323,7 @@ def main():
         "hilbert": False,
     }
 
-    num_features = sum(extract_args.values())
-    param = Dimensions(tokens=40000, mels=128, ctx=2048, dims=512, head=4, layer=4, act="gelu", norm_type="layernorm", num_features=num_features)
+    param = Dimensions(tokens=40000, mels=128, ctx=2048, dims=512, head=4, layer=4, act="gelu", norm_type="layernorm")
 
     train_dataset, test_dataset = prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, streaming=False,
         load_saved=False, save_dataset=False, cache_dir=None, extract_args=extract_args, max_ctx=param.ctx)
