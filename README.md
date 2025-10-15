@@ -1,3 +1,18 @@
+        This model optionally uses any mix of these:
+            
+            extract_args = {
+        
+                "spectrogram": False,
+                "pitch": False,
+                "waveform": False,
+                "harmonics": False,
+                "aperiodics": False,
+                "phase": False,
+                "hilbert": False,
+                "pitch_tokens": True,
+        
+            }
+
 ``` python
 
 
