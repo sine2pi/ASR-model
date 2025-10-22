@@ -1,20 +1,4 @@
-        This model optionally uses any mix of these:
-            
-            extract_args = {
-        
-                "spectrogram": False,
-                "pitch": False,
-                "waveform": False,
-                "harmonics": False,
-                "aperiodics": False,
-                "phase": False,
-                "hilbert": False,
-                "pitch_tokens": True,
-        
-            }
 
-        injection of continuous audio features like f0 inside the rotary increase long range blahbiddy blah blah. 
-        ..It's recurrent-like but without the baggage.
 
 ``` python
 
