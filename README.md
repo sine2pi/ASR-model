@@ -196,7 +196,7 @@ class attention(nn.Module):
 
         k, v = n.kv(x if xa is None else xa)
         q = n.q(x)
-        q, k = n.rot(q, xa=None, mask=mask), n.rot(k, xa=None, mask=mask)  
+        q, k = n.rot(q, xa=pt, mask=mask), n.rot(k, xa=pt[xa], mask=mask)  
 
         if skip and not have(p): a = scaled_dot_product_attention(n.ln(q), n.ln(k[:, :, ::max(1, 6 - n.layer), :]), v[:, :, ::max(1, 6 - n.layer), :], is_causal=mask is not None)
             
