@@ -13,7 +13,8 @@
         
             }
 
-        Recurrent-like injection of inherently continuous audio frequencies inside the rotary increase long range blahbiddy blah blah.
+        injection of continuous audio features like f0 inside the rotary increase long range blahbiddy blah blah. 
+        ..It's recurrent-like but without the baggage.
 
 ``` python
 
