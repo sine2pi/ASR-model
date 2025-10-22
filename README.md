@@ -1,4 +1,22 @@
-        
+
+    This model uses a mix of these.
+    
+    extract_args = {
+
+        "spectrogram": True,
+        "pitch": True,
+        "waveform": False,
+        "harmonics": False,
+        "aperiodics": False,
+        "phase": False,
+        "hilbert": False,
+        "pitch_tokens": True,
+
+    }
+
+        f0 injection at the embedding level gives the model recurrent-like qualities without the baggage.
+
+```python        
         
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         dtype = torch.float32
