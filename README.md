@@ -3,4 +3,5 @@
         Not everything in the script is fully integrated yet.
         
         How to use:
+        This script uses a hugging face hosted dataset so you might need your token or just use a different dataset.
         python model.py
