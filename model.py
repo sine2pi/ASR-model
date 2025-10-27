@@ -1,5 +1,5 @@
 import os, random, warnings, logging, time
-import torch, numpy as np
+import torch, torchaudio, numpy as np
 from datasets import load_dataset, Audio
 from torch.nn.functional import scaled_dot_product_attention
 from torch import nn, Tensor
