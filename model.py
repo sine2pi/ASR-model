@@ -17,7 +17,18 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 torch.set_default_dtype(dtype)
 
+torch.manual_seed(10)
+random.seed(10)
+np.random.seed(10)
+
+torch.backends.cudnn.conv.fp32_precision = 'tf32'
+
+warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.ERROR)
+
 PATH = 'H:/cache'
+os.environ['HF_HOME'] = PATH
+os.environ['HF_DATASETS_CACHE'] = PATH
 THETA = 30000.0
 
 @dataclass
@@ -51,93 +62,8 @@ def no_none(xa):
 def shift_right(x):
     return torch.cat([torch.zeros_like(x[:, :1]), x], dim=1)
 
-def load_wave(audio, sample_rate=16000):
-    if isinstance(audio, str):
-        waveform, sample_rate = torchaudio.load(uri=audio, normalize=True, backend="ffmpeg")
-    elif isinstance(audio, dict):
-        waveform = torch.tensor(data=audio["array"]).float()
-        sample_rate = audio["sampling_rate"]
-    else:
-        raise TypeError("Invalid wave_data format.")
-    return waveform, sample_rate
-
 def safe_div(n, d, eps = 1e-6):
     return n.div_(d + eps)
-
-def pitch_tokens(audio: torch.Tensor, sample_rate: int, labels: list, hop_length: int, mode: str = "mean"):
-    
-    wavnp = audio.numpy().astype(np.float64)
-    f0_np, t = pw.dio(wavnp, sample_rate, frame_period=hop_length / sample_rate * 1000)
-    f0_np = pw.stonemask(wavnp, f0_np, t, sample_rate)
-
-    audio_duration = len(audio) / sample_rate
-    T = len(labels)
-    tok_dur_sec = audio_duration / T
-    token_starts = torch.arange(T) * tok_dur_sec
-    token_ends = token_starts + tok_dur_sec
-    
-    f0_tensor = torch.from_numpy(f0_np)
-    t_tensor = torch.from_numpy(t)
-
-    mel_f0 = torch.zeros_like(f0_tensor)
-    positive_f0_mask = f0_tensor > 0
-    mel_f0[positive_f0_mask] = 2595. * torch.log10(1 + f0_tensor[positive_f0_mask] / 700.0)
-
-    start_idx = torch.searchsorted(t_tensor, token_starts, side="left")
-    end_idx = torch.searchsorted(t_tensor, token_ends, side="right")
-    pitch_tok = torch.zeros(T, dtype=torch.float32)
-
-    for q in range(T):
-        lo, hi = start_idx[q], max(start_idx[q] + 1, end_idx[q])
-        segment = mel_f0[lo:hi]
-        
-        voiced_segment = segment[segment > 0]
-        
-        if len(voiced_segment) > 0:
-            if mode == "mean":
-                pitch_tok[q] = voiced_segment.mean()
-            elif mode == "median":
-                pitch_tok[q] = torch.median(voiced_segment)
-            else:
-                pitch_tok[q] = voiced_segment[-1]
-
-    mean_pitch = pitch_tok[pitch_tok > 0].mean() if (pitch_tok > 0).any() else 0.0
-    std_pitch = pitch_tok[pitch_tok > 0].std() if (pitch_tok > 0).any() else 1.0
-    pt_tensor = (pitch_tok - mean_pitch) / (std_pitch + 1e-6)
-
-    if pt_tensor.numel() > 0:
-        bos_pitch = pt_tensor.item() if pt_tensor.numel() > 0 else 0.0
-    else:
-        bos_pitch = 0.0
-
-    bos_tensor = torch.tensor([bos_pitch], dtype=pt_tensor.dtype)
-    pt_tensor = torch.cat([bos_tensor, pt_tensor])
-    return pt_tensor
-
-def mel_spectrogram(audio, hop_length, n_fft):
-
-    spectrogram_config = {
-        "hop_length": hop_length,
-        "f_min": 50,
-        "f_max": 1000,
-        "n_mels": 128,
-        "n_fft": n_fft,
-        "sample_rate": 16000,
-        "pad_mode": "constant",
-        "center": True, 
-        "power": 1.0,
-        "window_fn": torch.hann_window,
-        "mel_scale": "htk",
-        "norm": None,
-        "normalized": False,
-    }
-
-    transform = torchaudio.transforms.MelSpectrogram(**spectrogram_config)
-    mel_spectrogram = transform(audio)
-    log_mel = torch.clamp(mel_spectrogram, min=1e-10).log10()
-    log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
-    s_tensor = (log_mel + 4.0) / 4.0
-    return s_tensor
 
 def sinusoids(ctx, dims, theta=THETA):
     tscales = torch.exp(-torch.log(torch.tensor(float(theta))) / (dims // 2 - 1) * torch.arange(dims // 2, device=device, dtype=torch.float32))
@@ -510,14 +436,12 @@ class Model(nn.Module):
         for module_type, count in n.counts.items():
             if count > 0:
                 print(f"{module_type}: {count}")
-
-
-
+    
 ########## pipeline functions ##########
 
 def prepare_datasets(tokenizer, sample_rate, streaming, load_saved, save_dataset, cache_dir, extract_args, max_ctx, fleurs):
     from datasets import load_dataset, Audio
-    token = ""
+    token = "" # hugging face datasets
 
     if load_saved:
         if cache_dir is None:
@@ -731,9 +655,11 @@ def get_activation(act: str) -> nn.Module:
 
 def extract_features(batch, tokenizer, spectrogram=False, pitch=False, waveform=False, pitch_tokens=False, hop_length=160, sample_rate=16000, n_fft=1024):
     import pyworld as pw
+
     mode = "mean"
     dummy_audio = False
     dummy_text = False
+    audio = batch["audio"]
 
     if dummy_text:
         labels = [1] * 32
@@ -741,13 +667,64 @@ def extract_features(batch, tokenizer, spectrogram=False, pitch=False, waveform=
         labels = tokenizer.encode(batch["transcription" if "transcription" in batch else "sentence"])
 
     if dummy_audio:
-        dummy, sample_rate = load_wave(batch["audio"], sample_rate)
+        if isinstance(audio, str):
+            dummy, sample_rate = torchaudio.load(uri=audio, normalize=True, backend="ffmpeg")
+        elif isinstance(audio, dict):
+            dummy = torch.tensor(data=audio["array"]).float()
         audio = torch.zeros_like(dummy)
     else:
-        audio, sample_rate = load_wave(batch["audio"], sample_rate)
+        if isinstance(audio, str):
+            audio, sample_rate = torchaudio.load(uri=audio, normalize=True, backend="ffmpeg")
+        elif isinstance(audio, dict):
+            audio = torch.tensor(data=audio["array"]).float()
 
     if pitch_tokens:
-        pt_tensor = pitch_tokens(audio, sample_rate, labels, hop_length, mode=mode)
+        wavnp = audio.numpy().astype(np.float64)
+        f0_np, t = pw.dio(wavnp, sample_rate, frame_period=hop_length / sample_rate * 1000)
+        f0_np = pw.stonemask(wavnp, f0_np, t, sample_rate)
+
+        audio_duration = len(audio) / sample_rate
+        T = len(labels)
+        tok_dur_sec = audio_duration / T
+        token_starts = torch.arange(T) * tok_dur_sec
+        token_ends = token_starts + tok_dur_sec
+        
+        f0_tensor = torch.from_numpy(f0_np)
+        t_tensor = torch.from_numpy(t)
+
+        mel_f0 = torch.zeros_like(f0_tensor)
+        positive_f0_mask = f0_tensor > 0
+        mel_f0[positive_f0_mask] = 2595. * torch.log10(1 + f0_tensor[positive_f0_mask] / 700.0)
+
+        start_idx = torch.searchsorted(t_tensor, token_starts, side="left")
+        end_idx = torch.searchsorted(t_tensor, token_ends, side="right")
+        pitch_tok = torch.zeros(T, dtype=torch.float32)
+
+        for q in range(T):
+            lo, hi = start_idx[q], max(start_idx[q] + 1, end_idx[q])
+            segment = mel_f0[lo:hi]
+            
+            voiced_segment = segment[segment > 0]
+            
+            if len(voiced_segment) > 0:
+                if mode == "mean":
+                    pitch_tok[q] = voiced_segment.mean()
+                elif mode == "median":
+                    pitch_tok[q] = torch.median(voiced_segment)
+                else:
+                    pitch_tok[q] = voiced_segment[-1]
+
+        mean_pitch = pitch_tok[pitch_tok > 0].mean() if (pitch_tok > 0).any() else 0.0
+        std_pitch = pitch_tok[pitch_tok > 0].std() if (pitch_tok > 0).any() else 1.0
+        pt_tensor = (pitch_tok - mean_pitch) / (std_pitch + 1e-6)
+
+        if pt_tensor.numel() > 0:
+            bos_pitch = pt_tensor.item() if pt_tensor.numel() > 0 else 0.0
+        else:
+            bos_pitch = 0.0
+
+        bos_tensor = torch.tensor([bos_pitch], dtype=pt_tensor.dtype)
+        pt_tensor = torch.cat([bos_tensor, pt_tensor])
 
     if pitch:
         f0, t = pw.dio(audio.numpy().astype(np.float64), sample_rate, frame_period=hop_length / sample_rate * 1000)
@@ -755,7 +732,27 @@ def extract_features(batch, tokenizer, spectrogram=False, pitch=False, waveform=
         p_tensor = torch.from_numpy(f0)
 
     if spectrogram:
-        s_tensor = mel_spectrogram(audio.float(), hop_length=hop_length, n_fft=n_fft)
+        spectrogram_config = {
+            "hop_length": hop_length,
+            "f_min": 50,
+            "f_max": 1000,
+            "n_mels": 128,
+            "n_fft": n_fft,
+            "sample_rate": 16000,
+            "pad_mode": "constant",
+            "center": True, 
+            "power": 1.0,
+            "window_fn": torch.hann_window,
+            "mel_scale": "htk",
+            "norm": None,
+            "normalized": False,
+        }
+
+        transform = torchaudio.transforms.MelSpectrogram(**spectrogram_config)
+        mel_spectrogram = transform(audio)
+        log_mel = torch.clamp(mel_spectrogram, min=1e-10).log10()
+        log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
+        s_tensor = (log_mel + 4.0) / 4.0
 
     if waveform:
         current = audio.shape[-1]  
