@@ -441,7 +441,7 @@ class Model(nn.Module):
 
 def prepare_datasets(tokenizer, sample_rate, streaming, load_saved, save_dataset, cache_dir, extract_args, max_ctx, fleurs):
     from datasets import load_dataset, Audio
-    token = "" # hugging face datasets
+    token = ""
 
     if load_saved:
         if cache_dir is None:
@@ -812,7 +812,7 @@ class DataCollator:
                 batch["text_ids"] = torch.tensor(all_ids, dtype=torch.long)
                 batch["labels"] = torch.tensor(all_labels, dtype=torch.long)
 
-            elif key in ["spectrogram", "waveform", "pitch", "pitch_tokens"]:
+            elif key in ["spectrogram", "waveform", "pitch"]:
                 items = [f[key] for f in features if key in f]
                 items = [item for item in items if item is not None]
                 if not items:  
@@ -889,11 +889,11 @@ def train_and_evaluate(
 
         start_time = time.time()
 
-        features = TensorDict({k: v.to(device) for k, v in batch.items() if k in ["spectrogram","waveform","pitch", "pitch_tokens"] and v is not None}, batch_size=batch["text_ids"].shape[0]).to(device)
+        features = TensorDict({k: v.to(device) for k, v in batch.items() if k in ["spectrogram","waveform","pitch"] and v is not None}, batch_size=batch["text_ids"].shape[0]).to(device)
         text_ids = batch["text_ids"].to(device)
         labels = batch["labels"].long().to(device)
 
-        output = model(text_ids=text_ids, labels=labels, spectrogram=features.get("spectrogram"), pitch=features.get("pitch"), waveform=features.get("waveform"), pitch_tokens=features.get("pitch_tokens"))
+        output = model(text_ids=text_ids, labels=labels, spectrogram=features.get("spectrogram"), pitch=features.get("pitch"), waveform=features.get("waveform"))
         loss = output["loss"]
 
         total_loss += loss.item()
@@ -976,14 +976,14 @@ def train_and_evaluate(
             
             with torch.no_grad():
                 for eval_batch in eval_loader:
-                    features = TensorDict({k: v.to(device) for k, v in eval_batch.items() if k in ["spectrogram","waveform","pitch", "pitch_tokens"] and v is not None}, batch_size=eval_batch["text_ids"].shape[0]).to(device)
+                    features = TensorDict({k: v.to(device) for k, v in eval_batch.items() if k in ["spectrogram","waveform","pitch"] and v is not None}, batch_size=eval_batch["text_ids"].shape[0]).to(device)
                     text_ids = eval_batch["text_ids"].to(device)
                     labels = eval_batch["labels"].long().to(device)
 
                     batch_size = text_ids.size(0)
                     total += batch_size
 
-                    output = model(text_ids=text_ids, labels=labels, spectrogram=features.get("spectrogram"), pitch=features.get("pitch"), waveform=features.get("waveform"), pitch_tokens=features.get("pitch_tokens"))
+                    output = model(text_ids=text_ids, labels=labels, spectrogram=features.get("spectrogram"), pitch=features.get("pitch"), waveform=features.get("waveform"))
                     loss = output["loss"]
                     eval_loss += loss.item()
                     all_p.extend(
@@ -1065,7 +1065,7 @@ def main():
     
     extract_args = {
 
-        "spectrogram": False,
+        "spectrogram": True,
         "pitch": True,
         "waveform": False,
         "pitch_tokens": False,
