@@ -1,6 +1,5 @@
-import os, random, warnings, logging, time
+import os, random, warnings, logging, time, math
 import torch, torchaudio, numpy as np
-from datasets import load_dataset, Audio
 from torch.nn.functional import scaled_dot_product_attention
 from torch import nn, Tensor
 from typing import Iterable, Optional, Any, List, Dict
@@ -12,23 +11,12 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from einops.layers.torch import Rearrange
+from optimizer import MaxFactor as MF, MaxFactor2 as MF2
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 torch.set_default_dtype(dtype)
 
-torch.manual_seed(10)
-random.seed(10)
-np.random.seed(10)
-
-torch.backends.cudnn.conv.fp32_precision = 'tf32'
-
-warnings.filterwarnings("ignore")
-logging.basicConfig(level=logging.ERROR)
-
-PATH = 'H:/cache'
-os.environ['HF_HOME'] = PATH
-os.environ['HF_DATASETS_CACHE'] = PATH
 THETA = 30000.0
 
 @dataclass
@@ -66,9 +54,9 @@ def safe_div(n, d, eps = 1e-6):
     return n.div_(d + eps)
 
 def sinusoids(ctx, dims, theta=THETA):
-    tscales = torch.exp(-torch.log(torch.tensor(float(theta))) / (dims // 2 - 1) * torch.arange(dims // 2, device=device, dtype=torch.float32))
+    tscales = torch.exp(-torch.log(torch.tensor(float(theta), requires_grad=False)) / (dims // 2 - 1) * torch.arange(dims // 2, device=device, dtype=torch.float32, requires_grad=False))
     scaled = torch.arange(ctx, device=device, dtype=torch.float32).unsqueeze(1) * tscales.unsqueeze(0)
-    positional_embedding = nn.Parameter(torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=1) , requires_grad=True)
+    positional_embedding = nn.Parameter(torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=1), requires_grad=False)
     return positional_embedding    
 
 class AudioEncoder(nn.Module):
@@ -113,24 +101,24 @@ class rotary(nn.Module):
         super().__init__()
 
         n.head_dim = dims // head
-        n._head = nn.Linear(dims, 1) 
+        # n._head = nn.Linear(dims, 1) 
     
     def _compute_freqs(n, x=None, mask=None):
         if mask is None:
-            scale = torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 4000/200)), n.head_dim // 2, device=device, dtype=dtype) / 2595) - 1
+            scale = torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 4000/200)), n.head_dim // 2, device=device, dtype=dtype, requires_grad=False) / 2595) - 1
             return x.mean(dim=-1) * scale / 1000 if x is not None else 200 * scale / 1000
         else: 
 
-            return torch.arange(0, n.head_dim, 2, device=device, dtype=dtype) / n.head_dim * torch.log(torch.tensor(x.mean(dim=-1) * THETA if x is not None else THETA))
+            return torch.arange(0, n.head_dim, 2, device=device, dtype=dtype, requires_grad=False) / n.head_dim * torch.log(torch.tensor(x.mean(dim=-1) * THETA if x is not None else THETA, requires_grad=False))
 
     def forward(n, x=None, xa=None, mask=None): 
-        t = torch.arange(x.shape[2], device=device, dtype=dtype).float()
+        t = torch.arange(x.shape[2], device=device, dtype=dtype, requires_grad=False).float()
         freqs = torch.einsum('i,j->ij', t,  n._compute_freqs(mask=mask))
         
         if xa is not None:
             freqs = torch.polar(xa.mean(dim=-1).unsqueeze(-1), freqs)
         else:   
-            freqs = torch.polar(torch.ones_like(freqs), freqs)
+            freqs = torch.polar(torch.ones_like(freqs, requires_grad=False), freqs)
 
         x1 = x[..., :freqs.shape[-1]*2]
         x2 = x[..., freqs.shape[-1]*2:]
@@ -271,9 +259,9 @@ class attentionb(nn.Module):
         scale = d ** -0.5
 
         if pt is not None: c = n.c(pt)
-        else: c = torch.zeros_like(x)
+        else: c = torch.zeros_like(x, requires_grad=False)
 
-        triplet_scores = torch.zeros(b, h, seq_len, seq_len, device=device)
+        triplet_scores = torch.zeros(b, h, seq_len, seq_len, device=device, requires_grad=False)
 
         for i in range(seq_len):
             for j in range(seq_len):
@@ -323,10 +311,10 @@ class residual(nn.Module):
         n.mlp = nn.Sequential(n.ln, nn.Linear(dims, dims*n.expand), get_activation(act), nn.Linear(dims*n.expand, dims))
 
     def forward(n, x, xa=None, mask=None, pt=None, skip=False, pattern=None):
-        x = x + n.attn(n.ln(x), mask=mask, pt=pt, skip=skip, pattern=pattern)[0]
+        x = x + n.attn(n.ln(x), mask=mask, pt=pt, skip=skip, pattern=pattern)
         if xa is not None: 
             xa = xa + n.gate(xa, n.expand // 2)
-            x = x + n.attn(n.ln(x), xa=xa, pt=pt, skip=skip, pattern=pattern)[0]
+            x = x + n.attn(n.ln(x), xa=xa, pt=pt, skip=skip, pattern=pattern)
         return x + n.mlp(x)
 
 class attn_pass(nn.Module):
@@ -924,10 +912,10 @@ def train_and_evaluate(
                 for module in oneshot_modules:
                     if recent_avg > prev_avg * 1.2:
                         module.scale *= 0.9
-                        logging.info(f"Reducing OneShot scale to {module.scale:.4f} (grad norm: {total_norm:.2f})")
                     elif recent_avg < prev_avg * 0.8:
                         module.scale *= 1.1
-                        logging.info(f"Increasing OneShot scale to {module.scale:.4f} (grad norm: {total_norm:.2f})")
+                for module in oneshot_modules:
+                    module.scale = float(max(0.05, min(2.0, module.scale)))
                 
                 if len(grad_history) > 100:
                     grad_history = grad_history[-100:]
@@ -937,7 +925,7 @@ def train_and_evaluate(
                 if oneshot_modules:
                     writer.add_scalar("OneShot/scale", oneshot_modules[0].scale, global_step)
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.9)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -1065,7 +1053,7 @@ def main():
     
     extract_args = {
 
-        "spectrogram": True,
+        "spectrogram": False,
         "pitch": True,
         "waveform": False,
         "pitch_tokens": False,
@@ -1094,8 +1082,7 @@ def main():
         dataset=test_dataset, batch_size=1, collate_fn=Collator, num_workers=0
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.00025, eps=1e-9, weight_decay=0.025, betas=(0.9, 0.999), amsgrad=False, foreach=False, fused=False, capturable=False, differentiable=False, maximize=False)
-
+    optimizer = MF(model.parameters(), lr=0.025, beta2_decay=-0.8, eps=(1e-10, 1e-3), d=1.0, weight_decay=0.01, gamma=0.99, max=False)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000, eta_min=1e-9, last_epoch=-1)
 
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=0)
