@@ -3,7 +3,7 @@
         f0 injection at the embedding level gives the model recurrent-like qualities without the baggage. Uses log mels, pitch, waveform (and others, 
         pitch-tokens, hilberts and harmonics), This specific version uses log-mels, pitch, waveform, and pitch-tokens but you can togle them on and off for          experimenting. Some other tricks.
         
-        Not everything in the script is fully integrated yet. 
+        Not everything in the script is fully integrated yet. I'm still trying to think through best how to inject characteristics that are unique to each           sound into the rotary without breaking things too badly. Might go okdshool and use some kind of genralized frequency phenom map as radius since its          consitent enough while still being able to apply it from f0 of the samples. Mix that with some set theta decay. The idea is to change the pairwise           rotations with just enough real data to make it meaningful but not enough to break its functioning. 
         
         How to use:
         install any imports in the imports section you dont have.
