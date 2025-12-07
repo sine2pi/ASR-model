@@ -306,3 +306,89 @@ class Model(nn.Module):
         for module_type, count in n.counts.items():
             if count > 0:
                 print(f"{module_type}: {count}")
+    
+def main():
+
+    metadata_file = "./cv17_1000/metadata.csv"
+    data_dir = "./cv17_1000"
+
+    log_dir = os.path.join('./logs/', datetime.now().strftime('%m-%d_%H_%M_%S'))
+    os.makedirs(log_dir, exist_ok=True)
+
+    tokenizer = setup_tokenizer("./tokenizer.json") 
+    
+    extract_args = {
+
+        "spectrogram": False,
+        "pitch": True,
+        "waveform": False,
+        "pitch_tokens": False,
+        "hop_length": 160,
+        "sample_rate": 16000,
+        "mels": 128
+    }
+
+    param = Dimensions(tokens=40000, mels=128, dims=512, head=4, layer=4, act="gelu", n_type="layernorm")
+
+    dataset = prepare_datasets(metadata_file, data_dir, tokenizer, extract_args=extract_args)
+    train_size = int(0.8 * len(dataset))
+    test_size = len(dataset) - train_size
+    train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
+    
+    model = Model(param).to('cuda')
+
+    metrics_fn = partial(compute_metrics, print_pred=True, num_samples=1, tokenizer=tokenizer, model=model)
+    Collator = DataCollator(tokenizer=tokenizer)
+
+    train_dataloader = DataLoader(
+        dataset=train_dataset, 
+        batch_size=1, 
+        collate_fn=Collator, 
+        num_workers=0,
+        # worker_init_fn=seed_worker,
+        # generator=g,
+        # shuffle=True
+    )
+
+    eval_dataloader = DataLoader(
+        dataset=test_dataset, 
+        batch_size=1, 
+        collate_fn=Collator, 
+        num_workers=0,
+        # worker_init_fn=seed_worker,
+        # generator=g
+    )
+
+    optimizer = MF(model.parameters(), lr=0.025, beta_decay=-0.8, eps=(1e-10, 1e-3), d=1.0, w_decay=0.01, gamma=0.99, max=False)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000, eta_min=1e-9, last_epoch=-1)
+
+    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=0)
+
+    train_and_evaluate(
+        model=model,
+        tokenizer=tokenizer,
+        train_loader=train_dataloader,
+        eval_loader=eval_dataloader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        loss_fn=loss_fn,
+        metric_fn=metrics_fn,
+        max_steps=1000,
+        device="cuda",
+        acc_steps=1,
+        clear_cache=False,
+        log_interval=10,
+        eval_interval=100,
+        save_interval=1000,
+        checkpoint_dir=log_dir,
+        log_dir=log_dir,
+    )
+
+    print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Test dataset size: {len(test_dataset)}")
+    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+if __name__ == "__main__":
+    main()
+
