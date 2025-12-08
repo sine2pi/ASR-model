@@ -85,9 +85,8 @@ class attention(nn.Module):
         q = n.q(x)
         q, k = n.rot(q, xa=x, mask=mask), n.rot(k, xa=x if xa is None else xa, mask=mask)  
 
-        if isinstance(skip, int) and not have(p):
-            stride = max(1, n.layer - skip)
-            a = SDPA(n.ln(q), n.ln(k[:, :, ::stride, :]), v[:, :, ::stride, :], is_causal=have(mask))
+        if skip and not have(p): 
+            a = SDPA(n.ln(q), n.ln(k[:, :, ::max(1, 6 - n.layer), :]), v[:, :, ::max(1, 6 - n.layer), :], is_causal=have(mask))
             
         elif have(p) and p > 1: 
             k, v = k[:, :, ::p, :], v[:, :, ::p, :]
@@ -104,10 +103,9 @@ class attention(nn.Module):
             if have(p) and p > 1:
                 k, ka, kb = k[:, :, ::p, :], k[:, :, 1::p, :], k[:, :, 2::p, :]
                 v, va, vb = v[:, :, ::p, :], v[:, :, 1::p, :], v[:, :, 2::p, :]
-            elif isinstance(skip, int):
-                stride = max(1, n.layer - skip)
-                ka, va = ka[:, :, ::stride, :], va[:, :, ::stride, :]
-                kb, vb = kb[:, :, ::stride, :], vb[:, :, ::stride, :]
+            elif skip:
+                ka, va = ka[:, :, ::max(1, 6 - n.layer), :], va[:, :, ::max(1, 6 - n.layer), :]
+                kb, vb = kb[:, :, ::max(1, 6 - n.layer), :], vb[:, :, ::max(1, 6 - n.layer), :]
             else:
                 ka, va = ka, va
                 kb, vb = kb, vb
@@ -188,13 +186,13 @@ class residual(nn.Module):
         n.ga = nn.ModuleList([nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()) for _ in range(num_types)])
         n.cs = nn.Sequential(nn.Linear(dims, num_types), nn.Softmax(dim=-1))        
 
-    def forward(n, x, xa=None, mask=None, pt=None, **kwargs):
-        x = x + n.attn(n.ln(x), mask=mask, pt=pt, **kwargs)
+    def forward(n, x, xa=None, mask=None, pt=None):
+        x = x + n.attn(n.ln(x), mask=mask, pt=pt)
         if xa is not None: 
             xa = xa + n.audio(xa.shape[1], xa.shape[-1]).to(device, dtype)
-            xa = xa + n.gate(xa, n.expand // 2) 
+            # xa = xa + n.gate(xa, n.expand // 2) 
             xa = xa + torch.sum(torch.stack([g(xa) for g in n.ga], dim=-1) * n.cs(xa).unsqueeze(2), dim=-1)
-            x = x + n.attn(n.ln(x), xa=xa, pt=pt, **kwargs)
+            x = x + n.attn(n.ln(x), xa=xa, pt=pt)
         return x + n.mlp(x)
 
 class attn_pass(nn.Module):
@@ -202,7 +200,7 @@ class attn_pass(nn.Module):
         super().__init__()
         
         n.layers = nn.ModuleList()
-        for i in range(layer): n.layers.append(residual(dims, head, layer, act, n_type))
+        for i in range(layer): n.layers.append(residual(dims, head, layer, act, n_type, skip=skip and i in skip, pattern=pattern[i] if pattern else None))
 
     def forward(n, x, override=None):
         for i, layer in enumerate(n.layers): x = layer(x, skip=i, pattern=override[i] if override else None)
@@ -345,9 +343,6 @@ def main():
         batch_size=1, 
         collate_fn=Collator, 
         num_workers=0,
-        # worker_init_fn=seed_worker,
-        # generator=g,
-        # shuffle=True
     )
 
     eval_dataloader = DataLoader(
@@ -355,8 +350,6 @@ def main():
         batch_size=1, 
         collate_fn=Collator, 
         num_workers=0,
-        # worker_init_fn=seed_worker,
-        # generator=g
     )
 
     optimizer = MF(model.parameters(), lr=0.025, beta_decay=-0.8, eps=(1e-10, 1e-3), d=1.0, w_decay=0.01, gamma=0.99, max=False)
