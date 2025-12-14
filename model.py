@@ -186,42 +186,42 @@ class attention(nn.Module):
         else:
             return n.out(a)
 
-class attentionb(nn.Module):
-    def __init__(n, dims: int, head: int, layer: int, n_type):
-        super().__init__()
+# class attentionb(nn.Module):
+#     def __init__(n, dims: int, head: int, layer: int, n_type):
+#         super().__init__()
 
-        n.q   = nn.Sequential(get_norm(n_type, dims) , nn.Linear(dims, dims), Rearrange('b c (h d) -> b h c d', h = head))
-        n.c   = nn.Sequential(get_norm(n_type, dims) , nn.Linear(dims, dims), Rearrange('b c (h d) -> b h c d', h = head))
-        n.kv  = nn.Sequential(get_norm(n_type, dims), nn.Linear(dims, dims * 2), Rearrange('b c (kv h d) -> kv b h c d', kv = 2, h = head))
-        n.out = nn.Sequential(Rearrange('b h n d -> b n (h d)'), nn.Linear(dims, dims), nn.Dropout(0.01))
+#         n.q   = nn.Sequential(get_norm(n_type, dims) , nn.Linear(dims, dims), Rearrange('b c (h d) -> b h c d', h = head))
+#         n.c   = nn.Sequential(get_norm(n_type, dims) , nn.Linear(dims, dims), Rearrange('b c (h d) -> b h c d', h = head))
+#         n.kv  = nn.Sequential(get_norm(n_type, dims), nn.Linear(dims, dims * 2), Rearrange('b c (kv h d) -> kv b h c d', kv = 2, h = head))
+#         n.out = nn.Sequential(Rearrange('b h n d -> b n (h d)'), nn.Linear(dims, dims), nn.Dropout(0.01))
         
-        n.ln = get_norm(n_type, dims // head)
+#         n.ln = get_norm(n_type, dims // head)
         
-    def forward(n, x, xa=None, mask=None, pt=None, context_window=3):
-        q = n.q(x)
-        k, v = n.kv(aorb(xa, x))
-        b, h, c, d = q.shape 
-        scale = d ** -0.5
+#     def forward(n, x, xa=None, mask=None, pt=None, context_window=3):
+#         q = n.q(x)
+#         k, v = n.kv(aorb(xa, x))
+#         b, h, c, d = q.shape 
+#         scale = d ** -0.5
 
-        if pt is not None: c = n.c(pt)
-        else: c = torch.zeros_like(x, requires_grad=False)
+#         if pt is not None: c = n.c(pt)
+#         else: c = torch.zeros_like(x, requires_grad=False)
 
-        triplet_scores = torch.zeros(b, h, c, c, device=device, requires_grad=False)
+#         triplet_scores = torch.zeros(b, h, c, c, device=device, requires_grad=False)
 
-        for i in range(c):
-            for j in range(c):
-                context_start = max(0, min(i, j) - context_window)
-                context_end = min(c, max(i, j) + context_window)
+#         for i in range(c):
+#             for j in range(c):
+#                 context_start = max(0, min(i, j) - context_window)
+#                 context_end = min(c, max(i, j) + context_window)
                 
-                for k in range(context_start, context_end): 
-                    score = (q[:, :, i, :] * k[:, :, j, :] * c[:, :, k, :]).sum(dim=-1)
-                    triplet_scores[:, :, i, j] += score
+#                 for k in range(context_start, context_end): 
+#                     score = (q[:, :, i, :] * k[:, :, j, :] * c[:, :, k, :]).sum(dim=-1)
+#                     triplet_scores[:, :, i, j] += score
 
-        qk = einsum('b h k d, b h q d -> b h k q', q, k) * scale + triplet_scores
-        if have(mask): qk = qk + mask[:c, :c]
-        qk = torch.nn.functional.softmax(qk, dim=-1)
-        wv = einsum('b h k q, b h q d -> b h k d', qk, v) 
-        return n.out(wv)
+#         qk = einsum('b h k d, b h q d -> b h k q', q, k) * scale + triplet_scores
+#         if have(mask): qk = qk + mask[:c, :c]
+#         qk = torch.nn.functional.softmax(qk, dim=-1)
+#         wv = einsum('b h k q, b h q d -> b h k d', qk, v) 
+#         return n.out(wv)
 
 # class tgate(nn.Module):
 #     def __init__(n, dims, num_types=2):
