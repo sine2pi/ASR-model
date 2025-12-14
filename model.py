@@ -27,6 +27,40 @@ class Dimensions:
     act: str
     n_type: str
 
+class AudioEncoder(nn.Module):
+    def __init__(n, mels, dims, head, act, n_type, norm=False, enc=False):
+        super().__init__()
+        
+        act_fn = get_activation(act)
+        n.conv1 = nn.Conv1d(mels, dims, kernel_size=3, stride=1, padding=1)
+        n.conv2 = nn.Conv1d(1, dims, kernel_size=3, stride=1, padding=1)
+        
+        n.encoder = nn.Sequential(
+            act_fn, nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1),
+            act_fn, nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
+
+        n.audio = lambda length, dims: sinusoids(length, dims, THETA)
+        n.EncoderLayer = nn.TransformerEncoderLayer(d_model=dims, nhead=head, batch_first=True) if enc else nn.Identity()
+        n.ln = get_norm(n_type, dims) if norm else nn.Identity()
+
+    def _process_feature(n, x):
+        if x.dim() == 2:
+            x = x.unsqueeze(0)   
+        if x.shape[1] > 1:      
+            x = n.conv1(x)
+        else:
+            x = n.conv2(x)
+        x = n.encoder(x).permute(0, 2, 1).contiguous().to(device, dtype)
+        x = x + n.audio(x.shape[1], x.shape[-1]).to(device, dtype)
+        x = n.ln(x)
+        return n.EncoderLayer(x)
+               
+    def forward(n, x):
+        if isinstance(x, TensorDict):
+            return x.apply(n._process_feature)
+        else:
+            return n._process_feature(x)
+
 class rotary(nn.Module):
     def __init__(n, dims, head):
         super().__init__()
@@ -36,9 +70,23 @@ class rotary(nn.Module):
         n.dims = dims
         n.lin = nn.Linear(dims, n.head_dim // 2, bias=True)
 
+    def gammatone(n, min_freq=200.0, max_freq=8000.0):
+        head_dim = n.dims // n.head
+        freqs = torch.pow(max_freq / min_freq, torch.linspace(0, 1, head_dim // 2, device=device, dtype=dtype)) * min_freq
+        return freqs / 1000
+
+    def wideband(n, max_freq=8000.0):
+        head_dim = n.dims // n.head
+        mel_max = 2595 * torch.log10(torch.tensor(1 + max_freq / 700, device=device, dtype=dtype))
+        mel_scale = torch.pow(10, torch.linspace(0, mel_max, head_dim // 2, device=device, dtype=dtype) / 2595) - 1
+        return 700 * mel_scale / 1000
+
     def _compute_freqs(n, x=None, mask=None):
         if mask is None:
-            scale = torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 4000/200)), n.head_dim // 2, device=device, dtype=dtype, requires_grad=False) / 2595) - 1
+            scale = n.gammatone()
+            # scale = n.wideband()
+            # scale = torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 4000/200)), n.head_dim // 2, device=device, dtype=dtype, requires_grad=False) / 2595) - 1
+
             return x.mean(dim=-1) * scale / 1000 if x is not None else 200 * scale / 1000
         else: 
             return torch.arange(0, n.head_dim, 2, device=device, dtype=dtype, requires_grad=False) / n.head_dim * torch.log(torch.tensor(x.mean(dim=-1) * THETA if x is not None else THETA, requires_grad=False))
@@ -61,6 +109,26 @@ class rotary(nn.Module):
         out = torch.cat([x1.type_as(x), x2], dim=-1)
         return out
     
+class OneShot(nn.Module):
+    def __init__(n, dims: int, head: int, scale: float = 0.3, features: Optional[List[str]] = None):
+        super().__init__()
+        if features is None:    
+            features = ["spectrogram", "waveform", "pitch", "aperiodic", "harmonics"]
+        n.head = head
+        n.head_dim = dims // head
+        n.scale = 1.0 // len(features) if features else scale
+
+        n.q = nn.Linear(dims, dims)
+        n.k = nn.Linear(dims, dims)
+
+    def forward(n, x: Tensor, xa: Tensor, feature=None) -> Tensor | None:
+        B, L, D = x.shape
+        K = xa.size(1)
+        q = n.q(x).view(B, L, n.head, n.head_dim).transpose(1,2)
+        k = n.k(xa).view(B, K, n.head, n.head_dim).transpose(1,2)
+        bias = (q @ k.transpose(-1, -2)) * n.scale / math.sqrt(n.head_dim)
+        return bias
+
 class attention(nn.Module):
     def __init__(n, dims, head, layer, n_type=None, modal=False): 
         super().__init__()
@@ -81,7 +149,8 @@ class attention(nn.Module):
  
         b, c, d = x.shape
         p = pattern if pattern is not None else None
-        k, v = n.kv(x if xa is None else xa)
+
+        k, v = n.kv(aorb(xa, x))
         q = n.q(x)
         q, k = n.rot(q, xa=x, mask=mask), n.rot(k, xa=x if xa is None else xa, mask=mask)  
 
@@ -154,6 +223,18 @@ class attentionb(nn.Module):
         wv = einsum('b h k q, b h q d -> b h k d', qk, v) 
         return n.out(wv)
 
+# class tgate(nn.Module):
+#     def __init__(n, dims, num_types=2):
+#         super().__init__()
+
+#         n.gates = nn.ModuleList([nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()) for _ in range(num_types)])
+#         n.classifier = nn.Sequential(nn.Linear(dims, num_types), nn.Softmax(dim=-1))
+
+#     def forward(n, x):
+#         types = n.classifier(x)
+#         gates = torch.stack([gate(x) for gate in n.gates], dim=-1)
+#         return  torch.sum(gates * types.unsqueeze(2), dim=-1)
+
 class gate(nn.Module):
     def __init__(n, dims, num_types):
         super().__init__()
@@ -163,15 +244,37 @@ class gate(nn.Module):
         n.top = nn.Linear(dims, num_types)
         n.alpha = nn.Parameter(torch.ones(1), requires_grad=True)
 
-    def forward(n, x, num=None):
+    def forward(n, x, num=2):
         types, indices = torch.topk(n.top(x), num, dim=-1)
         type = torch.zeros_like(n.features(x))
         type.scatter_(-1, indices, torch.nn.functional.softmax(types, dim=-1))
         features = torch.sigmoid(n.alpha) * type + (1 - torch.sigmoid(n.alpha)) * n.features(x)
         return torch.sum(torch.stack([gate(x) for gate in n.gates], dim=-1) * features.unsqueeze(2), dim=-1)
 
+class Router(nn.Module):
+    def __init__(n, dims, num_types):
+        super().__init__()
+        n.num_types = num_types
+        n.top = nn.Linear(dims * num_types, num_types)
+        n.soft = nn.Sequential(nn.Linear(dims * num_types, num_types), nn.Softmax(dim=-1))
+        n.alpha = nn.Parameter(torch.ones(1), requires_grad=True)
+
+    def weights(n, router_top, router_input, num=2):
+        types, indices = torch.topk(router_top, num, dim=-1)
+        type = torch.zeros_like(router_top)
+        type.scatter_(-1, indices, F.softmax(types, dim=-1))
+        soft_selection = n.soft(router_input)
+        alpha = torch.sigmoid(n.alpha)
+        return alpha * type + (1 - alpha) * soft_selection
+
+    def forward(n, *modalities):
+        stack = torch.stack(modalities, dim=-1)
+        input = stack.view(stack.shape[0], stack.shape[1], -1)
+        weights = n.weights(n.top(input), input)
+        return torch.sum(stack * weights.unsqueeze(2), dim=-1)
+
 class residual(nn.Module):
-    def __init__(n, dims, head, layer, act, n_type, num_types=2):
+    def __init__(n, dims, head, layer, act, n_type, num_types=8):
         super().__init__()
 
         n.expand = head
@@ -180,18 +283,14 @@ class residual(nn.Module):
         n.audio = lambda length, dims: sinusoids(length, dims, THETA)
         
         n.attn = attention(dims, head, layer, n_type=n_type)
-        n.gate = gate(dims, num_types=n.expand) 
-
-        n.mlp = nn.Sequential(n.ln, nn.Linear(dims, dims*n.expand), get_activation(act), nn.Linear(dims*n.expand, dims))
-        n.ga = nn.ModuleList([nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()) for _ in range(num_types)])
-        n.cs = nn.Sequential(nn.Linear(dims, num_types), nn.Softmax(dim=-1))        
+        n.router = Router(dims, num_types=3)
+        n.mlp = nn.Sequential(n.ln, nn.Linear(dims, dims*num_types), get_activation(act), nn.Linear(dims*num_types, dims))
 
     def forward(n, x, xa=None, mask=None, pt=None):
         x = x + n.attn(n.ln(x), mask=mask, pt=pt)
         if xa is not None: 
             xa = xa + n.audio(xa.shape[1], xa.shape[-1]).to(device, dtype)
-            # xa = xa + n.gate(xa, n.expand // 2) 
-            xa = xa + torch.sum(torch.stack([g(xa) for g in n.ga], dim=-1) * n.cs(xa).unsqueeze(2), dim=-1)
+            xa = n.router(*[xa for _ in range(3)])  
             x = x + n.attn(n.ln(x), xa=xa, pt=pt)
         return x + n.mlp(x)
 
@@ -216,29 +315,52 @@ class processor(nn.Module):
         n.position = nn.Parameter(torch.ones(ctx, dims), requires_grad=True)
         n.blend = nn.Parameter(torch.tensor(0.5), requires_grad=True)
 
+        # n.block_main: Iterable[residual] = nn.ModuleList(
+        #     [residual(dims, head, layer, act, n_type) for _ in range(layer)]) 
+
         n.block: Iterable[residual] = nn.ModuleList(
             [residual(dims, head, layer, act, n_type) for _ in range(layer)]) 
-        
+
         n.register_buffer("mask", torch.empty(ctx, ctx).fill_(-np.inf).triu_(1), persistent=False)
 
     def forward(n, x, xa=None, seq=False) -> Tensor:
 
-        xa, xb, xc, pt = (xa.pop(k, None) for k in ('a', 'b', 'c', 'pt')) if isinstance(xa, TensorDict) else (None, None, None, None)
+        m = {}
+        if isinstance(xa, TensorDict):
+            m = {k: v for k, v in xa.items() if k in ('a', 'b', 'c', 'pt')}
+        pt = m.pop('pt', None)
 
         blend = torch.sigmoid(n.blend)
         x = (n.token(x) + n.position[:x.shape[-1]]).to(device, dtype)
 
-        for i in n.block:
-            a = i(x, mask=n.mask, pt=pt)
-            b = i(a, xa=i(xa, pt=pt))
-            c = i(b, xa=i(xb, pt=pt))
-            d = i(c, xa=i(xc, pt=pt))
+        for i, b in enumerate(n.block):
+            x = b(x, mask=n.mask, pt=pt)
+            if 'a' in m: x = b(x=x, xa=b(m['a'], pt=pt), pt=pt)
+            if 'b' in m: x = b(x=x, xa=b(m['b'], pt=pt), pt=pt)
+            if 'c' in m: x = b(x=x, xa=b(m['c'], pt=pt), pt=pt)
 
-            for j in [(xa), (xb), (xc)]: e = i(x, xa=i(j, pt=pt))
+            # for j in [(m['a']), (m['b']), (m['c'])]: e = b(x, xa=b(j, pt=pt))
+            e = torch.mean(torch.stack([m['a'], m['b'], m['c']]), dim=0)
+            f = torch.cat([x, e], dim=1)
+            g = b(x=f[:, :x.shape[1]], xa=f[:, x.shape[1]:])
+            x = g if seq else blend * (x) + (1 - blend) * g 
 
-            f = torch.cat([d, e], dim=1)
-            g = i(x=f[:, :x.shape[1]], xa=f[:, x.shape[1]:])
-            x = g if seq else blend * (d) + (1 - blend) * g 
+        # xa, xb, xc, pt = (xa.pop(k, None) for k in ('a', 'b', 'c', 'pt')) if isinstance(xa, TensorDict) else (None, None, None, None)
+
+        # blend = torch.sigmoid(n.blend)
+        # x = (n.token(x) + n.position[:x.shape[-1]]).to(device, dtype)
+
+        # for i in n.block:
+        #     a = i(x, mask=n.mask, pt=pt)
+        #     b = i(a, xa=i(xa, pt=pt))
+        #     c = i(b, xa=i(xb, pt=pt))
+        #     d = i(c, xa=i(xc, pt=pt))
+
+        #     for j in [(xa), (xb), (xc)]: e = i(x, xa=i(j, pt=pt))
+
+        #     f = torch.cat([d, e], dim=1)
+        #     g = i(x=f[:, :x.shape[1]], xa=f[:, x.shape[1]:])
+        #     x = g if seq else blend * (d) + (1 - blend) * g 
 
         return (n.ln(x) @ torch.transpose(n.token.weight.to(dtype), 0, 1)).float()
 
@@ -384,4 +506,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
