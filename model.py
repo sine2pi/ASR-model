@@ -27,6 +27,36 @@ class Dimensions:
     act: str
     n_type: str
 
+def l2norm(t):
+    return torch.nn.functional.normalize(t, dim = -1)
+
+def Sequential(*modules):
+    return nn.Sequential(*filter(have, modules))  
+
+def have(a):
+    return a is not None  
+
+def aorb(a, b):
+    return a if have(a) else b
+
+def aborc(a, b, c):
+    return aorb(a, b) if not have(c) else c
+
+def no_none(xa):
+    return xa.apply(lambda tensor: tensor if tensor is not None else None)
+
+def shift_right(x):
+    return torch.cat([torch.zeros_like(x[:, :1]), x], dim=1)
+
+def safe_div(n, d, eps = 1e-6):
+    return n.div_(d + eps)
+
+def sinusoids(ctx, dims, theta=THETA):
+    tscales = torch.exp(-torch.log(torch.tensor(float(theta), requires_grad=False)) / (dims // 2 - 1) * torch.arange(dims // 2, device=device, dtype=torch.float32, requires_grad=False))
+    scaled = torch.arange(ctx, device=device, dtype=torch.float32).unsqueeze(1) * tscales.unsqueeze(0)
+    positional_embedding = nn.Parameter(torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=1), requires_grad=False)
+    return positional_embedding    
+
 class AudioEncoder(nn.Module):
     def __init__(n, mels, dims, head, act, n_type, norm=False, enc=False):
         super().__init__()
@@ -186,42 +216,42 @@ class attention(nn.Module):
         else:
             return n.out(a)
 
-# class attentionb(nn.Module):
-#     def __init__(n, dims: int, head: int, layer: int, n_type):
-#         super().__init__()
+class attentionb(nn.Module):
+    def __init__(n, dims: int, head: int, layer: int, n_type):
+        super().__init__()
 
-#         n.q   = nn.Sequential(get_norm(n_type, dims) , nn.Linear(dims, dims), Rearrange('b c (h d) -> b h c d', h = head))
-#         n.c   = nn.Sequential(get_norm(n_type, dims) , nn.Linear(dims, dims), Rearrange('b c (h d) -> b h c d', h = head))
-#         n.kv  = nn.Sequential(get_norm(n_type, dims), nn.Linear(dims, dims * 2), Rearrange('b c (kv h d) -> kv b h c d', kv = 2, h = head))
-#         n.out = nn.Sequential(Rearrange('b h n d -> b n (h d)'), nn.Linear(dims, dims), nn.Dropout(0.01))
+        n.q   = nn.Sequential(get_norm(n_type, dims) , nn.Linear(dims, dims), Rearrange('b c (h d) -> b h c d', h = head))
+        n.c   = nn.Sequential(get_norm(n_type, dims) , nn.Linear(dims, dims), Rearrange('b c (h d) -> b h c d', h = head))
+        n.kv  = nn.Sequential(get_norm(n_type, dims), nn.Linear(dims, dims * 2), Rearrange('b c (kv h d) -> kv b h c d', kv = 2, h = head))
+        n.out = nn.Sequential(Rearrange('b h n d -> b n (h d)'), nn.Linear(dims, dims), nn.Dropout(0.01))
         
-#         n.ln = get_norm(n_type, dims // head)
+        n.ln = get_norm(n_type, dims // head)
         
-#     def forward(n, x, xa=None, mask=None, pt=None, context_window=3):
-#         q = n.q(x)
-#         k, v = n.kv(aorb(xa, x))
-#         b, h, c, d = q.shape 
-#         scale = d ** -0.5
+    def forward(n, x, xa=None, mask=None, pt=None, context_window=3):
+        q = n.q(x)
+        k, v = n.kv(aorb(xa, x))
+        b, h, c, d = q.shape 
+        scale = d ** -0.5
 
-#         if pt is not None: c = n.c(pt)
-#         else: c = torch.zeros_like(x, requires_grad=False)
+        if pt is not None: c = n.c(pt)
+        else: c = torch.zeros_like(x, requires_grad=False)
 
-#         triplet_scores = torch.zeros(b, h, c, c, device=device, requires_grad=False)
+        triplet_scores = torch.zeros(b, h, c, c, device=device, requires_grad=False)
 
-#         for i in range(c):
-#             for j in range(c):
-#                 context_start = max(0, min(i, j) - context_window)
-#                 context_end = min(c, max(i, j) + context_window)
+        for i in range(c):
+            for j in range(c):
+                context_start = max(0, min(i, j) - context_window)
+                context_end = min(c, max(i, j) + context_window)
                 
-#                 for k in range(context_start, context_end): 
-#                     score = (q[:, :, i, :] * k[:, :, j, :] * c[:, :, k, :]).sum(dim=-1)
-#                     triplet_scores[:, :, i, j] += score
+                for k in range(context_start, context_end): 
+                    score = (q[:, :, i, :] * k[:, :, j, :] * c[:, :, k, :]).sum(dim=-1)
+                    triplet_scores[:, :, i, j] += score
 
-#         qk = einsum('b h k d, b h q d -> b h k q', q, k) * scale + triplet_scores
-#         if have(mask): qk = qk + mask[:c, :c]
-#         qk = torch.nn.functional.softmax(qk, dim=-1)
-#         wv = einsum('b h k q, b h q d -> b h k d', qk, v) 
-#         return n.out(wv)
+        qk = einsum('b h k d, b h q d -> b h k q', q, k) * scale + triplet_scores
+        if have(mask): qk = qk + mask[:c, :c]
+        qk = torch.nn.functional.softmax(qk, dim=-1)
+        wv = einsum('b h k q, b h q d -> b h k d', qk, v) 
+        return n.out(wv)
 
 # class tgate(nn.Module):
 #     def __init__(n, dims, num_types=2):
@@ -429,6 +459,8 @@ class Model(nn.Module):
     
 def main():
 
+    # metadata_file = "./LJSpeech1000/metadata.csv"
+    # data_dir = "./LJSpeech1000"
     metadata_file = "./cv17_1000/metadata.csv"
     data_dir = "./cv17_1000"
 
@@ -474,9 +506,15 @@ def main():
         num_workers=0,
     )
 
-    optimizer = MF(model.parameters(), lr=0.025, beta_decay=-0.8, eps=(1e-10, 1e-3), d=1.0, w_decay=0.01, gamma=0.99, max=False)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000, eta_min=1e-9, last_epoch=-1)
+    optimizer = MF(model.parameters(), lr=0.025, beta_decay=-0.8, eps=(1e-10, 1e-3), d=1.0, w_decay=0.01, 
+    gamma=0.99, max=False, bias=1)
+    scheduler1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=100)
+    scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=900, eta_min=1e-9)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[100])
 
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000, eta_min=1e-9, last_epoch=-1)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000, eta_min=1e-9, last_epoch=-1)
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=0)
 
     train_and_evaluate(
