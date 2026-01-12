@@ -5,7 +5,7 @@ from typing import Iterable
 from functools import partial
 from dataclasses import dataclass
 from einops.layers.torch import Rearrange
-from optimizer import MaxFactor as MF
+from optimizer import FAMScheduler2, MaxFactor
 from torch.utils.data import DataLoader    
 from datetime import datetime
 from essentials import *
@@ -124,6 +124,7 @@ class rotary(nn.Module):
     def forward(n, x=None, xa=None, mask=None): 
         t = torch.arange(x.shape[2], device=device, dtype=dtype, requires_grad=False).float()
         freqs = torch.einsum('i,j->ij', t,  n._compute_freqs(mask=mask))
+        
         if xa is not None:
             freqs = torch.polar(xa.mean(dim=-1).unsqueeze(-1), freqs)
         else:   
@@ -307,33 +308,56 @@ class residual(nn.Module):
     def __init__(n, dims, head, layer, act, n_type, num_types=8):
         super().__init__()
 
-        n.expand = head
+        n.layer = layer - 1 
         n.ln = get_norm(n_type=n_type, dims=dims)
         n.act_fn = get_activation(act)
         n.audio = lambda length, dims: sinusoids(length, dims, THETA)
         
         n.attn = attention(dims, head, layer, n_type=n_type)
         n.router = Router(dims, num_types=3)
+        # n.attn_pass = attn_pass(dims, head, layer, act, n_type)
+        n.gate = gate(dims, num_types=num_types)
         n.mlp = nn.Sequential(n.ln, nn.Linear(dims, dims*num_types), get_activation(act), nn.Linear(dims*num_types, dims))
 
     def forward(n, x, xa=None, mask=None, pt=None):
         x = x + n.attn(n.ln(x), mask=mask, pt=pt)
+
         if xa is not None: 
             xa = xa + n.audio(xa.shape[1], xa.shape[-1]).to(device, dtype)
-            xa = n.router(*[xa for _ in range(3)])  
+            # xa = xa + n.gate(xa)
+            # xa = n.router(*[xa if xa is not None else x for _ in range(n.layer)]) 
             x = x + n.attn(n.ln(x), xa=xa, pt=pt)
-        return x + n.mlp(x)
 
-class attn_pass(nn.Module):
-    def __init__(n, dims, head, layer, act, n_type, skip=True, pattern=None):
-        super().__init__()
+        return x + n.mlp(x) 
+
+# class attn_pass(nn.Module):
+#     def __init__(n, dims, head, layer, act, n_type, skip=True, pattern=None):
+#         super().__init__()
         
-        n.layers = nn.ModuleList()
-        for i in range(layer): n.layers.append(residual(dims, head, layer, act, n_type, skip=skip and i in skip, pattern=pattern[i] if pattern else None))
+#         n.layers = nn.ModuleList()
+#         for i in range(layer): n.layers.append(residual(dims, head, layer, act, n_type, skip=skip and i in skip, pattern=pattern[i] if pattern else None))
 
-    def forward(n, x, override=None):
-        for i, layer in enumerate(n.layers): x = layer(x, skip=i, pattern=override[i] if override else None)
-        return x
+#     def forward(n, x, override=None):
+#         for i, layer in enumerate(n.layers): x = layer(x, skip=i, pattern=override[i] if override else None)
+#         return x
+
+# class attn_pass(nn.Module):
+#     def __init__(n, dims, head, layer, act, n_type, blocks=[residual]):
+#         super().__init__()
+        
+#         n.layers = nn.ModuleList()
+#         n.router = Router(dims, num_types=3)
+
+#         for i in range(layer):
+#             n.layers.append(blocks[i % len(blocks)](dims, head, layer, act, n_type))
+
+#     def forward(n, x, xa=None):
+#         blocks = list(n.layers) if len(n.layers) // 2 else []
+#         out = n.router(*[xa for _ in range(blocks)])  
+        
+#         for i, layer in enumerate(blocks):
+#             out = layer(x, xa=out if out is not None else None)
+#         return out
 
 class processor(nn.Module):
     def __init__(n, tokens, mels, dims, head, layer, act, n_type, ctx=2048): 
@@ -345,54 +369,59 @@ class processor(nn.Module):
         n.position = nn.Parameter(torch.ones(ctx, dims), requires_grad=True)
         n.blend = nn.Parameter(torch.tensor(0.5), requires_grad=True)
 
-        # n.block_main: Iterable[residual] = nn.ModuleList(
-        #     [residual(dims, head, layer, act, n_type) for _ in range(layer)]) 
+        # n.block_main: Iterable[residual2] = nn.ModuleList(
+        #     [residual2(dims, head, layer, act, n_type) for _ in range(layer)]) 
 
+        # n.blocks: Iterable[residual] = attn_pass(dims, head, layer, act, n_type, block_types=[residual]).layers
         n.block: Iterable[residual] = nn.ModuleList(
             [residual(dims, head, layer, act, n_type) for _ in range(layer)]) 
-
+        # n.blocks: Iterable[attn_pass] = nn.ModuleList(
+        #     [attn_pass(dims, head, layer, act, n_type) for _ in range(layer // 2)]) 
+        
         n.register_buffer("mask", torch.empty(ctx, ctx).fill_(-np.inf).triu_(1), persistent=False)
 
     def forward(n, x, xa=None, seq=False) -> Tensor:
 
-        m = {}
-        if isinstance(xa, TensorDict):
-            m = {k: v for k, v in xa.items() if k in ('a', 'b', 'c', 'pt')}
-        pt = m.pop('pt', None)
+        xa, xb, xc, pt = (xa.pop(k, None) for k in ('a', 'b', 'c', 'pt')) if isinstance(xa, TensorDict) else (None, None, None, None)
 
         blend = torch.sigmoid(n.blend)
         x = (n.token(x) + n.position[:x.shape[-1]]).to(device, dtype)
 
-        for i, b in enumerate(n.block):
-            x = b(x, mask=n.mask, pt=pt)
-            if 'a' in m: x = b(x=x, xa=b(m['a'], pt=pt), pt=pt)
-            if 'b' in m: x = b(x=x, xa=b(m['b'], pt=pt), pt=pt)
-            if 'c' in m: x = b(x=x, xa=b(m['c'], pt=pt), pt=pt)
+        for i in n.block:
+            a = i(x,  mask=n.mask, pt=pt)
+            b = i(a, xa=i(xa, pt=pt))
+            c = i(b, xa=i(xb, pt=pt))
+            d = i(c, xa=i(xc, pt=pt))
 
-            # for j in [(m['a']), (m['b']), (m['c'])]: e = b(x, xa=b(j, pt=pt))
-            e = torch.mean(torch.stack([m['a'], m['b'], m['c']]), dim=0)
-            f = torch.cat([x, e], dim=1)
-            g = b(x=f[:, :x.shape[1]], xa=f[:, x.shape[1]:])
-            x = g if seq else blend * (x) + (1 - blend) * g 
-
-        # xa, xb, xc, pt = (xa.pop(k, None) for k in ('a', 'b', 'c', 'pt')) if isinstance(xa, TensorDict) else (None, None, None, None)
-
-        # blend = torch.sigmoid(n.blend)
-        # x = (n.token(x) + n.position[:x.shape[-1]]).to(device, dtype)
-
-        # for i in n.block:
-        #     a = i(x, mask=n.mask, pt=pt)
-        #     b = i(a, xa=i(xa, pt=pt))
-        #     c = i(b, xa=i(xb, pt=pt))
-        #     d = i(c, xa=i(xc, pt=pt))
-
-        #     for j in [(xa), (xb), (xc)]: e = i(x, xa=i(j, pt=pt))
-
-        #     f = torch.cat([d, e], dim=1)
-        #     g = i(x=f[:, :x.shape[1]], xa=f[:, x.shape[1]:])
-        #     x = g if seq else blend * (d) + (1 - blend) * g 
+            # for j in [(xa), (xb), (xc)]: e = i(x, xa=i(j, pt=pt))
+            e = a + b + c
+            f = torch.cat([d, e], dim=1)
+            g = i(x=f[:, :x.shape[1]], xa=f[:, x.shape[1]:])
+            x = g if seq else blend * (d) + (1 - blend) * g 
 
         return (n.ln(x) @ torch.transpose(n.token.weight.to(dtype), 0, 1)).float()
+
+    # def forward(n, x, xa=None, seq=False) -> Tensor:
+
+    #     xa, xb, xc, pt = (xa.pop(k, None) for k in ('a', 'b', 'c', 'pt')) if isinstance(xa, TensorDict) else (None, None, None, None)
+
+    #     blend = torch.sigmoid(n.blend)
+    #     x = (n.token(x) + n.position[:x.shape[-1]]).to(device, dtype)
+
+    #     for i in n.block:
+    #         a = i(x, mask=n.mask)
+    #         b = i(a, xa=i(xa))
+    #         c = i(b, xa=i(xb))
+    #         d = i(c, xa=i(xc))
+
+    #         # e = torch.mean(torch.stack([xa, xb, xc]), dim=0)
+    #         e = a + b + c
+    #         f = torch.cat([d, e], dim=1)
+    #         g = i(x=f[:, :x.shape[1]], xa=f[:, x.shape[1]:])
+
+    #     x = g if seq else blend * (d) + (1 - blend) * g if g is not None else a
+
+    #     return (n.ln(x) @ torch.transpose(n.token.weight.to(dtype), 0, 1)).float()
 
 class Model(nn.Module):
     def __init__(n, param: Dimensions):
@@ -420,7 +449,6 @@ class Model(nn.Module):
     def forward(n, labels=None, text_ids=None, spectrogram=None, pitch=None, waveform=None, pitch_tokens=None):
 
         fx = next((t for t in (pitch, spectrogram, waveform) if t is not None), None)
-
         xa = TensorDict({
             'a': aborc(pitch, spectrogram, waveform),
             'b': aborc(spectrogram, pitch, waveform),
@@ -429,8 +457,7 @@ class Model(nn.Module):
 
         x = text_ids
         xa = n.enc(no_none(xa))
-        xa['pt'] = pitch_tokens if pitch_tokens is not None else None
-
+        xa['pt'] = pitch_tokens
         output = n.processor(x, xa, seq=False)
 
         loss = None
@@ -438,6 +465,32 @@ class Model(nn.Module):
             loss = torch.nn.functional.cross_entropy(output.view(-1, output.shape[-1]), labels.view(-1), ignore_index=0)
 
         return {"logits": output, "loss": loss}
+
+    @torch.no_grad()
+    def generate(n, spectrogram=None, pitch=None, waveform=None, pitch_tokens=None, max_new_tokens=100):
+
+        fx = next((t for t in (pitch, spectrogram, waveform) if t is not None), None)
+        xa = TensorDict({
+            'a': aborc(pitch, spectrogram, waveform),
+            'b': aborc(spectrogram, pitch, waveform),
+            'c': aborc(waveform, pitch, spectrogram),
+        }, batch_size=fx.shape[0])
+        
+        xa = n.enc(no_none(xa))
+        if pitch_tokens is not None:
+            xa['pt'] = pitch_tokens 
+
+        y = torch.tensor([[1]], dtype=torch.long, device=device).repeat(fx.shape[0], 1)
+        for _ in range(max_new_tokens):
+            logits = n.processor(y, xa, seq=True) 
+            next_token_logits = logits[:, -1, :]
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            
+            y = torch.cat((y, next_token), dim=1)
+            if (next_token == 2).all():
+                break
+        
+        return y   
 
     def _init_w(n, m):
         n.counts = {"Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0, "Conv2d": 0, "processor": 0, "attention": 0, "Residual": 0}
@@ -459,10 +512,10 @@ class Model(nn.Module):
     
 def main():
 
-    # metadata_file = "./LJSpeech1000/metadata.csv"
-    # data_dir = "./LJSpeech1000"
-    metadata_file = "./cv17_1000/metadata.csv"
-    data_dir = "./cv17_1000"
+    metadata_file = "./LJSpeech1000/metadata.csv"
+    data_dir = "./LJSpeech1000"
+    # metadata_file = "./cv17_1000/metadata.csv"
+    # data_dir = "./cv17_1000"
 
     log_dir = os.path.join('./logs/', datetime.now().strftime('%m-%d_%H_%M_%S'))
     os.makedirs(log_dir, exist_ok=True)
@@ -506,15 +559,11 @@ def main():
         num_workers=0,
     )
 
-    optimizer = MF(model.parameters(), lr=0.025, beta_decay=-0.8, eps=(1e-10, 1e-3), d=1.0, w_decay=0.01, 
-    gamma=0.99, max=False, bias=1)
-    scheduler1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=100)
-    scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=900, eta_min=1e-9)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[100])
+    optimizer = MaxFactor(model.parameters(), lr=0.025, beta_decay=-0.8, 
+                   eps=(1e-10, 1e-3), d=1.0, w_decay=0.01, gamma=0.99, max=False, bias=1)
+    scheduler = FAMScheduler2(optimizer, warmup_steps=100, total_steps=1000, 
+                 decay_start_step=None, warmup_start_lr=1e-6, eta_min=1e-6, last_epoch=-1) 
 
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000, eta_min=1e-9, last_epoch=-1)
-    # optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000, eta_min=1e-9, last_epoch=-1)
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=0)
 
     train_and_evaluate(
@@ -535,6 +584,7 @@ def main():
         save_interval=1000,
         checkpoint_dir=log_dir,
         log_dir=log_dir,
+        generate=False,
     )
 
     print(f"Train dataset size: {len(train_dataset)}")
