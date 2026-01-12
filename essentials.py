@@ -587,6 +587,7 @@ def train_and_evaluate(
     save_interval=1000,
     checkpoint_dir="checkpoint_dir",
     log_dir="log_dir",
+    generate=False,
 ):
 
     logging.basicConfig(level=logging.INFO)
@@ -694,8 +695,11 @@ def train_and_evaluate(
                 global_step=global_step,
             )
             lr = scheduler.get_last_lr()[0]
+
             writer.add_scalar(
-                tag="LearningRate", scalar_value=lr, global_step=global_step
+                tag="LearningRate", 
+                scalar_value=lr, 
+                global_step=global_step
             )
             writer.add_scalar(
                 tag="SamplesPerSec",
@@ -703,7 +707,7 @@ def train_and_evaluate(
                 global_step=global_step,
             )
 
-        if global_step % eval_interval == 0:
+        if global_step % eval_interval == 0 and global_step >= (max_steps // 10):
             model.eval()
             start = time.time()
             eval_loss = 0
@@ -711,10 +715,10 @@ def train_and_evaluate(
             all_l = []
             batch = 0
             total = 0
-            predictions = {}
             
             with torch.no_grad():
                 for eval_batch in eval_loader:
+
                     features = TensorDict({k: v.to(device) for k, v in eval_batch.items() if k in ["spectrogram","waveform","pitch"] and v is not None}, batch_size=eval_batch["text_ids"].shape[0]).to(device)
                     text_ids = eval_batch["text_ids"].to(device)
                     labels = eval_batch["labels"].long().to(device)
@@ -722,14 +726,34 @@ def train_and_evaluate(
                     batch_size = text_ids.size(0)
                     total += batch_size
 
-                    output = model(text_ids=text_ids, labels=labels, spectrogram=features.get("spectrogram"), pitch=features.get("pitch"), waveform=features.get("waveform"))
+                    output = model(
+                        text_ids=text_ids, 
+                        labels=labels, 
+                        spectrogram=features.get("spectrogram"),
+                        pitch=features.get("pitch"), 
+                        waveform=features.get("waveform")
+                    )
+
                     loss = output["loss"]
                     eval_loss += loss.item()
-                    all_p.extend(
-                        torch.argmax(output["logits"], dim=-1).cpu().numpy().tolist()
-                    )
-                    all_l.extend(labels.cpu().numpy().tolist())
                     batch += 1
+
+                    if generate:
+                        generated_ids = model.generate(
+                            spectrogram=features.get("spectrogram"),
+                            pitch=features.get("pitch"),
+                            waveform=features.get("waveform"),
+                            pitch_tokens=None, 
+                            max_new_tokens=labels.shape[1] 
+                        ) 
+                        all_p.extend(generated_ids.cpu().numpy().tolist())
+                        all_l.extend(labels.cpu().numpy().tolist())
+
+                    else: 
+                        all_p.extend(
+                            torch.argmax(output["logits"], dim=-1).cpu().numpy().tolist()
+                        )
+                        all_l.extend(labels.cpu().numpy().tolist())
 
             eval_time = time.time() - start
             loss_avg = eval_loss / batch if batch > 0 else 0
@@ -738,12 +762,13 @@ def train_and_evaluate(
                 "predictions": np.array(all_p, dtype=object),
                 "label_ids": np.array(all_l, dtype=object),
             }
+            
             metrics = metric_fn(p, tokenizer=tokenizer, model=model)
             writer.add_scalar("Loss/eval", loss_avg, global_step)
             writer.add_scalar("WER", metrics["wer"], global_step)
             writer.add_scalar("EvalSamples", total, global_step)
             writer.add_scalar("EvalTimeSeconds", eval_time, global_step)
-      
+    
             if "per_layer_norms" in metrics:
                 for layer, norm in metrics["per_layer_norms"].items():
                     writer.add_scalar(f"eval/per_layer_norms/{layer}", norm, global_step)
@@ -864,3 +889,95 @@ class prepare_datasets(torch.utils.data.Dataset):
         )
         
         return features
+
+def generate_predictions(model, spectrogram=None, pitch=None, waveform=None, tokenizer=None, batch_size=None, max_new_tokens=None):
+    decoder_start_token_id = tokenizer.bos_token_id
+    eos_token_id = tokenizer.eos_token_id
+    
+    generated_ids = torch.full(size=(batch_size, 1), fill_value=decoder_start_token_id, dtype=torch.long, device=device)
+    
+    max_length = max_new_tokens + 1
+    for i in range(max_length - 1):
+        with torch.no_grad():
+            curr_output = model.processor(generated_ids, spectrogram=spectrogram, pitch=pitch, waveform=waveform)
+        next_token_logits = curr_output[:, -1, :]
+        
+        if i < max_new_tokens:
+            next_token_logits[:, eos_token_id] = float('-inf')
+        next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+        generated_ids = torch.cat([generated_ids, next_tokens], dim=1)
+        if (next_tokens == eos_token_id).all() and i >= max_new_tokens:
+            break
+    return generated_ids
+
+def save_model_checkpoint(model, optimizer, scheduler, checkpoint_dir, global_step):
+    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_step_{global_step}.pt')
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'global_step': global_step
+    }, checkpoint_path)
+    logging.info(f"Model checkpoint saved at step {global_step} to {checkpoint_path}")
+
+def evaluate_model(model, tokenizer, eval_loader, loss_fn, device, global_step, writer, eval_steps):
+    model.eval()
+    eval_loss = 0
+    batch_count = 0
+    all_preds = []
+    all_labels = []
+
+    eval_start_time = time.time()
+    
+    with torch.no_grad():
+        for eval_batch in tqdm(eval_loader, desc=f"Evaluating (Step {global_step})", leave=False):
+            if batch_count >= eval_steps:
+                break
+                
+            input_features = eval_batch['input_features'].to(device)
+            input_ids = eval_batch['input_ids'].to(device) 
+            labels = eval_batch['labels'].long().to(device)
+            
+            encoder_output = model.encoder(input_features)
+            decoder_output = model.decoder(input_ids, encoder_output)
+            logits = decoder_output.view(-1, decoder_output.size(-1))
+            
+            active_labels = labels.reshape(-1)
+            active_mask = active_labels != -100
+            loss = loss_fn(logits[active_mask], active_labels[active_mask])
+            eval_loss += loss.item()
+ 
+            batch_size = input_features.size(0)
+            
+            generated_ids = generate_predictions(
+                model=model,
+                input_features_encoded=encoder_output,
+                tokenizer=tokenizer,
+                device=device,
+                batch_size=batch_size,
+                min_length=5
+            )
+        
+            all_preds.append(generated_ids)
+            all_labels.append(labels)
+            
+            batch_count += 1
+            
+    # metrics = load_metric("wer")
+    preds = torch.cat(all_preds, dim=0)
+    labels = torch.cat(all_labels, dim=0)
+    
+    preds_text = tokenizer.batch_decode(preds, skip_special_tokens=True)
+    labels_text = tokenizer.batch_decode(labels, skip_special_tokens=True)
+    
+    # wer = metrics.compute(predictions=preds_text, references=labels_text)
+    avg_loss = eval_loss / max(1, batch_count)
+    eval_time = time.time() - eval_start_time
+    
+    return {
+        "loss": avg_loss,
+        # "wer": wer,
+        "preds": preds_text,
+        "labels": labels_text,
+        "eval_time": eval_time,
+    }
