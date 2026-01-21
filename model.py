@@ -1,7 +1,8 @@
 import os, torch, numpy as np
-from torch.nn.functional import scaled_dot_product_attention as SDPA
+from torch.nn.functional import embedding, scaled_dot_product_attention as SDPA
 from torch import nn, Tensor, einsum
 from typing import Iterable
+from torch.nn.utils.parametrizations import weight_norm
 from functools import partial
 from dataclasses import dataclass
 from einops.layers.torch import Rearrange
@@ -58,20 +59,23 @@ def sinusoids(ctx, dims, theta=THETA):
     return positional_embedding    
 
 class AudioEncoder(nn.Module):
-    def __init__(n, mels, dims, head, act, n_type, norm=False, enc=False):
+    def __init__(n, mels, dims, head, layer, act, n_type, norm=False, enc=False):
         super().__init__()
         
         act_fn = get_activation(act)
         n.conv1 = nn.Conv1d(mels, dims, kernel_size=3, stride=1, padding=1)
         n.conv2 = nn.Conv1d(1, dims, kernel_size=3, stride=1, padding=1)
-        
-        n.encoder = nn.Sequential(
-            act_fn, nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1),
-            act_fn, nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
 
         n.audio = lambda length, dims: sinusoids(length, dims, THETA)
         n.EncoderLayer = nn.TransformerEncoderLayer(d_model=dims, nhead=head, batch_first=True) if enc else nn.Identity()
         n.ln = get_norm(n_type, dims) if norm else nn.Identity()
+
+        n.encoder = nn.ModuleList()
+        for _ in range(layer):
+            n.encoder.append(nn.Sequential(act_fn, weight_norm(nn.Conv1d(dims, dims, kernel_size=3, padding=1)),
+                LayerNorm(dims),act_fn,nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn,
+                nn.Dropout(0.1)
+            ))
 
     def _process_feature(n, x):
         if x.dim() == 2:
@@ -80,7 +84,11 @@ class AudioEncoder(nn.Module):
             x = n.conv1(x)
         else:
             x = n.conv2(x)
-        x = n.encoder(x).permute(0, 2, 1).contiguous().to(device, dtype)
+
+        for layer in n.encoder:
+            x = layer(x)
+
+        x = x.permute(0, 2, 1).contiguous().to(device, dtype)
         x = x + n.audio(x.shape[1], x.shape[-1]).to(device, dtype)
         x = n.ln(x)
         return n.EncoderLayer(x)
@@ -90,6 +98,46 @@ class AudioEncoder(nn.Module):
             return x.apply(n._process_feature)
         else:
             return n._process_feature(x)
+
+class RotaryModulator(nn.Module):
+    def __init__(n, dims, head, pt_tensor: torch.Tensor, p_tensor: torch.Tensor = None, num_bins: int = 256, v_min: float = -2.0, v_max: float = 2.0, embedding=False, rev=False):
+        super().__init__()
+        n.dims = dims
+        n.head_dim = dims // head
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, n.head_dim, 2).float() / n.head_dim))
+        n.register_buffer("inv_freq", inv_freq)
+
+    def quantize_pitch(n, xa = None, pt = None, num_bins = 256, v_min = -2.0, v_max = 2.0, embedding=False):
+        indices = ((pt - v_min) / (v_max - v_min) * (num_bins - 1)).round().long()
+        tensor = torch.clamp(indices, 0, num_bins - 1)
+        tensor = torch.polar(xa, tensor) if xa is not None else tensor
+        tensor = torch.view_as_real(tensor) if xa is not None else tensor
+        return nn.Embedding(tensor, n.dims) if embedding else tensor
+
+    def forward(n, pitch_embedding: Tensor, pitch_tokens: Tensor):
+
+        B, L, D = pitch_embedding.shape
+        device = pitch_embedding.device
+        t = torch.arange(L, device=device, dtype=pitch_embedding.dtype)
+        modulated_t = t.unsqueeze(0) * pitch_tokens.unsqueeze(-1)
+        freqs = torch.einsum('bl,d->bld', modulated_t, n.inv_freq)
+        mag = torch.log1p(torch.abs(pitch_tokens).unsqueeze(-1))
+
+        sin_table = mag * torch.sin(freqs)
+        cos_table = mag * torch.cos(freqs)
+        
+        x_left = pitch_embedding[..., 0::2]
+        x_right = pitch_embedding[..., 1::2]
+        sin_table = sin_table.repeat_interleave(2, dim=-1)
+        cos_table = cos_table.repeat_interleave(2, dim=-1)
+
+        rotated_x = (pitch_embedding * cos_table) + (n._rotate_half(pitch_embedding) * sin_table)
+        return rotated_x
+
+    def _rotate_half(n, x):
+        x1 = x[..., 0::2]
+        x2 = x[..., 1::2]
+        return torch.cat((-x2, x1), dim=-1)
 
 class rotary(nn.Module):
     def __init__(n, dims, head):
@@ -125,18 +173,18 @@ class rotary(nn.Module):
         t = torch.arange(x.shape[2], device=device, dtype=dtype, requires_grad=False).float()
         freqs = torch.einsum('i,j->ij', t,  n._compute_freqs(mask=mask))
         
-        if xa is not None:
-            freqs = torch.polar(xa.mean(dim=-1).unsqueeze(-1), freqs)
-        else:   
-            freqs = torch.polar(torch.ones_like(freqs, requires_grad=False), freqs)
+        if mask is None:
+            freqs = torch.polar(n.lin(xa), freqs)
+        else: 
+            freqs = torch.polar(n.lin(xa), freqs)
 
         x1 = x[..., :freqs.shape[-1]*2]
         x2 = x[..., freqs.shape[-1]*2:]
-        orig_shape = x1.shape
+        s = x1.shape
         x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
         x1 = torch.view_as_complex(x1) * freqs
         x1 = torch.view_as_real(x1).flatten(-2)
-        x1 = x1.view(orig_shape)
+        x1 = x1.view(s)
         out = torch.cat([x1.type_as(x), x2], dim=-1)
         return out
     
@@ -144,7 +192,7 @@ class OneShot(nn.Module):
     def __init__(n, dims: int, head: int, scale: float = 0.3, features: Optional[List[str]] = None):
         super().__init__()
         if features is None:    
-            features = ["spectrogram", "waveform", "pitch", "aperiodic", "harmonics"]
+            features = ["spectrogram", "waveform", "pitch", "pitch_tokens"]
         n.head = head
         n.head_dim = dims // head
         n.scale = 1.0 // len(features) if features else scale
@@ -159,7 +207,7 @@ class OneShot(nn.Module):
         k = n.k(xa).view(B, K, n.head, n.head_dim).transpose(1,2)
         bias = (q @ k.transpose(-1, -2)) * n.scale / math.sqrt(n.head_dim)
         return bias
-
+    
 class attention(nn.Module):
     def __init__(n, dims, head, layer, n_type=None, modal=False): 
         super().__init__()
@@ -170,107 +218,53 @@ class attention(nn.Module):
 
         n.q   = nn.Sequential(get_norm(n_type, dims), nn.Linear(dims, dims), Rearrange('b c (h d) -> b h c d', h = head))
         n.kv  = nn.Sequential(get_norm(n_type, dims), nn.Linear(dims, dims * 2), Rearrange('b c (kv h d) -> kv b h c d', kv = 2, h = head))
+        #n.c   = nn.Sequential(get_norm(n_type, dims) , nn.Linear(dims, dims), Rearrange('b c (h d) -> b h c d', h = head))
         n.out = nn.Sequential(Rearrange('b h c d -> b c (h d)'), nn.Linear(dims, dims))
 
         n.conv = nn.Conv2d(head, head, 1, bias=False) if modal else nn.Identity()
         n.ln = get_norm(n_type, dims // head)
         n.rot = rotary(dims, head)
 
-    def forward(n, x, xa=None, mask=None, pt=None, skip=False, pattern=None): 
+    def forward(n, x, xa=None, mask=None, pt=None, skip=False, pattern=None, window=3): 
  
         b, c, d = x.shape
-        p = pattern if pattern is not None else None
-
         k, v = n.kv(aorb(xa, x))
         q = n.q(x)
-        q, k = n.rot(q, xa=x, mask=mask), n.rot(k, xa=x if xa is None else xa, mask=mask)  
 
-        if skip and not have(p): 
-            a = SDPA(n.ln(q), n.ln(k[:, :, ::max(1, 6 - n.layer), :]), v[:, :, ::max(1, 6 - n.layer), :], is_causal=have(mask))
-            
-        elif have(p) and p > 1: 
-            k, v = k[:, :, ::p, :], v[:, :, ::p, :]
-            a = SDPA(n.ln(q), n.ln(k), v, is_causal=have(mask))
-        else: 
-            a = SDPA(n.ln(q), n.ln(k), v, is_causal=have(mask))
+#         c = n.c(pt)
+#         b, h, c, d = q.shape 
+#         t = torch.zeros(b, h, c, c, device=device, requires_grad=False)
+
+#         for i in range(c):
+#             for j in range(c):
+#                 start = max(0, min(i, j) - window)
+#                 end = min(c, max(i, j) + window)
+                
+#                 for k in range(start, end): 
+#                     score = (q[:, :, i, :] * k[:, :, j, :] * c[:, :, k, :]).sum(dim=-1)
+#                     t[:, :, i, j] += score
+
+#       q = q * n.scale + t
+#       k = k * n.scale + t
+
+        q, k = n.rot(q, xa=x if pt is None else pt, mask=mask), n.rot(k, xa=xa if xa is not None else x, mask=mask)  
+        a = SDPA(n.ln(q), n.ln(k), v, is_causal=have(mask))
 
         if n.modal and xa is not None:
-
             (ka, va), (kb, vb) = n.kv(x), n.kv(xa)
             qa, qb = n.q(x), n.q(xa)
             qa, qb, ka, kb = n.rot(qa), n.rot(qb), n.rot(ka), n.rot(kb)
-
-            if have(p) and p > 1:
-                k, ka, kb = k[:, :, ::p, :], k[:, :, 1::p, :], k[:, :, 2::p, :]
-                v, va, vb = v[:, :, ::p, :], v[:, :, 1::p, :], v[:, :, 2::p, :]
-            elif skip:
-                ka, va = ka[:, :, ::max(1, 6 - n.layer), :], va[:, :, ::max(1, 6 - n.layer), :]
-                kb, vb = kb[:, :, ::max(1, 6 - n.layer), :], vb[:, :, ::max(1, 6 - n.layer), :]
-            else:
-                ka, va = ka, va
-                kb, vb = kb, vb
-                
             b = SDPA(n.ln(qa), n.ln(kb), vb, is_causal=have(mask))
             c = SDPA(n.ln(qb), n.ln(ka), va, is_causal=have(mask))
-
             return n.out(a), n.out(n.conv(b)), n.out(n.conv(c))
         else:
             return n.out(a)
-
-class attentionb(nn.Module):
-    def __init__(n, dims: int, head: int, layer: int, n_type):
-        super().__init__()
-
-        n.q   = nn.Sequential(get_norm(n_type, dims) , nn.Linear(dims, dims), Rearrange('b c (h d) -> b h c d', h = head))
-        n.c   = nn.Sequential(get_norm(n_type, dims) , nn.Linear(dims, dims), Rearrange('b c (h d) -> b h c d', h = head))
-        n.kv  = nn.Sequential(get_norm(n_type, dims), nn.Linear(dims, dims * 2), Rearrange('b c (kv h d) -> kv b h c d', kv = 2, h = head))
-        n.out = nn.Sequential(Rearrange('b h n d -> b n (h d)'), nn.Linear(dims, dims), nn.Dropout(0.01))
-        
-        n.ln = get_norm(n_type, dims // head)
-        
-    def forward(n, x, xa=None, mask=None, pt=None, context_window=3):
-        q = n.q(x)
-        k, v = n.kv(aorb(xa, x))
-        b, h, c, d = q.shape 
-        scale = d ** -0.5
-
-        if pt is not None: c = n.c(pt)
-        else: c = torch.zeros_like(x, requires_grad=False)
-
-        triplet_scores = torch.zeros(b, h, c, c, device=device, requires_grad=False)
-
-        for i in range(c):
-            for j in range(c):
-                context_start = max(0, min(i, j) - context_window)
-                context_end = min(c, max(i, j) + context_window)
-                
-                for k in range(context_start, context_end): 
-                    score = (q[:, :, i, :] * k[:, :, j, :] * c[:, :, k, :]).sum(dim=-1)
-                    triplet_scores[:, :, i, j] += score
-
-        qk = einsum('b h k d, b h q d -> b h k q', q, k) * scale + triplet_scores
-        if have(mask): qk = qk + mask[:c, :c]
-        qk = torch.nn.functional.softmax(qk, dim=-1)
-        wv = einsum('b h k q, b h q d -> b h k d', qk, v) 
-        return n.out(wv)
-
-# class tgate(nn.Module):
-#     def __init__(n, dims, num_types=2):
-#         super().__init__()
-
-#         n.gates = nn.ModuleList([nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()) for _ in range(num_types)])
-#         n.classifier = nn.Sequential(nn.Linear(dims, num_types), nn.Softmax(dim=-1))
-
-#     def forward(n, x):
-#         types = n.classifier(x)
-#         gates = torch.stack([gate(x) for gate in n.gates], dim=-1)
-#         return  torch.sum(gates * types.unsqueeze(2), dim=-1)
 
 class gate(nn.Module):
     def __init__(n, dims, num_types):
         super().__init__()
 
-        n.gates = nn.ModuleList([nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()) for _ in range(num_types)])
+        n.gates = nn.ModuleList([nn.Sequential(nn.Linear(dims, dims), nn.Sigmoid()) for _ in range(num_types)])
         n.features = nn.Sequential(nn.Linear(dims, num_types), nn.Softmax(dim=-1))
         n.top = nn.Linear(dims, num_types)
         n.alpha = nn.Parameter(torch.ones(1), requires_grad=True)
@@ -281,6 +275,18 @@ class gate(nn.Module):
         type.scatter_(-1, indices, torch.nn.functional.softmax(types, dim=-1))
         features = torch.sigmoid(n.alpha) * type + (1 - torch.sigmoid(n.alpha)) * n.features(x)
         return torch.sum(torch.stack([gate(x) for gate in n.gates], dim=-1) * features.unsqueeze(2), dim=-1)
+
+class tgate(nn.Module):
+    def __init__(n, dims, num_types=2):
+        super().__init__()
+
+        n.ga = nn.ModuleList([nn.Sequential(nn.Linear(dims, dims), nn.Sigmoid()) for _ in range(num_types)])
+        n.cs = nn.Sequential(nn.Linear(dims, num_types), nn.Softmax(dim=-1))
+
+    def forward(n, x):
+        types = n.cs(x)
+        ga = torch.stack([g(x) for g in n.ga], dim=-1)
+        return  torch.sum(ga * types.unsqueeze(2), dim=-1)
 
 class Router(nn.Module):
     def __init__(n, dims, num_types):
@@ -315,31 +321,17 @@ class residual(nn.Module):
         
         n.attn = attention(dims, head, layer, n_type=n_type)
         n.router = Router(dims, num_types=3)
-        # n.attn_pass = attn_pass(dims, head, layer, act, n_type)
         n.gate = gate(dims, num_types=num_types)
-        n.mlp = nn.Sequential(n.ln, nn.Linear(dims, dims*num_types), get_activation(act), nn.Linear(dims*num_types, dims))
+
+        n.mlp = nn.Sequential(n.ln, tgate(dims, num_types=num_types), 
+                              nn.Linear(dims, dims*num_types), get_activation(act), nn.Linear(dims*num_types, dims), n.ln)
 
     def forward(n, x, xa=None, mask=None, pt=None):
-        x = x + n.attn(n.ln(x), mask=mask, pt=pt)
-
+        x = n.router(*[x for _ in range(n.layer)]) + n.attn(n.ln(x), mask=mask, pt=pt)
         if xa is not None: 
             xa = xa + n.audio(xa.shape[1], xa.shape[-1]).to(device, dtype)
-            # xa = xa + n.gate(xa)
-            # xa = n.router(*[xa if xa is not None else x for _ in range(n.layer)]) 
-            x = x + n.attn(n.ln(x), xa=xa, pt=pt)
-
-        return x + n.mlp(x) 
-
-# class attn_pass(nn.Module):
-#     def __init__(n, dims, head, layer, act, n_type, skip=True, pattern=None):
-#         super().__init__()
-        
-#         n.layers = nn.ModuleList()
-#         for i in range(layer): n.layers.append(residual(dims, head, layer, act, n_type, skip=skip and i in skip, pattern=pattern[i] if pattern else None))
-
-#     def forward(n, x, override=None):
-#         for i, layer in enumerate(n.layers): x = layer(x, skip=i, pattern=override[i] if override else None)
-#         return x
+            x = x + n.attn(n.ln(x), xa=n.router(*[xa for _ in range(n.layer)]), pt=pt)
+        return x + n.mlp(x).to(device, dtype)
 
 # class attn_pass(nn.Module):
 #     def __init__(n, dims, head, layer, act, n_type, blocks=[residual]):
@@ -362,66 +354,53 @@ class residual(nn.Module):
 class processor(nn.Module):
     def __init__(n, tokens, mels, dims, head, layer, act, n_type, ctx=2048): 
         super().__init__()
-        
+
+        n.dims = dims
         n.ln = get_norm(n_type, dims)
 
-        n.token = nn.Embedding(tokens, dims) 
+        n.token = nn.Embedding(tokens, dims)
+        n.pitch_tokens = nn.Embedding(1024, dims) 
         n.position = nn.Parameter(torch.ones(ctx, dims), requires_grad=True)
         n.blend = nn.Parameter(torch.tensor(0.5), requires_grad=True)
 
-        # n.block_main: Iterable[residual2] = nn.ModuleList(
-        #     [residual2(dims, head, layer, act, n_type) for _ in range(layer)]) 
-
-        # n.blocks: Iterable[residual] = attn_pass(dims, head, layer, act, n_type, block_types=[residual]).layers
         n.block: Iterable[residual] = nn.ModuleList(
             [residual(dims, head, layer, act, n_type) for _ in range(layer)]) 
-        # n.blocks: Iterable[attn_pass] = nn.ModuleList(
-        #     [attn_pass(dims, head, layer, act, n_type) for _ in range(layer // 2)]) 
         
         n.register_buffer("mask", torch.empty(ctx, ctx).fill_(-np.inf).triu_(1), persistent=False)
+       
+    def quantize_pitch(n, xa = None, pt = None, num_bins = 256, v_min = -2.0, v_max = 2.0, embedding=False):
+        indices = ((pt - v_min) / (v_max - v_min) * (num_bins - 1)).round()
+        tensor = torch.clamp(indices, 0, num_bins - 1)
+        tensor = torch.polar(xa, tensor) if xa is not None else tensor
+        tensor = torch.view_as_real(tensor) if xa is not None else tensor
+        return nn.Embedding(tensor, n.dims) if embedding else tensor
 
     def forward(n, x, xa=None, seq=False) -> Tensor:
-
-        xa, xb, xc, pt = (xa.pop(k, None) for k in ('a', 'b', 'c', 'pt')) if isinstance(xa, TensorDict) else (None, None, None, None)
-
         blend = torch.sigmoid(n.blend)
-        x = (n.token(x) + n.position[:x.shape[-1]]).to(device, dtype)
+        mask = n.mask[:x.shape[1], :x.shape[1]]
+
+        x1 = n.token(x)    
+        if xa['pt'] is not None:
+            pt = n.quantize_pitch(pt=xa['pt'])
+            x2 = n.pitch_tokens(pt)
+            x1 = x1 + x2 
+
+        x = (x1 + n.position[:x.shape[-1]]).to(device, dtype)
 
         for i in n.block:
-            a = i(x,  mask=n.mask, pt=pt)
-            b = i(a, xa=i(xa, pt=pt))
-            c = i(b, xa=i(xb, pt=pt))
-            d = i(c, xa=i(xc, pt=pt))
+            a = i(x, mask=mask, pt=None)
+            b = i(a, xa=i(xa['a']), pt=None)
+            c = i(b, xa=i(xa['b']), pt=None)
+            d = i(c, xa=i(xa['c']), pt=None)
 
             # for j in [(xa), (xb), (xc)]: e = i(x, xa=i(j, pt=pt))
+            # e = torch.mean(torch.stack([xa, xb, xc]), dim=0)
             e = a + b + c
             f = torch.cat([d, e], dim=1)
             g = i(x=f[:, :x.shape[1]], xa=f[:, x.shape[1]:])
-            x = g if seq else blend * (d) + (1 - blend) * g 
-
+        
+        x = g if seq else blend * (d) + (1 - blend) * g if g is not None else a
         return (n.ln(x) @ torch.transpose(n.token.weight.to(dtype), 0, 1)).float()
-
-    # def forward(n, x, xa=None, seq=False) -> Tensor:
-
-    #     xa, xb, xc, pt = (xa.pop(k, None) for k in ('a', 'b', 'c', 'pt')) if isinstance(xa, TensorDict) else (None, None, None, None)
-
-    #     blend = torch.sigmoid(n.blend)
-    #     x = (n.token(x) + n.position[:x.shape[-1]]).to(device, dtype)
-
-    #     for i in n.block:
-    #         a = i(x, mask=n.mask)
-    #         b = i(a, xa=i(xa))
-    #         c = i(b, xa=i(xb))
-    #         d = i(c, xa=i(xc))
-
-    #         # e = torch.mean(torch.stack([xa, xb, xc]), dim=0)
-    #         e = a + b + c
-    #         f = torch.cat([d, e], dim=1)
-    #         g = i(x=f[:, :x.shape[1]], xa=f[:, x.shape[1]:])
-
-    #     x = g if seq else blend * (d) + (1 - blend) * g if g is not None else a
-
-    #     return (n.ln(x) @ torch.transpose(n.token.weight.to(dtype), 0, 1)).float()
 
 class Model(nn.Module):
     def __init__(n, param: Dimensions):
@@ -438,7 +417,7 @@ class Model(nn.Module):
             n_type=param.n_type,
             )
 
-        n.enc = AudioEncoder(param.mels, param.dims, param.head, param.act, param.n_type, norm=False, enc=False)
+        n.enc = AudioEncoder(param.mels, param.dims, param.head, param.layer, param.act, param.n_type, norm=False, enc=False)
 
         n.layer = 0
         for name, module in n.named_modules():
@@ -453,11 +432,11 @@ class Model(nn.Module):
             'a': aborc(pitch, spectrogram, waveform),
             'b': aborc(spectrogram, pitch, waveform),
             'c': aborc(waveform, pitch, spectrogram),
+            'pt': pitch_tokens,
             }, batch_size=fx.shape[0])
 
         x = text_ids
         xa = n.enc(no_none(xa))
-        xa['pt'] = pitch_tokens
         output = n.processor(x, xa, seq=False)
 
         loss = None
@@ -467,30 +446,33 @@ class Model(nn.Module):
         return {"logits": output, "loss": loss}
 
     @torch.no_grad()
-    def generate(n, spectrogram=None, pitch=None, waveform=None, pitch_tokens=None, max_new_tokens=100):
-
+    def generate(n, spectrogram=None, pitch=None, waveform=None, pitch_tokens=None, max_new_tokens=150):
+        n.eval()
         fx = next((t for t in (pitch, spectrogram, waveform) if t is not None), None)
-        xa = TensorDict({
+
+        xa_dict = TensorDict({
             'a': aborc(pitch, spectrogram, waveform),
             'b': aborc(spectrogram, pitch, waveform),
             'c': aborc(waveform, pitch, spectrogram),
-        }, batch_size=fx.shape[0])
+        }, batch_size=fx.shape[0]).to(device)
         
-        xa = n.enc(no_none(xa))
+        xa_enc = n.enc(no_none(xa_dict))
         if pitch_tokens is not None:
-            xa['pt'] = pitch_tokens 
+            xa_enc['pt'] = pitch_tokens 
 
         y = torch.tensor([[1]], dtype=torch.long, device=device).repeat(fx.shape[0], 1)
+        
         for _ in range(max_new_tokens):
-            logits = n.processor(y, xa, seq=True) 
+            logits = n.processor(y, xa_enc.clone(), seq=True) 
+            
             next_token_logits = logits[:, -1, :]
             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
             
             y = torch.cat((y, next_token), dim=1)
             if (next_token == 2).all():
                 break
-        
-        return y   
+                
+        return y
 
     def _init_w(n, m):
         n.counts = {"Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0, "Conv2d": 0, "processor": 0, "attention": 0, "Residual": 0}
@@ -512,8 +494,13 @@ class Model(nn.Module):
     
 def main():
 
-    metadata_file = "./LJSpeech1000/metadata.csv"
-    data_dir = "./LJSpeech1000"
+    logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    metadata_file = "./lb1/metadata.csv"
+    data_dir = "./lb1"
+
+    # metadata_file = "./LJSpeech1000/metadata.csv"
+    # data_dir = "./LJSpeech1000"
     # metadata_file = "./cv17_1000/metadata.csv"
     # data_dir = "./cv17_1000"
 
@@ -560,11 +547,12 @@ def main():
     )
 
     optimizer = MaxFactor(model.parameters(), lr=0.025, beta_decay=-0.8, 
-                   eps=(1e-10, 1e-3), d=1.0, w_decay=0.01, gamma=0.99, max=False, bias=1)
-    scheduler = FAMScheduler2(optimizer, warmup_steps=100, total_steps=1000, 
+                   eps=(1e-8, 1e-3), d=1.0, w_decay=0.01, gamma=0.99, max=False, bias=1, clip=False, cap=0.0)
+    scheduler = FAMScheduler2(optimizer, warmup_steps=10, total_steps=100, 
                  decay_start_step=None, warmup_start_lr=1e-6, eta_min=1e-6, last_epoch=-1) 
 
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=0)
+    # loss_fn = torch.nn.functional.cross_entropy(ignore_index=0)
 
     train_and_evaluate(
         model=model,
@@ -575,16 +563,18 @@ def main():
         scheduler=scheduler,
         loss_fn=loss_fn,
         metric_fn=metrics_fn,
-        max_steps=1000,
+        max_steps=100,
         device="cuda",
         acc_steps=1,
         clear_cache=False,
         log_interval=10,
-        eval_interval=100,
-        save_interval=1000,
+        eval_interval=0,
+        save_interval=0,
+        warmup_interval=10,
         checkpoint_dir=log_dir,
         log_dir=log_dir,
         generate=False,
+        clip_grad_norm=0.0,
     )
 
     print(f"Train dataset size: {len(train_dataset)}")
