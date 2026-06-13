@@ -61,45 +61,125 @@ def sinusoids(ctx, dims, theta=THETA):
     positional_embedding = nn.Parameter(torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=1), requires_grad=False)
     return positional_embedding    
 
-class LocalNorm(nn.Module):
-    def __init__(n, size: int = 5, alpha: float = 1e-4, beta: float = 0.75, k: float = 1.0, mode: str = '1', threshold: float = 0.8):
+# class AbbyNormal(nn.Module):
+#     def __init__(n, dims, size: int = 5, alpha: float = 1e-4, beta: float = 0.75, k: float = 1.0, threshold: float = 0.8):
+#         super().__init__()
+#         n.size = size
+#         n.alpha = alpha
+#         n.beta = beta
+#         n.k = k
+#         n.mode  = nn.Sequential(
+#             nn.Linear(dims, dims),
+#             nn.SiLU(),
+#             nn.Linear(dims, 3))
+#         n.threshold = threshold
+
+#     def forward(n, x: Tensor, confidence=None, action=1) -> Tensor:
+
+#         # sizes = input.size()
+#         # blend_weight = torch.sigmoid(cv - n.threshold) # 1 if very spiky, 0 if flat
+#         # div_mode1 = avg_d
+#         # condition = (max_d > 2.0 * avg_d).float()
+#         # div_mode2 = (condition * max_d) + ((1 - condition) * avg_d)
+#         # div = (blend_weight * div_mode2) + ((1 - blend_weight) * div_mode1)
+
+#         if x.numel() == 0:
+#             return x
+
+#         size = max(3, int(x.size(-1) * 0.05))
+#         if size % 2 == 0:
+#             size += 1
+            
+#         pad_len = size // 2
+#         div = x.mul(x).unsqueeze(1) 
+        
+#         mean_val = x.abs().mean(dim=-1, keepdim=True)
+#         std_val = x.std(dim=-1, keepdim=True)
+#         cv = std_val / (mean_val + 1e-6)
+#         if cv.mean() > n.threshold: 
+#             action > 1
+#         else:
+#             action < 1
+
+#         decisions = F.gumbel_softmax(n.mode(x), tau=1.0, hard=True)
+#         n.threshold = decisions.argmax(dim=-1).item()
+
+#         pad_len = n.size // 2
+#         if action <= 1:
+#             div = F.avg_pool1d(div, kernel_size=n.size, stride=1, padding=pad_len)
+
+#         elif action > 1: # if dim == 3:?
+#             avg_d = F.avg_pool1d(div, kernel_size=n.size, stride=1, padding=pad_len)
+#             max_d = F.max_pool1d(div, kernel_size=n.size, stride=1, padding=pad_len)
+#             condition = (max_d > 2.0 * avg_d).float()
+#             div = (condition * max_d) + ((1 - condition) * avg_d)
+
+#         else:
+#             avg_d = F.avg_pool1d(div, kernel_size=n.size, stride=1, padding=pad_len)
+#             max_d = F.max_pool1d(div, kernel_size=n.size, stride=1, padding=pad_len)
+            
+#             if confidence is None:
+#                 div = avg_d
+#             else:
+#                 conf_mask = (confidence > n.threshold).float().unsqueeze(1)
+#                 div = (conf_mask * avg_d) + ((1 - conf_mask) * max_d)
+
+#         div = div.narrow(2, 0, x.size(1)).squeeze(1)
+#         denom = div.mul(n.alpha).add(n.k).pow(n.beta)
+#         return x / denom
+
+class AbbyNormal(nn.Module):
+    def __init__(n, dims, size: int = 5, alpha: float = 1e-4, beta: float = 0.75, k: float = 1.0, threshold: float = 0.8):
         super().__init__()
         n.size = size
         n.alpha = alpha
         n.beta = beta
         n.k = k
-        n.mode = mode
         n.threshold = threshold
-
-    def forward(n, input: Tensor, confidence=None) -> Tensor:
-        if input.numel() == 0:
-            return input
-
-        div = input.mul(input).unsqueeze(1) 
         
-        pad_len = n.size // 2
-        if n.mode == "1":
-            div = F.avg_pool1d(div, kernel_size=n.size, stride=1, padding=pad_len)
+        n.mode_router = nn.Sequential(
+            nn.Linear(dims, dims),
+            nn.SiLU(),
+            nn.Linear(dims, 3)
+        )
 
-        elif n.mode == "2":
-            avg_d = F.avg_pool1d(div, kernel_size=n.size, stride=1, padding=pad_len)
-            max_d = F.max_pool1d(div, kernel_size=n.size, stride=1, padding=pad_len)
-            condition = (max_d > 2.0 * avg_d).float()
-            div = (condition * max_d) + ((1 - condition) * avg_d)
+    def forward(n, x: Tensor, confidence=None) -> Tensor:
+        if x.numel() == 0:
+            return x
 
-        elif n.mode == "3":
-            avg_d = F.avg_pool1d(div, kernel_size=n.size, stride=1, padding=pad_len)
-            max_d = F.max_pool1d(div, kernel_size=n.size, stride=1, padding=pad_len)
-            
-            if confidence is None:
-                div = avg_d
-            else:
-                conf_mask = (confidence > n.threshold).float().unsqueeze(1)
-                div = (conf_mask * avg_d) + ((1 - conf_mask) * max_d)
+        size = max(3, int(x.size(-1) * 0.05))
+        if size % 2 == 0:
+            size += 1
+        pad_len = size // 2
+        
+        div = x.mul(x).unsqueeze(1) 
+        logits = n.mode_router(x)
+        mean_val = x.abs().mean(dim=-1, keepdim=True)
+        std_val = x.std(dim=-1, keepdim=True)
+        cv = std_val / (mean_val + 1e-6)
 
-        div = div.narrow(2, 0, input.size(1)).squeeze(1)
+        decisions = F.gumbel_softmax(logits + cv, tau=1.0, hard=True) 
+        avg_d = F.avg_pool1d(div, kernel_size=size, stride=1, padding=pad_len)
+        max_d = F.max_pool1d(div, kernel_size=size, stride=1, padding=pad_len)
+  
+        div_mode1 = avg_d
+        condition = (max_d > 2.0 * avg_d).float()
+        div_mode2 = (condition * max_d) + ((1 - condition) * avg_d)
+        
+        if confidence is None:
+            div_mode3 = avg_d
+        else:
+            conf_mask = (confidence > n.threshold).float().unsqueeze(1)
+            div_mode3 = (conf_mask * avg_d) + ((1 - conf_mask) * max_d)
+
+        d0 = decisions[..., 0].unsqueeze(1)
+        d1 = decisions[..., 1].unsqueeze(1)
+        d2 = decisions[..., 2].unsqueeze(1)
+        
+        div = (d0 * div_mode1) + (d1 * div_mode2) + (d2 * div_mode3)
+        div = div.narrow(2, 0, x.size(1)).squeeze(1)
         denom = div.mul(n.alpha).add(n.k).pow(n.beta)
-        return input / denom
+        return x / denom
 
 class LayerNorm(nn.Module):
     def __init__(n, dims, eps=1e-5):
@@ -148,7 +228,7 @@ def get_norm(n_type: str, dims: Optional[int] = None, num_groups: Optional[int] 
         "adanormal": lambda: AdaLN(dims=dims),
         "rmsnorm": lambda: nn.RMSNorm(normalized_shape=dims),        
         "groupnorm": lambda: nn.GroupNorm(num_groups=num_groups, num_channels=dims),
-        "localnorm": lambda: LocalNorm(size=5),
+        "AbbyNormal": lambda: AbbyNormal(dims, size = 5, alpha = 1e-4, beta = 0.75, k = 1.0, threshold = 0.8),
         }
    
     norm_func = norm_map.get(n_type)
