@@ -4,7 +4,6 @@ from typing import Iterable
 from torch.nn.utils.parametrizations import weight_norm
 from functools import partial
 from dataclasses import dataclass
-# pyrefly: ignore [missing-import]
 from einops.layers.torch import Rearrange
 from optimizerc import FAMScheduler2, MaxFactor, MaxFactorA, MaxFactorB, MaxFactor1, MaxFactor2
 from torch.utils.data import DataLoader    
@@ -28,12 +27,6 @@ class Dimensions:
     act: str
     n_type: str
 
-def l2norm(t):
-    return torch.nn.functional.normalize(t, dim = -1)
-
-def Sequential(*modules):
-    return nn.Sequential(*filter(have, modules))  
-
 def have(a):
     return a is not None  
 
@@ -45,6 +38,12 @@ def aborc(a, b, c):
 
 def abcord(a, b, c, d):
     return aorb(a, aborc(b, c, d))
+
+def l2norm(t):
+    return torch.nn.functional.normalize(t, dim = -1)
+
+def Sequential(*modules):
+    return nn.Sequential(*filter(have, modules))  
 
 def no_none(xa):
     return xa.apply(lambda tensor: tensor if tensor is not None else None)
@@ -72,12 +71,12 @@ def sinusoids(ctx, dims, theta=THETA):
 #             nn.Linear(dims, dims),
 #             nn.SiLU(),
 #             nn.Linear(dims, 3))
-#         n.threshold = threshold
+#         n.tx = threshold
 
 #     def forward(n, x: Tensor, confidence=None, action=1) -> Tensor:
 
 #         # sizes = input.size()
-#         # blend_weight = torch.sigmoid(cv - n.threshold) # 1 if very spiky, 0 if flat
+#         # blend_weight = torch.sigmoid(cv - n.tx) # 1 if very spiky, 0 if flat
 #         # div_mode1 = avg_d
 #         # condition = (max_d > 2.0 * avg_d).float()
 #         # div_mode2 = (condition * max_d) + ((1 - condition) * avg_d)
@@ -96,13 +95,13 @@ def sinusoids(ctx, dims, theta=THETA):
 #         mean_val = x.abs().mean(dim=-1, keepdim=True)
 #         std_val = x.std(dim=-1, keepdim=True)
 #         cv = std_val / (mean_val + 1e-6)
-#         if cv.mean() > n.threshold: 
+#         if cv.mean() > n.tx: 
 #             action > 1
 #         else:
 #             action < 1
 
 #         decisions = F.gumbel_softmax(n.mode(x), tau=1.0, hard=True)
-#         n.threshold = decisions.argmax(dim=-1).item()
+#         n.tx = decisions.argmax(dim=-1).item()
 
 #         pad_len = n.size // 2
 #         if action <= 1:
@@ -121,7 +120,7 @@ def sinusoids(ctx, dims, theta=THETA):
 #             if confidence is None:
 #                 div = avg_d
 #             else:
-#                 conf_mask = (confidence > n.threshold).float().unsqueeze(1)
+#                 conf_mask = (confidence > n.tx).float().unsqueeze(1)
 #                 div = (conf_mask * avg_d) + ((1 - conf_mask) * max_d)
 
 #         div = div.narrow(2, 0, x.size(1)).squeeze(1)
@@ -135,7 +134,7 @@ class AbbyNormal(nn.Module):
         n.alpha = alpha
         n.beta = beta
         n.k = k
-        n.threshold = threshold
+        n.tx = threshold
         
         n.mode_router = nn.Sequential(
             nn.Linear(dims, dims),
@@ -169,7 +168,7 @@ class AbbyNormal(nn.Module):
         if confidence is None:
             div_mode3 = avg_d
         else:
-            conf_mask = (confidence > n.threshold).float().unsqueeze(1)
+            conf_mask = (confidence > n.tx).float().unsqueeze(1)
             div_mode3 = (conf_mask * avg_d) + ((1 - conf_mask) * max_d)
 
         d0 = decisions[..., 0].unsqueeze(1)
@@ -304,6 +303,46 @@ class AudioEncoder(nn.Module):
         else:
             return n._process_feature(x)
 
+class RotaryModulator(nn.Module):
+    def __init__(n, dims, head, pt_tensor: torch.Tensor, p_tensor: torch.Tensor = None, num_bins: int = 256, v_min: float = -2.0, v_max: float = 2.0, embedding=False, rev=False):
+        super().__init__()
+        n.dims = dims
+        n.head_dim = dims // head
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, n.head_dim, 2).float() / n.head_dim))
+        n.register_buffer("inv_freq", inv_freq)
+
+    def quantize_pitch(n, xa = None, pt = None, num_bins = 256, v_min = -2.0, v_max = 2.0, embedding=False):
+        indices = ((pt - v_min) / (v_max - v_min) * (num_bins - 1)).round().long()
+        tensor = torch.clamp(indices, 0, num_bins - 1)
+        tensor = torch.polar(xa, tensor) if xa is not None else tensor
+        tensor = torch.view_as_real(tensor) if xa is not None else tensor
+        return nn.Embedding(tensor, n.dims) if embedding else tensor
+
+    def forward(n, pitch_embedding: Tensor, pitch_tokens: Tensor):
+
+        B, L, D = pitch_embedding.shape
+        device = pitch_embedding.device
+        t = torch.arange(L, device=device, dtype=pitch_embedding.dtype)
+        modulated_t = t.unsqueeze(0) * pitch_tokens.unsqueeze(-1)
+        freqs = torch.einsum('bl,d->bld', modulated_t, n.inv_freq)
+        mag = torch.log1p(torch.abs(pitch_tokens).unsqueeze(-1))
+
+        sin_table = mag * torch.sin(freqs)
+        cos_table = mag * torch.cos(freqs)
+        
+        x_left = pitch_embedding[..., 0::2]
+        x_right = pitch_embedding[..., 1::2]
+        sin_table = sin_table.repeat_interleave(2, dim=-1)
+        cos_table = cos_table.repeat_interleave(2, dim=-1)
+
+        rotated_x = (pitch_embedding * cos_table) + (n._rotate_half(pitch_embedding) * sin_table)
+        return rotated_x
+
+    def _rotate_half(n, x):
+        x1 = x[..., 0::2]
+        x2 = x[..., 1::2]
+        return torch.cat((-x2, x1), dim=-1)
+
 class rotary(nn.Module):
     def __init__(n, dims, head):
         super().__init__()
@@ -352,199 +391,6 @@ class rotary(nn.Module):
         x1 = x1.view(s)
         return torch.cat([x1.type_as(x), x2], dim=-1)
     
-## for reference - lets give rope a memory
-
-# # mem_state comes from the ConvNeXt/Fuser block processing the PAST chunk
-# delta_m, delta_f = n.memory_proj(mem_state).chunk(2, dim=-1)
-
-# # m is your current magnitude, f is your standard time-step angle
-# warp_m = m * torch.sigmoid(delta_m)  # Modulate amplitude
-# warp_f = f + delta_f                 # Shift the phase of time itself
-
-# # The rotary embedding is now dynamically warped by the emotional memory
-# f_complex = torch.polar(warp_m, warp_f) 
-
-# class SimpleMaskDownSampler(nn.Module):
-#     """
-#     Progressively downsample a mask by total_stride, each time by stride.
-#     Note that LayerNorm is applied per *token*, like in ViT.
-
-#     With each downsample (by a factor stride**2), channel capacity increases by the same factor.
-#     In the end, we linearly project to embed_dim channels.
-#     """
-
-#     def __init__(
-#         self,
-#         embed_dim=256,
-#         kernel_size=4,
-#         stride=4,
-#         padding=0,
-#         total_stride=16,
-#         activation=nn.GELU,
-#         # Option to interpolate the input mask first before downsampling using convs. In that case, the total_stride is assumed to be after interpolation.
-#         # If set to input resolution or None, we don't interpolate. We default to None to be safe (for older configs or if not explicitly set)
-#         interpol_size=None,
-#     ):
-#         super().__init__()
-#         num_layers = int(math.log2(total_stride) // math.log2(stride))
-#         assert stride**num_layers == total_stride
-#         self.encoder = nn.Sequential()
-#         mask_in_chans, mask_out_chans = 1, 1
-#         for _ in range(num_layers):
-#             mask_out_chans = mask_in_chans * (stride**2)
-#             self.encoder.append(
-#                 nn.Conv2d(
-#                     mask_in_chans,
-#                     mask_out_chans,
-#                     kernel_size=kernel_size,
-#                     stride=stride,
-#                     padding=padding,
-#                 )
-#             )
-#             self.encoder.append(LayerNorm2d(mask_out_chans))
-#             self.encoder.append(activation())
-#             mask_in_chans = mask_out_chans
-
-#         self.encoder.append(nn.Conv2d(mask_out_chans, embed_dim, kernel_size=1))
-#         self.interpol_size = interpol_size
-#         if self.interpol_size is not None:
-#             assert isinstance(self.interpol_size, (list, tuple)), (
-#                 f"Unsupported type {type(self.interpol_size)}. Should be a list or tuple."
-#             )
-#             self.interpol_size = list(interpol_size)
-#             assert len(self.interpol_size) == 2
-
-#     def forward(self, x: torch.Tensor):
-#         if self.interpol_size is not None and self.interpol_size != list(x.shape[-2:]):
-#             x = F.interpolate(
-#                 x.float(),
-#                 size=self.interpol_size,
-#                 align_corners=False,
-#                 mode="bilinear",
-#                 antialias=True,
-#             )
-#         return self.encoder(x)
-
-# # Lightly adapted from ConvNext (https://github.com/facebookresearch/ConvNeXt)
-# class CXBlock(nn.Module):
-#     r"""ConvNeXt Block. There are two equivalent implementations:
-#     (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
-#     (2) DwConv -> Permute to (N, H, W, C); LayerNorm (channels_last) -> Linear -> GELU -> Linear; Permute back
-#     We use (2) as we find it slightly faster in PyTorch
-
-#     Args:
-#         dim (int): Number of input channels.
-#         drop_path (float): Stochastic depth rate. Default: 0.0
-#         layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
-#     """
-
-#     def __init__(
-#         self,
-#         dim,
-#         kernel_size=7,
-#         padding=3,
-#         drop_path=0.0,
-#         layer_scale_init_value=1e-6,
-#         use_dwconv=True,
-#     ):
-#         super().__init__()
-#         self.dwconv = nn.Conv2d(
-#             dim,
-#             dim,
-#             kernel_size=kernel_size,
-#             padding=padding,
-#             groups=dim if use_dwconv else 1,
-#         )  # depthwise conv
-#         self.norm = LayerNorm2d(dim, eps=1e-6)
-#         self.pwconv1 = nn.Linear(
-#             dim, 4 * dim
-#         )  # pointwise/1x1 convs, implemented with linear layers
-#         self.act = nn.GELU()
-#         self.pwconv2 = nn.Linear(4 * dim, dim)
-#         self.gamma = (
-#             nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
-#             if layer_scale_init_value > 0
-#             else None
-#         )
-#         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-
-#     def forward(self, x):
-#         input = x
-#         x = self.dwconv(x)
-#         x = self.norm(x)
-#         x = x.permute(0, 2, 3, 1)  # (N, C, H, W) -> (N, H, W, C)
-#         x = self.pwconv1(x)
-#         x = self.act(x)
-#         x = self.pwconv2(x)
-#         if self.gamma is not None:
-#             x = self.gamma * x
-#         x = x.permute(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
-
-#         x = input + self.drop_path(x)
-#         return x
-
-# class SimpleFuser(nn.Module):
-#     def __init__(self, layer, num_layers, dim=None, input_projection=False):
-#         super().__init__()
-#         self.proj = nn.Identity()
-#         self.layers = get_clones(layer, num_layers)
-
-#         if input_projection:
-#             assert dim is not None
-#             self.proj = nn.Conv2d(dim, dim, kernel_size=1)
-
-#     def forward(self, x):
-#         # normally x: (N, C, H, W)
-#         x = self.proj(x)
-#         for layer in self.layers:
-#             x = layer(x)
-#         return x
-
-# class SimpleMaskEncoder(nn.Module):
-#     def __init__(
-#         self,
-#         out_dim,
-#         mask_downsampler,
-#         fuser,
-#         position_encoding,
-#         in_dim=256,  # in_dim of pix_feats
-#     ):
-#         super().__init__()
-
-#         self.mask_downsampler = mask_downsampler
-
-#         self.pix_feat_proj = nn.Conv2d(in_dim, in_dim, kernel_size=1)
-#         self.fuser = fuser
-#         self.position_encoding = position_encoding
-#         self.out_proj = nn.Identity()
-#         if out_dim != in_dim:
-#             self.out_proj = nn.Conv2d(in_dim, out_dim, kernel_size=1)
-
-#     def forward(
-#         self,
-#         pix_feat: torch.Tensor,
-#         masks: torch.Tensor,
-#         skip_mask_sigmoid: bool = False,
-#     ) -> Tuple[torch.Tensor, torch.Tensor]:
-#         ## Process masks
-#         # sigmoid, so that less domain shift from gt masks which are bool
-#         if not skip_mask_sigmoid:
-#             masks = F.sigmoid(masks)
-#         masks = self.mask_downsampler(masks)
-
-#         ## Fuse pix_feats and downsampled masks
-#         # in case the visual features are on CPU, cast them to CUDA
-#         pix_feat = pix_feat.to(masks.device)
-
-#         x = self.pix_feat_proj(pix_feat)
-#         x = x + masks
-#         x = self.fuser(x)
-#         x = self.out_proj(x)
-
-#         pos = self.position_encoding(x).to(x.dtype)
-
-#         return {"vision_features": x, "vision_pos_enc": [pos]}
-
 class OneShot(nn.Module):
     def __init__(n, dims: int, head: int, scale: float = 0.3, features: Optional[List[str]] = None):
         super().__init__()
@@ -582,32 +428,30 @@ class attention(nn.Module):
         n.ln = get_norm(n_type, dims // head)
         n.rot = rotary(dims, head)
 
-    def forward(n, x, xa=None, mask=None, pt=None, skip=False, pattern=None, window=3, zero=False, pitch_bias=None): 
+    def forward(n, x, xa=None, mask=None, pt=None, window=3, pitch_bias=None): 
         
         b, c, d = x.shape
         k, v = n.kv(aorb(xa, x))
         q = n.q(x)
 
-        if zero:
-            if n.rbf:
-                qk = n.rbf_scores(q * n.scale, k * n.scale, rbf_sigma=1.0, rbf_ratio=0.3)
-            if n.use_pbias:
-                pbias = pitch_bias(xa) 
-                if pbias is not None:
-                    qk = qk + pbias[:,:,:q,:q]
+        if n.rbf:
+            qk = n.rbf_scores(q * n.scale, k * n.scale, rbf_sigma=1.0, rbf_ratio=0.3)
+            pb = pitch_bias(xa) 
+            if pb is not None:
+                qk = qk + pb[:,:,:q,:q]
 
-            token_ids = k[:, :, :, 0]
-            zscale = torch.ones_like(token_ids)
-            fzero = torch.clamp(F.softplus(n.fzero), n.minz, n.maxz)
-            zscale[token_ids.float() == n.pad_token] = fzero
+            ids = k[:, :, :, 0]
+            scale = torch.ones_like(ids)
+            fz = torch.clamp(F.softplus(n.fz), n.minz, n.maxz)
+            scale[ids.float() == n.pad] = fz
             
             if mask is not None:
                 if mask.dim() == 4:
                     mask = mask[0, 0]
                 mask = mask[:q, :k] if xa is not None else mask[:q, :q]
-                qk = qk + mask * zscale.unsqueeze(-2).expand(qk.shape)
+                qk = qk + mask * scale.unsqueeze(-2).expand(qk.shape)
 
-            qk = qk * zscale.unsqueeze(-2)
+            qk = qk * scale.unsqueeze(-2)
             w = F.softmax(qk, dim=-1).to(q.dtype)
             wv = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
 
@@ -662,88 +506,88 @@ class STthreshold(torch.autograd.Function):
 
 apply_ste = STthreshold.apply
 
-class voltage_gate(nn.Module):
+class v_gate(nn.Module):
     def __init__(n, dims, mem=64, thresh=0.5):
         super().__init__()
         n.mkey = nn.Parameter(torch.randn(mem, dims))
         n.mval = nn.Parameter(torch.randn(mem, 1))
         n.mlp = nn.Sequential(nn.Linear(dims, dims // 2), nn.SiLU(), nn.Linear(dims // 2, 1))
         
-        n.threshold = nn.Parameter(torch.tensor(thresh, dtype=dtype), requires_grad=False)
+        n.tx = nn.Parameter(torch.tensor(thresh, dtype=dtype), requires_grad=False)
         n.concat = nn.Linear(2, 1, device=device, dtype=dtype)
 
     def forward(n, x):
         key = F.softmax(torch.matmul(F.normalize(x, p=2, dim=-1), F.normalize(n.mkey, p=2, dim=-1).transpose(0, 1)) / math.sqrt(x.shape[-1]), dim=-1)
         x_val = n.concat(torch.cat((torch.matmul(key, n.mval), n.mlp(x)), dim=-1))
         
-        survival_mask = apply_ste(x_val, n.threshold)
-        return survival_mask, x_val
+        smask = apply_ste(x_val, n.tx)
+        return smask, x_val
 
-    def update_threshold(n, loss, current_loss_ema, lr=0.01):
-        if loss > current_loss_ema:
-            n.threshold.sub_(lr)
+    def update_threshold(n, loss, cema, lr=0.01):
+        if loss > cema:
+            n.tx.sub_(lr)
         else:
-            n.threshold.add_(lr)
-        n.threshold.data = torch.clamp(n.threshold.data, 0.05, 0.95)
+            n.tx.add_(lr)
+        n.tx.data = torch.clamp(n.tx.data, 0.05, 0.95)
 
-class NodeOfRanvier(nn.Module):
-    def __init__(n, dims, expand=2):
+class r_node(nn.Module):
+    def __init__(n, dims, exp=2):
         super().__init__()
         n.dims = dims
-        n.expand = expand
-        n.parallel = nn.ModuleList([nn.Linear(dims, dims) for _ in range(expand)])
-        n.network = nn.Linear(dims, dims)
+        n.exp = exp
+        n.par = nn.ModuleList([nn.Linear(dims, dims) for _ in range(exp)])
+        n.net = nn.Linear(dims, dims)
         n.relu = nn.ReLU()
 
     def forward(n, x):
-        features = torch.stack([pathway(x) for pathway in n.parallel])
-        weights = torch.softmax(n.network(x), dim=-1)
-        weighted =  torch.sum(weights * features.unsqueeze(2), dim=-1)
-        return n.relu(weighted)
+        feat = torch.stack([path(x) for path in n.par])
+        wts = torch.softmax(n.net(x), dim=-1)
+        wtd =  torch.sum(wts * feat.unsqueeze(2), dim=-1)
+        return n.relu(wtd)
 
-class MacroPolicyNet(nn.Module):
-    def __init__(n, dims, max_jump=2):
+class MPNet(nn.Module):
+    def __init__(n, dims, jump=2):
         super().__init__()
         n.net = nn.Sequential(
             nn.Linear(dims, 128),
             nn.SiLU(),
-            nn.Linear(128, max_jump + 1)
+            nn.Linear(128, jump + 1)
         )
         
-    def forward(n, pooled_features):
-        return F.softmax(n.net(pooled_features), dim=-1)
+    def forward(n, pooled):
+        return F.softmax(n.net(pooled), dim=-1)
 
-class MyelinatedSheath(nn.Module):
-    def __init__(n, dims, head, layer, mini_hc=False, hc_expansion_rate=2):
+class MSheath(nn.Module):
+    def __init__(n, dims, head, layer, mini_hc=False, rate=2):
         super().__init__()
         n.layer = layer
         n.dims = dims
-        n.learn_jumps = True  
-        n.jump_statistics = {0: 0, 1: 0, 2: 0} 
+        n.l_jump = True  
+        n.jstat = {0: 0, 1: 0, 2: 0} 
         
-        n.shared_head = AdaptiveSpan(dims, head)
-        n.work_mem = nn.Parameter(torch.zeros(1, 1, dims), requires_grad=True)
+        n.shared_head = AdaptiveSpan(dims, head, max_dist=1)
+        n.mem_w = nn.Parameter(torch.zeros(1, 1, dims), requires_grad=True)
         n.mem_gate = nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid())
         
-        n.jump_weights = nn.Parameter(torch.tensor([0.1, 0.05, 0.01]), requires_grad=True)
+        n.jump_s = nn.Parameter(torch.tensor([0.1, 0.05, 0.01]), requires_grad=True)
         
         n.layers = nn.ModuleList()
         for i in range(layer):
             layer_dict = {
                 'ln': nn.LayerNorm(dims),
                 'gate': nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()),
-                'voltage_gate': voltage_gate(dims, mem=64, thresh=0.3),
+                'v_gate': v_gate(dims, mem=64, thresh=0.3),
                 'adapter': nn.Linear(dims, dims) if i % 2 == 0 else None,
             }
 
             if mini_hc:
-                layer_dict['ranvier'] = NodeOfRanvier(dims, expand=hc_expansion_rate)
+                layer_dict['ranvier'] = r_node(dims, exp=rate)
             else:
                 layer_dict['ranvier'] = None
 
             n.layers.append(nn.ModuleDict(layer_dict))
 
-        n.policy_net = MacroPolicyNet(dims, max_jump=2)
+        n.pnet = MPNet(dims, jump=2)
 
         n.mlp_gate = nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid())
         n.mlp = nn.Sequential(
@@ -757,12 +601,12 @@ class MyelinatedSheath(nn.Module):
 
     def forward(n, x): 
         batch, ctx = x.shape[:2]
-        original_x = x
+        orig_x = x
         
-        work_mem = n.work_mem.expand(batch, -1, -1)
+        mem_w = n.mem_w.expand(batch, -1, -1)
         
         pooled = x.mean(dim=1)
-        policy = n.policy_net(pooled)
+        policy = n.pnet(pooled)
         
         history = []
         i = 0
@@ -770,68 +614,68 @@ class MyelinatedSheath(nn.Module):
         while i < n.layer:
             layer = n.layers[i]
             
-            ion, survival_logits = layer['voltage_gate'](x)
-            mask_layer = ion.expand(-1, ctx, n.dims)
+            ion, _ = layer['v_gate'](x)
+            mlayer = ion.expand(-1, ctx, n.dims)
             
             px = layer['ln'](x)  
 
             if layer['adapter'] is not None:
-                adapted_px = layer['adapter'](px)
+                apx = layer['adapter'](px)
             else:
-                adapted_px = px
+                apx = px
 
             if layer['ranvier'] is not None:
-                layer_out = layer['ranvier'](adapted_px)
+                out = layer['ranvier'](apx)
             else:
-                layer_out = adapted_px
+                out = apx
                 
-            gate_val = layer['gate'](px)
-            x = x + gate_val * (layer_out * mask_layer)
+            g_val = layer['gate'](px)
+            x = x + g_val * (out * mlayer)
 
             mem = x.mean(dim=1, keepdim=True)
-            mem_val = n.mem_gate(mem)
-            work_mem = mem_val * work_mem + (1 - mem_val) * mem
+            mem_v = n.mem_gate(mem)
+            mem_w = mem_v * mem_w + (1 - mem_v) * mem
             
             potential = ion.mean()
-            jump_grad = 1.0
+            jump_g = 1.0
             
             if potential < 0.1 and i < n.layer - 1:
                 action = 1
                 
             elif i < n.layer - 1:
-                if n.learn_jumps:
+                if n.l_jump:
 
-                    jump_decisions = F.gumbel_softmax(policy, tau=1.0, hard=True)
-                    action = jump_decisions.argmax(dim=-1).item()
-                    jump_grad = jump_decisions[0, action] 
+                    jump = F.gumbel_softmax(policy, tau=1.0, hard=True)
+                    action = jump.argmax(dim=-1).item()
+                    jump_g = jump[0, action] 
                 else:    
                     action = torch.multinomial(policy, 1).squeeze(-1).item()
             else:
                 action = 0
                 
-            if action in n.jump_statistics:
-                n.jump_statistics[action] += batch
+            if action in n.jstat:
+                n.jstat[action] += batch
             else:
-                n.jump_statistics[action] = batch
+                n.jstat[action] = batch
                 
             if action > 0:
-                jump_distance = action
-                i_next = min(i + jump_distance + 1, n.layer)
-                jump_weight = n.jump_weights[min(jump_distance-1, 2)]               
-                jump_injection = jump_weight * original_x + (1-jump_weight) * work_mem.expand(-1, ctx, -1)
-                x = x + (jump_injection * jump_grad) 
+                jdist = action
+                i_next = min(i + jdist + 1, n.layer)
+                jump_w = n.jump_s[min(jdist-1, 2)]               
+                jump_i = jump_w * orig_x + (1-jump_w) * mem_w.expand(-1, ctx, -1)
+                x = x + (jump_i * jump_g) 
                 
                 i = i_next
                 history.append({'layer': i, 'status': 'jumped_to'})
             else:
-                x = x * jump_grad
+                x = x * jump_g
                 i += 1
                 history.append({'layer': i, 'status': 'processed'})
         
         # x = n.dendrites(x)
-        mlp_gate = n.mlp_gate(x)
-        mlp_output = n.mlp(n.mlp_ln(x))
-        x = x + mlp_gate * mlp_output
+        gate = n.mlp_gate(x)
+        output = n.mlp(n.mlp_ln(x))
+        x = x + gate * output
         jmp = {'jump_history': history}
         return x, jmp
 
@@ -897,7 +741,7 @@ class residual(nn.Module):
         
         n.attn = attention(dims, head, layer, n_type=n_type)
         n.router = router(dims, num_types=num_types)
-        n.jump = MyelinatedSheath(dims, head, layer)
+        n.jump = MSheath(dims, head, layer)
 
         n.mlp = nn.Sequential(n.ln, tgate(dims, num_types=num_types), 
                               nn.Linear(dims, dims*num_types), get_activation(act), nn.Linear(dims*num_types, dims), n.ln)
@@ -948,7 +792,7 @@ class processor(nn.Module):
             x2 = n.pitch_tokens(pt)
             x1 = x1 + x2 
         else:
-            pt = None #  lets pass the dict im thinking of using the raw features for something downstream
+            pt = None 
 
         x = (x1 + n.position[:x.shape[-1]]).to(device, dtype)
 
@@ -958,8 +802,8 @@ class processor(nn.Module):
             c = i(b, xa=i(xa['b']), pt=pt)
             d = i(c, xa=i(xa['c']), pt=pt)
 
-            # for j in [(xa), (xb), (xc)]: e = i(x, xa=i(j, pt=pt))
-            # e = torch.mean(torch.stack([xa, xb, xc]), dim=0)
+            # for j in [(xa['a']), (xa['b']), (xa['c'])]: e = i(x, xa=i(j, pt=pt))
+            # e = torch.mean(torch.stack([xa['a'], xa['b'], xa['c']]), dim=0)
 
             e = a + b + c
             f = torch.cat([d, e], dim=1)
@@ -1065,11 +909,6 @@ def main():
     metadata_file = "H:/DEV/datasets/lb1/metadata.csv"
     data_dir = "H:/DEV/datasets/lb1"
 
-    # metadata_file = "./datasets/LJSpeech1000/metadata.csv"
-    # data_dir = "./datasets/LJSpeech1000"
-    # metadata_file = "./datasets/cv17_1000/metadata.csv"
-    # data_dir = "./datasets/cv17_1000"
-
     log_dir = os.path.join('./logs/', datetime.now().strftime('%m-%d_%H_%M_%S'))
     os.makedirs(log_dir, exist_ok=True)
 
@@ -1077,9 +916,9 @@ def main():
     
     extract_args = {
 
-        "spectrogram": False,
+        "spectrogram": True,
         "pitch": True,
-        "waveform": False,
+        "waveform": True,
         "pitch_tokens": False,
         "harmonics": False,
         "aperiodics": False,
@@ -1120,7 +959,7 @@ def main():
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if 'jump' in name or 'policy_net' in name or 'micro_filter' in name:
+        if 'jump' in name or 'pnet' in name or 'micro_filter' in name:
             jump_params.append(p)
         else:
             main_params.append(p)
@@ -1128,8 +967,10 @@ def main():
     optimizer = MaxFactor([
         {'params': main_params, 'bias': 1.0}, 
         {'params': jump_params, 'bias': 2.0}  
-    ], lr=0.025, b_decay=-0.8, eps=(1e-8, 1e-8), d=1.0, decay=0.01, gamma=0.99, max=False, bias=1, 
+    ], lr=2.5e-3, b_decay=-0.8, eps=(1e-8, 1e-8), d=1.0, decay=1e-2, gamma=0.99, max=False, bias=1, 
                  min_lr=1e-9, clip=False, cap=0.0)
+
+    # optimizer = MaxFactorA(model.named_parameters(), lr=2.5e-3, b_decay=-0.8, eps=(1e-8, 1e-8), d=1.0, decay=1e-2, gamma=0.99, max=False, clip=False, cap=0.0)
 
     scheduler = FAMScheduler2(optimizer, warmup_steps=10, total_steps=100, 
                  decay_start=None, warmup_start=1e-6, eta_min=1e-6, last_epoch=-1) 
