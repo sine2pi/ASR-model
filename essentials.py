@@ -1,4 +1,3 @@
-# bare necessities, old mother natures recipes
 import torch, torchaudio, torch.nn.functional as F
 import os, math, logging, time
 import pyworld as pw
@@ -58,21 +57,16 @@ class LocalNorm(nn.Module):
         
         pad_len = self.size // 2
 
-        # We use 1D pooling to avoid the 'interpolation' feeling of 2D on a line
         if self.mode == "1":
-            # MODE 1: Standard Average (Original LRN behavior over time)
             div = F.avg_pool1d(div, kernel_size=self.size, stride=1, padding=pad_len)
 
         elif self.mode == "2":
-            # MODE 2: Intensity-based Switch (Lateral Inhibition vs smoothing)
             avg_d = F.avg_pool1d(div, kernel_size=self.size, stride=1, padding=pad_len)
             max_d = F.max_pool1d(div, kernel_size=self.size, stride=1, padding=pad_len)
-            # If there's a significant spike, switch to Max-based suppression
             condition = (max_d > 2.0 * avg_d).float()
             div = (condition * max_d) + ((1 - condition) * avg_d)
 
         elif self.mode == "3":
-            # MODE 3: PyWorld Confidence Gate
             avg_d = F.avg_pool1d(div, kernel_size=self.size, stride=1, padding=pad_len)
             max_d = F.max_pool1d(div, kernel_size=self.size, stride=1, padding=pad_len)
             
@@ -144,7 +138,6 @@ class AdaLN(nn.Module):
         beta = beta.unsqueeze(1)
         return self.norm(x) * (1 + gamma) + beta
 
-
 def get_norm(n_type: str, dims: Optional[int] = None, num_groups: Optional[int] = None)-> nn.Module:
 
     if n_type in ["batchnorm", "instancenorm"] and dims is None:
@@ -161,7 +154,7 @@ def get_norm(n_type: str, dims: Optional[int] = None, num_groups: Optional[int] 
         "rmsnorm": lambda: nn.RMSNorm(normalized_shape=dims),        
         "batchnorm": lambda: nn.BatchNorm1d(num_features=dims),
         "instancenorm2d": lambda: nn.InstanceNorm2d(num_features=dims),
-        "groupnorm": lambda: nn.GroupNorm(num_groups=num_groups, num_dims=dims),
+        "groupnorm": lambda: nn.GroupNorm(num_groups=num_groups, num_channels=dims),
         "localnorm": lambda: LocalNorm(size=5),
         }
    
@@ -386,11 +379,10 @@ def extract_features(batch, tokenizer=None, spectrogram=False, pitch=False, wave
         dummy, _ = load_wave(batch["audio"], sample_rate)
         audio = torch.zeros_like(dummy)
     else:
-        audio, sample_rate = load_wave(batch["audio"], sample_rate)
+        audio, _ = load_wave(batch["audio"], sample_rate)
 
     if pitch_tokens:
         pt_tensor = pitch_toks(audio, sample_rate, labels, hop_length, mode=mode).to(device, dtype)
-        # print(f"Pitch Tokens: {pt_tensor.shape}")
 
     if harmonics:
         h_tensor, a_tensor = harmonics_and_aperiodics(audio, sample_rate, hop_length)
@@ -801,6 +793,23 @@ def train_and_evaluate(
                     writer.add_scalar(f"Entropy/{name}", s_entropy, global_step)
                     writer.add_scalar(f"GradNorm/{name}", param.grad.norm(2), global_step)
 
+            # Analyze jump_statistics quietly and push to tensorboard
+            jump_summary = {0: 0, 1: 0, 2: 0}
+            has_jumps = False
+            for name, module in model.named_modules():
+                if hasattr(module, 'jump_statistics'):
+                    has_jumps = True
+                    for action, count in module.jump_statistics.items():
+                        jump_summary[action] = jump_summary.get(action, 0) + count
+                    # Reset stats so we monitor the interval, not cumulative!
+                    module.jump_statistics = {0: 0, 1: 0, 2: 0}
+            
+            if has_jumps:
+                writer.add_scalar("Jumps/Layer_Maintained_0", jump_summary.get(0, 0), global_step)
+                writer.add_scalar("Jumps/Skipped_1_Layer", jump_summary.get(1, 0), global_step)
+                writer.add_scalar("Jumps/Skipped_2_Layers", jump_summary.get(2, 0), global_step)
+                tqdm.write(f"[Step {global_step}] Sheath Jump Stats: Kept_Layer={jump_summary.get(0,0)} | Skip_1={jump_summary.get(1,0)} | Skip_2={jump_summary.get(2,0)}")
+
         if eval_interval > 0 and warmup_interval < global_step or global_step == max_steps - 1: 
             eval_interval = eval_interval if eval_interval > 0 else 1
             if global_step % (eval_interval) == 0:
@@ -1018,11 +1027,12 @@ def evaluate_model(model, tokenizer, eval_loader, loss_fn, device, global_step, 
             
             generated_ids = generate_predictions(
                 model=model,
-                input_features_encoded=encoder_output,
+                pitch=encoder_output,
+                spectrogram=encoder_output,
+                waveform=encoder_output,
                 tokenizer=tokenizer,
-                device=device,
                 batch_size=batch_size,
-                min_length=5
+                max_new_tokens=500,
             )
         
             all_preds.append(generated_ids)
@@ -1030,20 +1040,17 @@ def evaluate_model(model, tokenizer, eval_loader, loss_fn, device, global_step, 
             
             batch_count += 1
             
-    # metrics = load_metric("wer")
     preds = torch.cat(all_preds, dim=0)
     labels = torch.cat(all_labels, dim=0)
     
     preds_text = tokenizer.batch_decode(preds, skip_special_tokens=True)
     labels_text = tokenizer.batch_decode(labels, skip_special_tokens=True)
     
-    # wer = metrics.compute(predictions=preds_text, references=labels_text)
     avg_loss = eval_loss / max(1, batch_count)
     eval_time = time.time() - eval_start_time
     
     return {
         "loss": avg_loss,
-        # "wer": wer,
         "preds": preds_text,
         "labels": labels_text,
         "eval_time": eval_time,
@@ -1084,3 +1091,1017 @@ class curiosity(nn.Module):
         out = n.merge(h_main * (1 - g) + h_aux * g)
         return n.o(out)
 
+def create_attention_mask(batch_size, ctx, is_causal=True, padding_mask=None, device=None):
+    if is_causal:
+        mask = torch.triu(torch.ones((ctx, ctx), device=device), diagonal=1).bool()
+        mask = mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, ctx, ctx)
+    else:
+        mask = torch.zeros((batch_size, 1, ctx, ctx), device=device).bool()
+    if padding_mask is not None:
+        padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)
+        mask = mask | (~padding_mask)
+    return mask
+
+class BaseAttention(nn.Module):
+    use_sdpa = True
+    
+    def __init__(self, dims: int, head: int, max_dist: int = 512):
+        super().__init__()
+        assert dims % head == 0, f"dims ({dims}) must be divisible by head ({head})"
+        self.dims = dims
+        self.head = head
+        self.head_dim = dims // head
+        self.max_dist = max_dist
+        self.scale = self.head_dim ** -0.25
+        
+    def _shape(self, tensor: torch.Tensor, ctx: int, batch: int):
+        return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
+        
+    def _reshape_to_output(self, attn_output, batch, ctx):
+        return attn_output.permute(0, 2, 1, 3).reshape(batch, ctx, self.dims)
+
+def calculate_attention(q, k, v, mask=None, temperature=1.0, use_sdpa=True, is_causal=True):
+    batch_size = q.shape[0]
+    ctx = q.shape[2]
+    attn_mask = None
+    if mask is not None:
+        if mask.dim() <= 3:
+            attn_mask = create_attention_mask(
+                batch_size=batch_size, 
+                ctx=ctx, 
+                is_causal=is_causal, 
+                padding_mask=mask if mask.dim() > 1 else None,
+                device=q.device)
+        else:
+            attn_mask = mask
+    scaled_q = q
+    if temperature != 1.0 and temperature > 0:
+        scaled_q = q * (1.0 / temperature)**.5
+    a = SDPA(
+        scaled_q, k, v, 
+        attn_mask=attn_mask, 
+        is_causal=is_causal if attn_mask is None else False)
+    out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
+    return out, None
+
+def compute_attention(self, norm_x, mask=None, kv_cache=None, is_causal=True):
+
+    batch, ctx = norm_x.shape[:2]
+    
+    q = norm_x.view(batch, ctx, self.head, -1).transpose(1, 2)
+    k = norm_x.view(batch, ctx, self.head, -1).transpose(1, 2)
+    v = norm_x.view(batch, ctx, self.head, -1).transpose(1, 2)
+
+    attn_output, _ = calculate_attention(q, k, v, mask, 1.0, BaseAttention.use_sdpa, is_causal=is_causal)
+    
+    attn_output = attn_output.transpose(1, 2).contiguous().view(batch, ctx, -1)
+    return attn_output
+
+class AdaptiveSpan(BaseAttention):
+
+    def __init__(self, dims, head, max_dist, sharpen=True, temp_scale=0.01):
+        super().__init__(dims, head, max_dist)
+        self.sharpen = sharpen
+        self.temp_scale = temp_scale
+        self.span_scale = nn.Parameter(torch.tensor(1.0))
+
+    # def compute_attention(self, norm_x, mask=None, kv_cache=None, is_causal=True):
+
+    #     batch, ctx = norm_x.shape[:2]
+        
+    #     q = norm_x.view(batch, ctx, self.head, -1).transpose(1, 2)
+    #     k = norm_x.view(batch, ctx, self.head, -1).transpose(1, 2)
+    #     v = norm_x.view(batch, ctx, self.head, -1).transpose(1, 2)
+
+    #     attn_output, _ = calculate_attention(q, k, v, mask, 1.0, BaseAttention.use_sdpa, is_causal=is_causal)
+        
+    #     attn_output = attn_output.transpose(1, 2).contiguous().view(batch, ctx, -1)
+    #     return attn_output
+
+    def forward(self, x, query=None, key=None, value=None, max_dist=None, max_span=None, span_scale=None, is_causal=True):
+
+        batch, ctx = x.shape[:2]
+        query = x.view(batch, ctx, self.head, -1).transpose(1, 2)
+        key = x.view(batch, ctx, self.head, -1).transpose(1, 2)
+        value = x.view(batch, ctx, self.head, -1).transpose(1, 2)
+
+        if max_dist is None:
+            max_dist = self.max_dist
+        if max_span is None:
+            max_span = query.shape[1]
+        if span_scale is None:
+            span_scale = self.span_scale
+            
+        span_mean = span_scale.mean().item()
+        span_len = min(int(max_span * span_mean), query.shape[1], key.shape[1], value.shape[1])
+        eff_span = min(span_len, max_dist)
+        
+        if eff_span == 0:
+            batch = query.shape[0]
+            return (torch.zeros(batch, eff_span, self.dims, device=query.device), None)
+            
+        q_span = query[:, :eff_span, :]
+        k_span = key[:, :eff_span, :]
+        v_span = value[:, :eff_span, :]
+
+        batch = q_span.shape[0]
+
+        q = self._shape(q_span, q_span.size(1), batch)
+        k = self._shape(k_span, k_span.size(1), batch)
+        v = self._shape(v_span, v_span.size(1), batch)
+
+        temperature = (1.0 + self.temp_scale * (1.0 - span_mean)
+            if self.sharpen
+            else 0.5 + self.temp_scale * span_mean)
+        
+        with torch.autocast(device_type="cuda", enabled=torch.cuda.is_available()):
+            attn_output, weights = calculate_attention(
+                q, k, v, None, temperature, BaseAttention.use_sdpa, is_causal=is_causal)
+            out = self._reshape_to_output(attn_output, batch, eff_span)
+        return out, weights
+
+class MyelinatedLayer(BaseAttention):
+    def __init__(self, dims, head, layerA=3, sparsity_threshold=0.1, max_dist=512):
+        super().__init__(dims, head, max_dist)
+        self.layers = nn.ModuleList()
+        self.layerA = layerA
+        self.sparsity_threshold = sparsity_threshold
+        self.max_dist = max_dist
+        
+        self.node_predictors = nn.ModuleList([
+            nn.Sequential(LayerNorm(dims),
+                        nn.Linear(dims, 1),
+                        nn.Sigmoid()) for _ in range(layerA)])
+        
+        for i in range(layerA):
+            self.layers.append(nn.ModuleDict({
+                'ln': LayerNorm(dims),
+                'gate': nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()),
+                'adapter': nn.Linear(dims, dims) if i % 2 == 0 else None
+            }))
+        self.policy_net = nn.Sequential(nn.Linear(dims, 128), nn.ReLU(), nn.Linear(128, 3))
+        self.jump_weights = nn.Parameter(torch.tensor([0.1, 0.05, 0.01]))
+        
+        mlp = dims * 4
+        self.mlp_gate = nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid())
+        self.mlp = nn.Sequential(nn.Linear(dims, mlp), nn.GELU(), nn.Linear(mlp, dims))
+        self.mlp_ln = LayerNorm(dims)
+        
+        self.working_memory = nn.Parameter(torch.zeros(1, 1, dims))
+        self.memory_gate = nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid())
+        self.last_memory_gate_values = None
+
+    def compute_attention(self, norm_x, mask=None, kv_cache=None, is_causal=True):
+        """Compute attention with adaptive span and content-dependent updates."""
+        batch, ctx = norm_x.shape[:2]
+        
+        q = norm_x.view(batch, ctx, self.head, -1).transpose(1, 2)
+        k = norm_x.view(batch, ctx, self.head, -1).transpose(1, 2)
+        v = norm_x.view(batch, ctx, self.head, -1).transpose(1, 2)
+
+        attn_output, _ = calculate_attention(q, k, v, mask, 1.0, BaseAttention.use_sdpa, is_causal=is_causal)
+        
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch, ctx, -1)
+        return attn_output
+
+    def predict_node_importance(self, x, layer_idx):
+        """Dynamically determine if processing should occur at this node."""
+        importance = self.node_predictors[layer_idx](x)
+        return (importance > self.sparsity_threshold).float()
+
+    def decide_jump(self, policy, jump_weights, i, layerA, x, original_x, working_memory):
+        """Decide whether to jump layers based on the policy network."""
+        jump_prob = policy[:, 1] if i < layerA - 1 else torch.zeros_like(policy[:, 1])
+        should_jump = (torch.rand_like(jump_prob) < jump_prob).any()
+        if should_jump:
+            jump_length = torch.multinomial(policy, 1)[:, 0].max().item() + 1
+            i_next = min(i + jump_length, layerA - 1)
+            skip_weight = jump_weights[min(jump_length - 1, 2)]
+            x = x + skip_weight * original_x + (1 - skip_weight) * working_memory
+            return x, i_next
+        return x, i + 1
+
+    def forward(self, x, xa=None, mask=None, kv_cache=None, is_causal=True):
+        batch, ctx = x.shape[:2]
+        working_memory = self.working_memory.expand(batch, -1, -1)
+        original_x = x
+        pooled_representation = x.mean(dim=1, keepdim=False)
+        policy_logits = self.policy_net(pooled_representation)
+        policy = F.softmax(policy_logits, dim=-1)
+        jump_history = []
+        memory_gate = torch.zeros(batch, 1, 1, device=x.device)
+        
+        i = 0
+        while i < self.layerA:
+            layer = self.layers[i]
+            node_importance = self.predict_node_importance(x, i)
+            print(f"Node importance (Layer {i}): {node_importance}")
+
+            if node_importance.mean() < 0.2 and i > 0:
+                i += 1
+                jump_history.append(i)
+                continue
+            norm_x = layer['ln'](x)
+            attn_mask = mask * node_importance.squeeze(-1).unsqueeze(1) if mask is not None else node_importance.squeeze(-1).unsqueeze(1)
+            
+            if node_importance.mean() > 0.3:
+                attn_output = self.compute_attention(norm_x, mask=attn_mask, kv_cache=kv_cache)
+                print(f"Attention output (Layer {i}): {attn_output}")
+                
+                if layer['adapter'] is not None:
+                    attn_output = layer['adapter'](attn_output)
+                gate_value = layer['gate'](norm_x)
+                x = x + gate_value * attn_output
+                print(f"Updated representation (Layer {i}): {x}")
+                
+                memory_gate = self.memory_gate(x.mean(dim=1, keepdim=True))
+                mean_x = x.mean(dim=1, keepdim=True)
+                working_memory = memory_gate * working_memory + (1 - memory_gate) * mean_x
+                print(f"Memory gate value: {memory_gate}")
+            
+            x, i = self.decide_jump(policy, self.jump_weights, i, self.layerA, x, original_x, working_memory)
+            jump_history.append(i)
+
+        self.last_memory_gate_values = memory_gate.detach().clone()
+        print(f"Jump history: {jump_history}")
+        mlp_importance = self.mlp_gate(x)
+        mlp_output = self.mlp(self.mlp_ln(x))
+        x = x + mlp_importance * mlp_output
+        print(f"Final output: {x}")
+        return x
+
+import contextlib
+import os
+import queue
+import re
+import time
+from threading import Condition, get_ident, Lock, Thread
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+from PIL import Image
+
+from tqdm import tqdm
+import cv2, torch, subprocess, numpy as np, json, logging, os, glob, gc
+
+IS_MAIN_PROCESS = os.getenv("IS_MAIN_PROCESS", "1") == "1"
+RANK = int(os.getenv("RANK", "0"))
+
+IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"]
+VIDEO_EXTS = [".mp4", ".mov", ".avi", ".mkv", ".webm"]
+
+def target_shape(img_shape, target_size: int):
+    h, w = img_shape[:2]
+    new_w, new_h = (int(target_size * w / h), target_size) if h > w else (target_size, int(target_size * h / w))
+    return new_h, new_w
+
+def have(a):
+    return a is not None  
+
+def aorb(a, b):
+    return a if have(a) else b
+
+def aborc(a, b, c):
+    return aorb(a, aorb(b, c))
+
+def abcord(a, b, c, d):
+    return aorb(a, aborc(b, c, d))
+
+def no_none(x):
+    return x.apply(lambda tensor: tensor if tensor is not None else None)
+
+def denormalize(tensor, target_w, target_h):
+    if isinstance(tensor, np.ndarray):
+        tensor = torch.from_numpy(tensor).to(device)
+    
+    img_float = (tensor.float() * 0.5 + 0.5) * 255.0
+    if img_float.shape[2] != target_w or img_float.shape[1] != target_h:
+        img_float = torch.nn.functional.interpolate(img_float.unsqueeze(0), size=(target_h, target_w), mode="bilinear", align_corners=False).squeeze(0)
+    img = img_float.permute(1, 2, 0).to(torch.uint8)
+    return img
+
+def feather_mask(mask: torch.Tensor, blur_radius: float = 1.5, iterations: int = 3) -> torch.Tensor:
+    import torchvision.transforms.functional as V
+
+    if blur_radius <= 0:
+        return mask
+
+    orig_shape = mask.shape
+    if mask.ndim == 2:
+        x = mask[None, None, ...]
+    elif mask.ndim == 3:
+        x = mask[None, ...]
+    else:
+        x = mask
+        
+    x = x.float()
+    k_size = int(blur_radius * 2) + 1
+    if k_size % 2 == 0:
+        k_size += 1
+
+    for _ in range(iterations):
+        x = V.gaussian_blur(x, kernel_size=k_size, sigma=float(blur_radius))
+
+    return x.view(orig_shape) 
+
+def morph3x3(mask: torch.Tensor, dilation: int) -> torch.Tensor:
+    
+    if dilation == 0: return mask
+    x = mask.float().view(1, 1, *mask.shape) if mask.ndim == 2 else mask
+    k_size = 2 * abs(dilation) + 1
+    padding = abs(dilation)
+    
+    if dilation > 0:
+        x = torch.nn.functional.max_pool2d(x, kernel_size=k_size, stride=1, padding=padding)
+    else:
+        x = -torch.nn.functional.max_pool2d(-x, kernel_size=k_size, stride=1, padding=padding)
+    return (x > 0.5).to(mask.dtype).view(mask.shape)
+
+def mask_edges(mask: torch.Tensor, kernel_size: int = 1) -> torch.Tensor:
+    import torchvision.transforms.functional as V
+    if kernel_size <= 0:
+        return mask
+    
+    orig_shape = mask.shape
+    x = mask.float()
+    if x.ndim == 2:
+        x = x[None, None, ...]
+    elif x.ndim == 3:
+        x = x[None, ...]
+        
+    x = (x > 0.5).float()
+    pad = kernel_size // 2
+    k_size = pad * 2 + 1
+    
+    if pad > 0:
+        x = torch.nn.functional.max_pool2d(x, kernel_size=k_size, stride=1, padding=pad)
+        x = -torch.nn.functional.max_pool2d(-x, kernel_size=k_size, stride=1, padding=pad)
+        
+        x = -torch.nn.functional.max_pool2d(-x, kernel_size=k_size, stride=1, padding=pad)
+        x = torch.nn.functional.max_pool2d(x, kernel_size=k_size, stride=1, padding=pad)
+    
+    blur_k = k_size + 2
+    if blur_k % 2 == 0:
+        blur_k += 1
+    
+    sigma = float(blur_k) / 3.0
+    x = V.gaussian_blur(x, kernel_size=blur_k, sigma=sigma)
+    
+    x = (x > 0.5).to(mask.dtype)
+    
+    return x.view(orig_shape)
+
+def apply_effects(masks, dilation, feather_radius, smooth_edges):
+    out_masks = []
+    for m in masks:
+        t = torch.from_numpy(m).to(device).float() / 255.0
+        if dilation != 0:
+            t = morph3x3(t, dilation)
+        if smooth_edges > 0:
+            t = mask_edges(t, kernel_size=smooth_edges)
+        if feather_radius > 0:
+            t = feather_mask(t, blur_radius=feather_radius)
+        out_masks.append((t.cpu().numpy() * 255).astype(np.uint8))
+    return out_masks
+
+def metadata(path):
+    cmd_key = [
+        'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+        '-show_entries', 'frame=pict_type',
+        '-of', 'csv=p=0', '-skip_frame', 'nokey', path]
+
+    res_key = subprocess.run(cmd_key, capture_output=True, text=True)
+    lines = res_key.stdout.strip().split('\n')
+    num_keyframes = len(lines)
+
+    cmd_stream = [
+        'ffprobe', '-v', 'quiet', '-print_format', 'json', 
+        '-show_streams', '-select_streams', 'v:0', path]
+
+    res_stream = subprocess.run(cmd_stream, capture_output=True, text=True)
+    data = json.loads(res_stream.stdout)
+    
+    if not data.get('streams'):
+        return None, None, None, None, None, None
+        
+    stream = data['streams'][0]
+    width = int(stream['width'])
+    height = int(stream['height'])
+    duration = float(stream.get('duration', 0))
+        
+    fps_str = stream.get('r_frame_rate', '30/1')
+    try:
+        num, denom = map(int, fps_str.split('/'))
+        fps = num / denom if denom != 0 else 30.0
+    except:
+        fps = 30.0
+
+    f_tot = stream.get('nb_frames')
+    if f_tot:
+        nb_frames = int(f_tot)
+    else:
+        nb_frames = int(duration * fps) if duration > 0 else 0
+    return nb_frames, num_keyframes, width, height, duration, fps
+
+def ffmpeg_pipe(out_path, width, height, fps):
+
+    ffmpeg_cmd = [
+        'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+        '-s', f'{width}x{height}', '-pix_fmt', 'bgr24', '-r', str(fps),
+        '-i', '-', '-c:v', 'hevc_qsv', '-profile:v', 'main10', '-pix_fmt', 'p010le', '-tag:v', 'hvc1', '-g', '30', '-b:v', '100M', '-preset', 'fast',
+        '-colorspace', 'bt709', '-color_primaries', 'bt709', '-fps_mode', 'cfr', '-r', str(fps), '-movflags', '+faststart+write_colr+use_metadata_tags',
+        '-metadata:s:v:0', 'stereo_mode=left_right', '-color_trc', 'bt709', out_path
+    ]
+    return subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+def load_resource_as_video_frames(
+    resource_path,
+    image_size,
+    offload_video_to_cpu,
+    img_mean=(0.5, 0.5, 0.5),
+    img_std=(0.5, 0.5, 0.5),
+    async_loading_frames=False,
+    video_loader_type="cv2",
+    start_frame=0,
+    max_frames=None,
+):
+    """
+    Load video frames from either a video or an image (as a single-frame video).
+    Alternatively, if input is a list of PIL images, convert its format
+    """
+    if isinstance(resource_path, list):
+        img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
+        img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
+        assert all(isinstance(img_pil, Image.Image) for img_pil in resource_path)
+        assert len(resource_path) is not None
+        orig_height, orig_width = resource_path[0].size
+        orig_height, orig_width = (
+            orig_width,
+            orig_height,
+        )  # For some reason, this method returns these swapped
+        images = []
+        for img_pil in resource_path:
+            img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
+            assert img_np.dtype == np.uint8, "np.uint8 is expected for JPEG images"
+            img_np = img_np / 255.0
+            img = torch.from_numpy(img_np).permute(2, 0, 1)
+            # float16 precision should be sufficient for image tensor storage
+            img = img.to(dtype=torch.float16)
+            # normalize by mean and std
+            img -= img_mean
+            img /= img_std
+            images.append(img)
+        images = torch.stack(images)
+        if not offload_video_to_cpu:
+            images = images.cuda()
+        return images, orig_height, orig_width
+
+    is_image = (
+        isinstance(resource_path, str)
+        and os.path.splitext(resource_path)[-1].lower() in IMAGE_EXTS
+    )
+    return load_video_frames(
+        video_path=resource_path,
+        image_size=image_size,
+        offload_video_to_cpu=offload_video_to_cpu,
+        img_mean=img_mean,
+        img_std=img_std,
+        async_loading_frames=async_loading_frames,
+        video_loader_type=video_loader_type,
+        start_frame=start_frame,
+        max_frames=max_frames,
+    )
+
+def load_video_frames(
+    video_path,
+    image_size,
+    offload_video_to_cpu,
+    img_mean=(0.5, 0.5, 0.5),
+    img_std=(0.5, 0.5, 0.5),
+    async_loading_frames=False,
+    video_loader_type="cv2",
+    start_frame=0,
+    max_frames=None,
+):
+
+    assert isinstance(video_path, str)
+    if video_path.startswith("<load-dummy-video"):
+        # Check for pattern <load-dummy-video-N> where N is an integer
+        match = re.match(r"<load-dummy-video-(\d+)>", video_path)
+        num_frames = int(match.group(1)) if match else 60
+        return load_dummy_video(image_size, offload_video_to_cpu, num_frames=num_frames)
+    elif os.path.splitext(video_path)[-1].lower() in VIDEO_EXTS:
+        return load_video_frames_from_video_file(
+            video_path=video_path,
+            image_size=image_size,
+            offload_video_to_cpu=offload_video_to_cpu,
+            img_mean=img_mean,
+            img_std=img_std,
+            async_loading_frames=async_loading_frames,
+            video_loader_type=video_loader_type,
+            start_frame=start_frame,
+            max_frames=max_frames,
+        )
+    else:
+        raise NotImplementedError("Only video files and image folders are supported")
+
+def load_video_frames_from_video_file(
+    video_path,
+    image_size,
+    offload_video_to_cpu,
+    img_mean,
+    img_std,
+    async_loading_frames,
+    gpu_acceleration=False,
+    gpu_device=None,
+    video_loader_type="cv2",
+    start_frame=0,
+    max_frames=None,
+):
+    """Load the video frames from a video file."""
+    if video_loader_type == "cv2":
+        return load_video_frames_from_video_file_using_cv2(
+            video_path=video_path,
+            image_size=image_size,
+            img_mean=img_mean,
+            img_std=img_std,
+            offload_video_to_cpu=offload_video_to_cpu,
+            start_frame=start_frame,
+            max_frames=max_frames,
+        )
+    elif video_loader_type == "torchcodec":
+        logger.info("Using torchcodec to load video file")
+        lazy_images = AsyncVideoFileLoaderWithTorchCodec(
+            video_path=video_path,
+            image_size=image_size,
+            offload_video_to_cpu=offload_video_to_cpu,
+            img_mean=img_mean,
+            img_std=img_std,
+            gpu_acceleration=gpu_acceleration,
+            gpu_device=gpu_device,
+        )
+        # The `AsyncVideoFileLoaderWithTorchCodec` class always loads the videos asynchronously,
+        # so we just wait for its loading thread to finish if async_loading_frames=False.
+        if not async_loading_frames:
+            async_thread = lazy_images.thread
+            if async_thread is not None:
+                async_thread.join()
+        return lazy_images, lazy_images.video_height, lazy_images.video_width
+    else:
+        raise RuntimeError("video_loader_type must be either 'cv2' or 'torchcodec'")
+
+def load_video_frames_from_video_file_using_cv2(
+    video_path: str,
+    image_size: int,
+    img_mean: tuple = (0.5, 0.5, 0.5),
+    img_std: tuple = (0.5, 0.5, 0.5),
+    offload_video_to_cpu: bool = False,
+    start_frame: int = 0,
+    max_frames: int = None,
+) -> torch.Tensor:
+    """
+    Load video from path, convert to normalized tensor with specified preprocessing
+
+    Args:
+        video_path: Path to video file
+        image_size: Target size for square frames (height and width)
+        img_mean: Normalization mean (RGB)
+        img_std: Normalization standard deviation (RGB)
+
+    Returns:
+        torch.Tensor: Preprocessed video tensor in shape (T, C, H, W) with float16 dtype
+    """
+    import cv2  # delay OpenCV import to avoid unnecessary dependency
+
+    # Initialize video capture
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video: {video_path}")
+
+    original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    num_frames = num_frames if num_frames > 0 else None
+
+    frames = []
+    pbar = tqdm(desc=f"frame loading (OpenCV) [rank={RANK}]", total=num_frames if max_frames is None else min(num_frames - start_frame, max_frames))
+    
+    # Seek to start frame
+    if start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        
+    count = 0
+    while True:
+        if max_frames is not None and count >= max_frames:
+            break
+            
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Convert BGR to RGB and resize
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_resized = cv2.resize(
+            frame_rgb, (image_size, image_size), interpolation=cv2.INTER_CUBIC
+        )
+        frames.append(frame_resized)
+        pbar.update(1)
+        count += 1
+    cap.release()
+    pbar.close()
+
+    if len(frames) == 0:
+        raise RuntimeError(
+            f"No frames could be decoded from video: {video_path}. "
+            f"The file may be corrupted, empty, or encoded with an unsupported codec."
+        )
+
+    # Convert to tensor
+    # Using float16 (half precision) to save memory (reduces usage by 2x compared to float32)
+    frames_np = np.stack(frames, axis=0)  # (T, H, W, C)
+    video_tensor = torch.from_numpy(frames_np).permute(0, 3, 1, 2).to(dtype=torch.float16)  # (T, C, H, W)
+
+    img_mean = torch.tensor(img_mean, dtype=torch.float16).view(1, 3, 1, 1)
+    img_std = torch.tensor(img_std, dtype=torch.float16).view(1, 3, 1, 1)
+    if not offload_video_to_cpu:
+        video_tensor = video_tensor.cuda()
+        img_mean = img_mean.cuda()
+        img_std = img_std.cuda()
+    # normalize by mean and std
+    video_tensor -= img_mean
+    video_tensor /= img_std
+    return video_tensor, original_height, original_width
+
+def load_dummy_video(image_size, offload_video_to_cpu, num_frames=60):
+    video_height, video_width = 480, 640  # dummy original video sizes
+    images = torch.randn(num_frames, 3, image_size, image_size, dtype=torch.float16)
+    if not offload_video_to_cpu:
+        images = images.cuda()
+    return images, video_height, video_width
+
+def _load_img_as_tensor(img_path, image_size):
+    """Load and resize an image and convert it into a PyTorch tensor."""
+    img = Image.open(img_path).convert("RGB")
+    orig_width, orig_height = img.width, img.height
+    img = TF.resize(img, size=(image_size, image_size))
+    img = TF.to_tensor(img)
+    return img, orig_height, orig_width
+
+class AsyncImageFrameLoader:
+    """
+    A list of video frames to be load asynchronously without blocking session start.
+    """
+
+    def __init__(self, img_paths, image_size, offload_video_to_cpu, img_mean, img_std):
+        self.img_paths = img_paths
+        self.image_size = image_size
+        self.offload_video_to_cpu = offload_video_to_cpu
+        self.img_mean = img_mean
+        self.img_std = img_std
+        # items in `self._images` will be loaded asynchronously
+        self.images = [None] * len(img_paths)
+        # catch and raise any exceptions in the async loading thread
+        self.exception = None
+        # video_height and video_width be filled when loading the first image
+        self.video_height = None
+        self.video_width = None
+
+        # load the first frame to fill video_height and video_width and also
+        # to cache it (since it's most likely where the user will click)
+        self.__getitem__(0)
+
+        # load the rest of frames asynchronously without blocking the session start
+        def _load_frames():
+            try:
+                for n in tqdm(
+                    range(len(self.images)),
+                    desc=f"frame loading (image folder) [rank={RANK}]",
+                ):
+                    self.__getitem__(n)
+            except Exception as e:
+                self.exception = e
+
+        self.thread = Thread(target=_load_frames, daemon=True)
+        self.thread.start()
+
+    def __getitem__(self, index):
+        if self.exception is not None:
+            raise RuntimeError("Failure in frame loading thread") from self.exception
+
+        img = self.images[index]
+        if img is not None:
+            return img
+
+        img, video_height, video_width = _load_img_as_tensor(
+            self.img_paths[index], self.image_size
+        )
+        self.video_height = video_height
+        self.video_width = video_width
+        # float16 precision should be sufficient for image tensor storage
+        img = img.to(dtype=torch.float16)
+        # normalize by mean and std
+        img -= self.img_mean
+        img /= self.img_std
+        if not self.offload_video_to_cpu:
+            img = img.cuda()
+        self.images[index] = img
+        return img
+
+    def __len__(self):
+        return len(self.images)
+
+class TorchCodecDecoder:
+    """
+    A wrapper to support GPU device and num_threads in TorchCodec decoder,
+    which are not supported by `torchcodec.decoders.SimpleVideoDecoder` yet.
+    """
+    def __init__(self, source, dimension_order="NCHW", device="cpu", num_threads=1):
+        from torchcodec import _core as core
+
+        self._source = source  # hold a reference to the source to prevent it from GC
+        if isinstance(source, str):
+            self._decoder = core.create_from_file(source, "exact")
+        elif isinstance(source, bytes):
+            self._decoder = core.create_from_bytes(source, "exact")
+        else:
+            raise TypeError(f"Unknown source type: {type(source)}.")
+        assert dimension_order in ("NCHW", "NHWC")
+
+        device_string = str(device)
+        core.scan_all_streams_to_update_metadata(self._decoder)
+        core.add_video_stream(
+            self._decoder,
+            dimension_order=dimension_order,
+            device=device_string,
+            num_threads=(1 if "cuda" in device_string else num_threads),
+        )
+        video_metadata = core.get_container_metadata(self._decoder)
+        best_stream_index = video_metadata.best_video_stream_index
+        assert best_stream_index is not None
+        self.metadata = video_metadata.streams[best_stream_index]
+        assert self.metadata.num_frames_from_content is not None
+        self._num_frames = self.metadata.num_frames_from_content
+
+    def __len__(self) -> int:
+        return self._num_frames
+
+    def __getitem__(self, key: int):
+        from torchcodec import _core as core
+
+        if key < 0:
+            key += self._num_frames
+        if key >= self._num_frames or key < 0:
+            raise IndexError(
+                f"Index {key} is out of bounds; length is {self._num_frames}"
+            )
+        frame_data, *_ = core.get_frame_at_index(
+            self._decoder,
+            frame_index=key,
+        )
+        return frame_data
+
+class AsyncVideoFileLoaderWithTorchCodec:
+    """
+    Loading frames from video files asynchronously without blocking session start.
+
+    Unlike `AsyncVideoFileLoader`, this class uses PyTorch's offical TorchCodec library
+    for video decoding, which is more efficient and supports more video formats.
+    """
+
+    def __init__(
+        self,
+        video_path,
+        image_size,
+        offload_video_to_cpu,
+        img_mean,
+        img_std,
+        gpu_acceleration=True,
+        gpu_device=None,
+        use_rand_seek_in_loading=False,
+    ):
+        # Check and possibly infer the output device (and also get its GPU id when applicable)
+        assert gpu_device is None or gpu_device.type == "cuda"
+        gpu_id = (
+            gpu_device.index
+            if gpu_device is not None and gpu_device.index is not None
+            else torch.cuda.current_device()
+        )
+        if offload_video_to_cpu:
+            out_device = torch.device("cpu")
+        else:
+            out_device = torch.device("cuda") if gpu_device is None else gpu_device
+        self.out_device = out_device
+        self.gpu_acceleration = gpu_acceleration
+        self.gpu_id = gpu_id
+        self.image_size = image_size
+        self.offload_video_to_cpu = offload_video_to_cpu
+        if not isinstance(img_mean, torch.Tensor):
+            img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
+        self.img_mean = img_mean
+        if not isinstance(img_std, torch.Tensor):
+            img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
+        self.img_std = img_std
+
+        if gpu_acceleration:
+            self.img_mean = self.img_mean.to(f"cuda:{self.gpu_id}")
+            self.img_std = self.img_std.to(f"cuda:{self.gpu_id}")
+            decoder_option = {"device": f"cuda:{self.gpu_id}"}
+        else:
+            self.img_mean = self.img_mean.cpu()
+            self.img_std = self.img_std.cpu()
+            decoder_option = {"num_threads": 1}  # use a single thread to save memory
+
+        self.rank = int(os.environ.get("RANK", "0"))
+        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        self.async_reader = TorchCodecDecoder(video_path, **decoder_option)
+
+        # `num_frames_from_content` is the true number of frames in the video content
+        # from the scan operation (rather than from the metadata, which could be wrong)
+        self.num_frames = self.async_reader.metadata.num_frames_from_content
+        self.video_height = self.async_reader.metadata.height
+        self.video_width = self.async_reader.metadata.width
+
+        # items in `self._images` will be loaded asynchronously
+        self.images_loaded = [False] * self.num_frames
+        self.images = torch.zeros(
+            self.num_frames,
+            3,
+            self.image_size,
+            self.image_size,
+            dtype=torch.float16,
+            device=self.out_device,
+        )
+        # catch and raise any exceptions in the async loading thread
+        self.exception = None
+        self.use_rand_seek_in_loading = use_rand_seek_in_loading
+        self.rand_seek_idx_queue = queue.Queue()
+        # use a lock to avoid race condition between concurrent access to torchcodec
+        # libs (which are not thread-safe); the lock is replaced with a nullcontext
+        # when the video is fully loaded
+        self.torchcodec_access_lock = FIFOLock()
+        self._start_video_loading()
+
+    def _load_one_frame(self, idx):
+        frame_resized = self._transform_frame(self.async_reader[idx])
+        return frame_resized
+
+    @torch.inference_mode()
+    def _start_video_loading(self):
+        desc = f"frame loading (TorchCodec w/ {'GPU' if self.gpu_acceleration else 'CPU'}) [rank={RANK}]"
+        pbar = tqdm(desc=desc, total=self.num_frames)
+        self.num_loaded_frames = 0
+        # load the first frame synchronously to cache it before the session is opened
+        idx = self.num_loaded_frames
+        self.images[idx] = self._load_one_frame(idx)
+        self.images_loaded[idx] = True
+        self.num_loaded_frames += 1
+        pbar.update(n=1)
+        self.all_frames_loaded = self.num_loaded_frames == self.num_frames
+
+        # load the frames asynchronously without blocking the session start
+        def _load_frames():
+            finished = self.all_frames_loaded
+            chunk_size = 16
+            while not finished:
+                # asynchronously load `chunk_size` frames each time we acquire the lock
+                with self.torchcodec_access_lock, torch.inference_mode():
+                    for _ in range(chunk_size):
+                        try:
+                            idx = self.num_loaded_frames
+                            self.images[idx] = self._load_one_frame(idx)
+                            self.images_loaded[idx] = True
+                            self.num_loaded_frames += 1
+                            pbar.update(n=1)
+                            if self.num_loaded_frames >= self.num_frames:
+                                finished = True
+                                break
+                        except Exception as e:
+                            self.exception = e
+                            raise
+
+                    # also read the frame that is being randomly seeked to
+                    while True:
+                        try:
+                            idx = self.rand_seek_idx_queue.get_nowait()
+                            if not self.images_loaded[idx]:
+                                self.images[idx] = self._load_one_frame(idx)
+                                self.images_loaded[idx] = True
+                        except queue.Empty:
+                            break
+                        except Exception as e:
+                            self.exception = e
+                            raise
+
+            # finished -- check whether we have loaded the total number of frames
+            if self.num_loaded_frames != self.num_frames:
+                raise RuntimeError(
+                    f"There are {self.num_frames} frames in the video, but only "
+                    f"{self.num_loaded_frames} frames can be loaded successfully."
+                )
+            else:
+                self.all_frames_loaded = True
+                pbar.close()
+                with self.torchcodec_access_lock:
+                    import gc
+                    reader = self.async_reader
+                    if reader is not None:
+                        reader._source = None
+                    self.async_reader = None
+                    self.pbar = None
+                    self.thread = None
+                    self.rand_seek_idx_queue = None
+                    gc.collect()
+                self.torchcodec_access_lock = contextlib.nullcontext()
+
+        self.thread = Thread(target=_load_frames, daemon=True)
+        self.thread.start()
+
+    def _transform_frame(self, frame):
+        frame = frame.clone()  # make a copy to avoid modifying the original frame bytes
+        frame = frame.float()  # convert to float32 before interpolation
+        frame_resized = F.interpolate(
+            frame[None, :],
+            size=(self.image_size, self.image_size),
+            mode="bicubic",
+            align_corners=False,
+        )[0]
+        # float16 precision should be sufficient for image tensor storage
+        frame_resized = frame_resized.half()  # uint8 -> float16
+        frame_resized /= 255
+        frame_resized -= self.img_mean
+        frame_resized /= self.img_std
+        if self.offload_video_to_cpu:
+            frame_resized = frame_resized.cpu()
+        elif frame_resized.device != self.out_device:
+            frame_resized = frame_resized.to(device=self.out_device, non_blocking=True)
+        return frame_resized
+
+    def __getitem__(self, index):
+        if self.exception is not None:
+            raise RuntimeError("Failure in frame loading thread") from self.exception
+
+        max_tries = 1200
+        for _ in range(max_tries):
+            with self.torchcodec_access_lock:
+                if self.images_loaded[index]:
+                    return self.images[index]
+
+                if self.use_rand_seek_in_loading:
+                    self.rand_seek_idx_queue.put(index)
+
+            time.sleep(0.1)
+
+        raise RuntimeError(f"Failed to load frame {index} after {max_tries} tries")
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getstate__(self):
+        """
+        Remove a few attributes during pickling, so that this async video loader can be
+        saved and loaded as a part of the model session.
+        """
+        # wait for async video loading to finish before pickling
+        async_thread = self.thread
+        if async_thread is not None:
+            async_thread.join()
+        # release a few objects that cannot be pickled
+        reader = self.async_reader
+        if reader is not None:
+            reader._source = None
+        self.async_reader = None
+        self.pbar = None
+        self.thread = None
+        self.rand_seek_idx_queue = None
+        self.torchcodec_access_lock = contextlib.nullcontext()
+        return self.__dict__.copy()
+
+class FIFOLock:
+    def __init__(self):
+        self._lock = Lock()
+        self._waiters = queue.Queue()
+        self._condition = Condition()
+
+    def acquire(self):
+        ident = get_ident()
+        with self._condition:
+            self._waiters.put(ident)
+            while self._waiters.queue[0] != ident or not self._lock.acquire(
+                blocking=False
+            ):
+                self._condition.wait()
+                # got the lock and it's our turn
+
+    def release(self):
+        with self._condition:
+            self._lock.release()
+            self._waiters.get()
+            self._condition.notify_all()
+
+    def __enter__(self):
+        self.acquire()
+
+    def __exit__(self, t, v, tb):
+        self.release()
