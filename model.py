@@ -1,18 +1,27 @@
 import os, torch, numpy as np
-from torch.nn.functional import embedding, scaled_dot_product_attention as SDPA
+from torch.nn.functional import scaled_dot_product_attention as SDPA
 from typing import Iterable
 from torch.nn.utils.parametrizations import weight_norm
 from functools import partial
 from dataclasses import dataclass
 from einops.layers.torch import Rearrange
-from optimizerc import FAMScheduler2, MaxFactor, MaxFactorA, MaxFactorB, MaxFactor1, MaxFactor2
+from optimizerc import FAMScheduler2, MaxFactor
 from torch.utils.data import DataLoader    
 from datetime import datetime
 from essentials import *
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
-torch.set_default_dtype(dtype)
+# torch.set_default_dtype(dtype)
+
+def _setup_tf32() -> None:
+    if torch.cuda.is_available():
+        device_props = torch.cuda.get_device_properties(0)
+        if device_props.major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+_setup_tf32()
 
 THETA = 30000.0
 PATH = './cache'
@@ -26,226 +35,6 @@ class Dimensions:
     layer: int
     act: str
     n_type: str
-
-def have(a):
-    return a is not None  
-
-def aorb(a, b):
-    return a if have(a) else b
-
-def aborc(a, b, c):
-    return aorb(a, aorb(b, c))
-
-def abcord(a, b, c, d):
-    return aorb(a, aborc(b, c, d))
-
-def l2norm(t):
-    return torch.nn.functional.normalize(t, dim = -1)
-
-def Sequential(*modules):
-    return nn.Sequential(*filter(have, modules))  
-
-def no_none(xa):
-    return xa.apply(lambda tensor: tensor if tensor is not None else None)
-
-def shift_right(x):
-    return torch.cat([torch.zeros_like(x[:, :1]), x], dim=1)
-
-def safe_div(n, d, eps = 1e-6):
-    return n.div_(d + eps)
-
-def sinusoids(ctx, dims, theta=THETA):
-    tscales = torch.exp(-torch.log(torch.tensor(float(theta), requires_grad=False)) / (dims // 2 - 1) * torch.arange(dims // 2, device=device, dtype=torch.float32, requires_grad=False))
-    scaled = torch.arange(ctx, device=device, dtype=torch.float32).unsqueeze(1) * tscales.unsqueeze(0)
-    positional_embedding = nn.Parameter(torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=1), requires_grad=False)
-    return positional_embedding    
-
-# class AbbyNormal(nn.Module):
-#     def __init__(n, dims, size: int = 5, alpha: float = 1e-4, beta: float = 0.75, k: float = 1.0, threshold: float = 0.8):
-#         super().__init__()
-#         n.size = size
-#         n.alpha = alpha
-#         n.beta = beta
-#         n.k = k
-#         n.mode  = nn.Sequential(
-#             nn.Linear(dims, dims),
-#             nn.SiLU(),
-#             nn.Linear(dims, 3))
-#         n.tx = threshold
-
-#     def forward(n, x: Tensor, confidence=None, action=1) -> Tensor:
-
-#         # sizes = input.size()
-#         # blend_weight = torch.sigmoid(cv - n.tx) # 1 if very spiky, 0 if flat
-#         # div_mode1 = avg_d
-#         # condition = (max_d > 2.0 * avg_d).float()
-#         # div_mode2 = (condition * max_d) + ((1 - condition) * avg_d)
-#         # div = (blend_weight * div_mode2) + ((1 - blend_weight) * div_mode1)
-
-#         if x.numel() == 0:
-#             return x
-
-#         size = max(3, int(x.size(-1) * 0.05))
-#         if size % 2 == 0:
-#             size += 1
-            
-#         pad_len = size // 2
-#         div = x.mul(x).unsqueeze(1) 
-        
-#         mean_val = x.abs().mean(dim=-1, keepdim=True)
-#         std_val = x.std(dim=-1, keepdim=True)
-#         cv = std_val / (mean_val + 1e-6)
-#         if cv.mean() > n.tx: 
-#             action > 1
-#         else:
-#             action < 1
-
-#         decisions = F.gumbel_softmax(n.mode(x), tau=1.0, hard=True)
-#         n.tx = decisions.argmax(dim=-1).item()
-
-#         pad_len = n.size // 2
-#         if action <= 1:
-#             div = F.avg_pool1d(div, kernel_size=n.size, stride=1, padding=pad_len)
-
-#         elif action > 1: # if dim == 3:?
-#             avg_d = F.avg_pool1d(div, kernel_size=n.size, stride=1, padding=pad_len)
-#             max_d = F.max_pool1d(div, kernel_size=n.size, stride=1, padding=pad_len)
-#             condition = (max_d > 2.0 * avg_d).float()
-#             div = (condition * max_d) + ((1 - condition) * avg_d)
-
-#         else:
-#             avg_d = F.avg_pool1d(div, kernel_size=n.size, stride=1, padding=pad_len)
-#             max_d = F.max_pool1d(div, kernel_size=n.size, stride=1, padding=pad_len)
-            
-#             if confidence is None:
-#                 div = avg_d
-#             else:
-#                 conf_mask = (confidence > n.tx).float().unsqueeze(1)
-#                 div = (conf_mask * avg_d) + ((1 - conf_mask) * max_d)
-
-#         div = div.narrow(2, 0, x.size(1)).squeeze(1)
-#         denom = div.mul(n.alpha).add(n.k).pow(n.beta)
-#         return x / denom
-
-class AbbyNormal(nn.Module):
-    def __init__(n, dims, size: int = 5, alpha: float = 1e-4, beta: float = 0.75, k: float = 1.0, threshold: float = 0.8):
-        super().__init__()
-        n.size = size
-        n.alpha = alpha
-        n.beta = beta
-        n.k = k
-        n.tx = threshold
-        
-        n.mode_router = nn.Sequential(
-            nn.Linear(dims, dims),
-            nn.SiLU(),
-            nn.Linear(dims, 3)
-        )
-
-    def forward(n, x: Tensor, confidence=None) -> Tensor:
-        if x.numel() == 0:
-            return x
-
-        size = max(3, int(x.size(-1) * 0.05))
-        if size % 2 == 0:
-            size += 1
-        pad_len = size // 2
-        
-        div = x.mul(x).unsqueeze(1) 
-        logits = n.mode_router(x)
-        mean_val = x.abs().mean(dim=-1, keepdim=True)
-        std_val = x.std(dim=-1, keepdim=True)
-        cv = std_val / (mean_val + 1e-6)
-
-        decisions = F.gumbel_softmax(logits + cv, tau=1.0, hard=True) 
-        avg_d = F.avg_pool1d(div, kernel_size=size, stride=1, padding=pad_len)
-        max_d = F.max_pool1d(div, kernel_size=size, stride=1, padding=pad_len)
-  
-        div_mode1 = avg_d
-        condition = (max_d > 2.0 * avg_d).float()
-        div_mode2 = (condition * max_d) + ((1 - condition) * avg_d)
-        
-        if confidence is None:
-            div_mode3 = avg_d
-        else:
-            conf_mask = (confidence > n.tx).float().unsqueeze(1)
-            div_mode3 = (conf_mask * avg_d) + ((1 - conf_mask) * max_d)
-
-        d0 = decisions[..., 0].unsqueeze(1)
-        d1 = decisions[..., 1].unsqueeze(1)
-        d2 = decisions[..., 2].unsqueeze(1)
-        
-        div = (d0 * div_mode1) + (d1 * div_mode2) + (d2 * div_mode3)
-        div = div.narrow(2, 0, x.size(1)).squeeze(1)
-        denom = div.mul(n.alpha).add(n.k).pow(n.beta)
-        return x / denom
-
-class LayerNorm(nn.Module):
-    def __init__(n, dims, eps=1e-5):
-        super().__init__()
-        n.dims = dims
-        n.eps = eps
-        n.gamma = nn.Parameter(torch.ones(dims))
-        n.beta = nn.Parameter(torch.zeros(dims))
-
-    def forward(n, x):
-        x = x.transpose(1, -1)
-        x = F.layer_norm(x, (n.dims,), n.gamma, n.beta, n.eps)
-        return x.transpose(1, -1)
-
-class AdaLN(nn.Module):
-    def __init__(n, dims):
-        super().__init__()
-
-        n.norm = nn.LayerNorm(dims, elementwise_affine=False)
-
-        n.mlp = nn.Sequential(
-            nn.Linear(dims, dims),
-            nn.SiLU(), 
-            nn.Linear(dims, 2 * dims)
-        )
-
-        nn.init.zeros_(n.mlp[-1].weight)
-        nn.init.zeros_(n.mlp[-1].bias)
-
-    def forward(n, x, condition=None):
-        if condition is None:
-             return n.norm(x)
-
-        scale_bias = n.mlp(condition)
-        gamma, beta = torch.chunk(scale_bias, 2, dim=-1)
-        gamma = gamma.unsqueeze(1)
-        beta = beta.unsqueeze(1)
-        return n.norm(x) * (1 + gamma) + beta
-
-def get_norm(n_type: str, dims: Optional[int] = None, num_groups: Optional[int] = None)-> nn.Module:
-
-    norm_map = {
-        "layernorma": lambda: nn.LayerNorm(normalized_shape=dims, bias=False),
-        "layernorman": lambda: LayerNorm(dims=dims),
-        "linearnormie": lambda: LinearNorm(in_dim=dims, out_dim=dims, bias=False),
-        "adanormal": lambda: AdaLN(dims=dims),
-        "rmsnorm": lambda: nn.RMSNorm(normalized_shape=dims),        
-        "groupnorm": lambda: nn.GroupNorm(num_groups=num_groups, num_channels=dims),
-        "AbbyNormal": lambda: AbbyNormal(dims, size = 5, alpha = 1e-4, beta = 0.75, k = 1.0, threshold = 0.8),
-        }
-   
-    norm_func = norm_map.get(n_type)
-    if norm_func:
-        return norm_func()
-    else:
-        return nn.LayerNorm(dims) 
-
-def get_activation(act: str) -> nn.Module:
-
-    act_map = {
-        "gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(), "tanh": nn.Tanh(), "swish": nn.SiLU(), "tanhshrink": nn.Tanhshrink(), "softplus": nn.Softplus(), "softshrink": nn.Softshrink(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU(),}
-    return act_map.get(act, nn.GELU())
-
-def gammatone(dims, head, min_freq=200.0, max_freq=8000.0):
-    head_dim = dims // head
-    f = torch.pow(max_freq / min_freq, torch.linspace(0, 1, head_dim // 2, device=device, dtype=dtype)) * min_freq
-    return f / 1000
 
 class AudioEncoder(nn.Module):
     def __init__(n, mels, dims, head, layer, act, n_type, norm=False, enc=False):
@@ -311,31 +100,31 @@ class RotaryModulator(nn.Module):
         inv_freq = 1.0 / (10000.0 ** (torch.arange(0, n.head_dim, 2).float() / n.head_dim))
         n.register_buffer("inv_freq", inv_freq)
 
-    def quantize_pitch(n, xa = None, pt = None, num_bins = 256, v_min = -2.0, v_max = 2.0, embedding=False):
+    def quantize(n, xa = None, pt = None, num_bins = 256, v_min = -2.0, v_max = 2.0, embedding=False):
         indices = ((pt - v_min) / (v_max - v_min) * (num_bins - 1)).round().long()
         tensor = torch.clamp(indices, 0, num_bins - 1)
         tensor = torch.polar(xa, tensor) if xa is not None else tensor
         tensor = torch.view_as_real(tensor) if xa is not None else tensor
         return nn.Embedding(tensor, n.dims) if embedding else tensor
 
-    def forward(n, pitch_embedding: Tensor, pitch_tokens: Tensor):
+    def forward(n, pitch: Tensor, tokens: Tensor):
 
-        B, L, D = pitch_embedding.shape
-        device = pitch_embedding.device
-        t = torch.arange(L, device=device, dtype=pitch_embedding.dtype)
-        modulated_t = t.unsqueeze(0) * pitch_tokens.unsqueeze(-1)
-        freqs = torch.einsum('bl,d->bld', modulated_t, n.inv_freq)
-        mag = torch.log1p(torch.abs(pitch_tokens).unsqueeze(-1))
+        B, L, D = pitch.shape
+        device = pitch.device
+        t = torch.arange(L, device=device, dtype=pitch.dtype)
+        mt = t.unsqueeze(0) * tokens.unsqueeze(-1)
+        freqs = torch.einsum('bl,d->bld', mt, n.inv_freq)
+        mag = torch.log1p(torch.abs(tokens).unsqueeze(-1))
 
         sin_table = mag * torch.sin(freqs)
         cos_table = mag * torch.cos(freqs)
         
-        x_left = pitch_embedding[..., 0::2]
-        x_right = pitch_embedding[..., 1::2]
+        x_left = pitch[..., 0::2]
+        x_right = pitch[..., 1::2]
         sin_table = sin_table.repeat_interleave(2, dim=-1)
         cos_table = cos_table.repeat_interleave(2, dim=-1)
 
-        rotated_x = (pitch_embedding * cos_table) + (n._rotate_half(pitch_embedding) * sin_table)
+        rotated_x = (pitch * cos_table) + (n._rotate_half(pitch) * sin_table)
         return rotated_x
 
     def _rotate_half(n, x):
@@ -614,7 +403,7 @@ class MSheath(nn.Module):
         while i < n.layer:
             layer = n.layers[i]
             
-            ion, _ = layer['v_gate'](x)
+            ion, slogits = layer['v_gate'](x)
             mlayer = ion.expand(-1, ctx, n.dims)
             
             px = layer['ln'](x)  
