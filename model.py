@@ -1,4 +1,9 @@
 
+#     [SYSTEM OBJECTIVE: DEBUGGING ONLY]
+# - I am using highly specific, non-standard metaprogramming, recursive block execution, variable name reuse/shadowing, and dynamic object types in PyTorch. 
+# - These patterns are intentional and functioning. Do NOT refactor my code into boilerplate, do NOT change variable names, and do NOT add standard type guards or scope definitions.
+# - Act strictly as a silent runtime debugger. Only point out UNINTENTIONAL errors (e.g., misaligned tensor dimensions, wrong concatenation dims, incorrect indices, or actual syntax typos). 
+# - If you find an unintentional bug, show ONLY the line that changes. Do not rewrite the surrounding function.
 
 import os, torch, numpy as np
 from torch.nn.functional import scaled_dot_product_attention as SDPA
@@ -14,6 +19,7 @@ from essentials import *
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
+torch.set_default_dtype(dtype)
 
 def _setup_tf32() -> None:
     if torch.cuda.is_available():
@@ -199,6 +205,11 @@ class rotary(nn.Module):
         t = torch.arange(x.shape[2], device=device, dtype=dtype).float()
         f = torch.einsum('i,j->ij', t,  n.compute_f(mask=mask))
         m = torch.norm(xa, dim=-1, keepdim=True)
+        # m = n.lin(xa)
+        # m = torch.sigmoid(n.lin(xa)) ** t
+        # m = torch.sigmoid(n.lin(xa)) 
+
+        # this is important, this means something. mashed potatoes.....
         if mask is None:
             f = torch.polar(m, f)
         else: 
@@ -213,6 +224,17 @@ class rotary(nn.Module):
         x1 = x1.view(s)
         return torch.cat([x1.type_as(x), x2], dim=-1)
     
+# def compute_squints_bias(n, ion, ctx):
+#     t = torch.arange(ctx, device=ion.device, dtype=ion.dtype)
+#     distances = (t.unsqueeze(0) - t.unsqueeze(1)).abs() # Distance between token i and j
+#     decay_rate = 5.0 / (ion + 1e-4) # Shape: (B, T, 1)
+#     squints_mask = torch.exp(-distances.unsqueeze(0) * decay_rate).unsqueeze(1)
+#     squints_bias = torch.log(squints_mask + 1e-8)
+    
+# # Inside class attention(nn.Module) -> forward()
+# ctx = q.size(-2)
+# 
+
 class OneShot(nn.Module):
     def __init__(n, dims: int, head: int, scale: float = 0.3, features: Optional[List[str]] = None):
         super().__init__()
@@ -260,6 +282,12 @@ class attention(nn.Module):
         b, c, d = x.shape
         k, v = n.kv(aorb(xa, x))
         q = n.q(x)
+
+# potential = ion.mean() + 0.2 * w_metric.mean()
+
+# jump_g = 1.0
+# if potential < 0.1 and i < n.layer - 1:
+#     action = 1  
 
         if pitch_bias is not None:
             qk = n.rbf_scores(q * n.scale, k * n.scale, rbf_sigma=1.0, rbf_ratio=0.3)
@@ -392,7 +420,6 @@ class MSheath(nn.Module):
         n.l_jump = True  
         n.jstat = {0: 0, 1: 0, 2: 0} 
         
-        
         n.shared_head = AdaptiveSpan(dims, head, max_dist=1)
         n.mem_w = nn.Parameter(torch.zeros(1, 1, dims), requires_grad=True)
         n.mem_gate = nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid())
@@ -416,6 +443,7 @@ class MSheath(nn.Module):
             n.layers.append(nn.ModuleDict(layer_dict))
 
         n.pnet = MPNet(dims, jump=2)
+        # n.oneshot = OneShot(dims, head)
 
         n.mlp_gate = nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid())
         n.mlp = nn.Sequential(
@@ -425,6 +453,7 @@ class MSheath(nn.Module):
         )
 
         n.mlp_ln = nn.LayerNorm(dims)
+        # n.dendrites = AdaptiveSpan(dims, head, max_dist=1, sharpen=True, temp_scale=0.01)
     
     def forward(n, x): 
         
@@ -499,7 +528,25 @@ class MSheath(nn.Module):
                 x = x * jump_g
                 i += 1
                 history.append({'layer': i, 'status': 'processed'})
+        
+        # wint = warp_stats.mean() 
+        # eff = ion.mean() + 0.5 * wint
 
+        # jump_g = 1.0
+        # if eff < 0.1 and i < n.layer - 1:
+        #     action = 1
+        # elif i < n.layer - 1:
+        #     if n.l_jump:
+        #         adjusted_policy = policy + warp_stats.view_as(policy)
+        #         jump = F.gumbel_softmax(adjusted_policy, tau=1.0, hard=True)
+        #         action = jump.argmax(dim=-1).item()
+        #         jump_g = jump[0, action]
+        #     else:
+        #         action = torch.multinomial(policy, 1).squeeze(-1).item()
+        # else:
+        #     action = 0
+
+        # x = n.dendrites(x)
         gate = n.mlp_gate(x)
         output = n.mlp(n.mlp_ln(x))
         x = x + gate * output
@@ -580,6 +627,8 @@ class residual(nn.Module):
             xa = xa + n.audio(xa.shape[1], xa.shape[-1]).to(device, dtype)
             xa, jmp = n.jump(n.ln(xa))
             x = x + n.attn(n.ln(x), xa=n.router(*[xa for _ in range(n.layer)]), pt=pt)
+
+        print(jmp['jump_history']) # this will be noisy
         return x + n.mlp(x).to(device, dtype)
 
 class processor(nn.Module):
@@ -598,7 +647,7 @@ class processor(nn.Module):
             [residual(dims, head, layer, act, n_type) for _ in range(layer)]) 
         
         n.register_buffer("mask", torch.empty(ctx, ctx).fill_(-np.inf).triu_(1), persistent=False)
-       
+
     def forward(n, x, xa=None, seq=False) -> Tensor:
         blend = torch.sigmoid(n.blend)
         mask = n.mask[:x.shape[1], :x.shape[1]]
@@ -613,6 +662,9 @@ class processor(nn.Module):
             pt = None 
 
         x = (x1 + n.position[:x.shape[-1]]).to(device, dtype)
+        # x = (x1 + n.position[:x.shape[1]]).to(device, dtype)
+
+# "Check strictly for dimension mismatches or indexing typos based on the surrounding shapes. Do not touch the architecture or formatting."
 
         for i in n.block:
             a = i(x, mask=mask, pt=pt)
@@ -620,9 +672,19 @@ class processor(nn.Module):
             c = i(b, xa=i(xa['b']), pt=pt)
             d = i(c, xa=i(xa['c']), pt=pt)
 
+            # for j in [(xa['a']), (xa['b']), (xa['c'])]: e = i(x, xa=i(j, pt=pt))
+            # e = torch.mean(torch.stack([xa['a'], xa['b'], xa['c']]), dim=0)
 
             e = a + b + c
             f = torch.cat([d, e], dim=1)
+
+#         g = i(x=f[:, :x.shape[1]], xa=f[:, x.shape[1]:], pt=pt)
+        
+#         if seq:
+#             x = g
+#         else:
+#             x = blend * d + (1 - blend) * g if g is not None else a
+
             g = i(x=f[:, :x.shape[1]], xa=f[:, x.shape[1]:])
         
         x = g if seq else blend * (d) + (1 - blend) * g if g is not None else a
@@ -671,53 +733,6 @@ class Model(nn.Module):
 
         return {"logits": output, "loss": loss}
 
-    @torch.no_grad()
-    def generate(n, spectrogram=None, pitch=None, waveform=None, pitch_tokens=None, max_new_tokens=150):
-        n.eval()
-        fx = next((t for t in (pitch, spectrogram, waveform) if t is not None), None)
-
-        xa_dict = TensorDict({
-            'a': aborc(pitch, spectrogram, waveform),
-            'b': aborc(spectrogram, pitch, waveform),
-            'c': aborc(waveform, pitch, spectrogram),
-        }, batch_size=fx.shape[0]).to(device)
-        
-        xa_enc = n.enc(no_none(xa_dict))
-        if pitch_tokens is not None:
-            xa_enc['pt'] = pitch_tokens 
-
-        y = torch.tensor([[1]], dtype=torch.long, device=device).repeat(fx.shape[0], 1)
-        
-        for _ in range(max_new_tokens):
-            logits = n.processor(y, xa_enc.clone(), seq=True) 
-            
-            next_token_logits = logits[:, -1, :]
-            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-            
-            y = torch.cat((y, next_token), dim=1)
-            if (next_token == 2).all():
-                break
-                
-        return y
-
-    def _init_w(n, m):
-        n.counts = {"Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0, "Conv2d": 0, "processor": 0, "attention": 0, "Residual": 0}
-        for name, m in n.named_modules():
-            if isinstance(m, nn.RMSNorm):
-                n.counts["RMSNorm"] += 1
-            if isinstance(m, nn.LayerNorm):
-                n.counts["LayerNorm"] += 1                
-            elif isinstance(m, nn.Linear):
-                n.counts["Linear"] += 1
-
-    def init_w(n):
-        print("Initializing model w...")
-        n.apply(n._init_w)
-        print("Initialization summary:")
-        for module_type, count in n.counts.items():
-            if count > 0:
-                print(f"{module_type}: {count}")
-    
 def main():
 
     logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -786,6 +801,7 @@ def main():
     ], lr=2.5e-3, b_decay=-0.8, eps=(1e-8, 1e-8), d=1.0, decay=1e-2, gamma=0.99, max=False, bias=1, 
                  min_lr=1e-9, clip=False, cap=0.0)
 
+    # optimizer = MaxFactorA(model.named_parameters(), lr=2.5e-3, b_decay=-0.8, eps=(1e-8, 1e-8), d=1.0, decay=1e-2, gamma=0.99, max=False, clip=False, cap=0.0)
 
     scheduler = FAMScheduler2(optimizer, warmup_steps=10, total_steps=100, 
                  decay_start=None, warmup_start=1e-6, eta_min=1e-6, last_epoch=-1) 
