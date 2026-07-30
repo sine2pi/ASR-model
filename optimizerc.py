@@ -3,7 +3,7 @@ import torch
 import numpy as np
 from datetime import datetime
 
-
+# need to test somethings
 class MaxFactor(torch.optim.Optimizer):
     __version__ = "1.0"
 
@@ -54,8 +54,8 @@ class MaxFactor(torch.optim.Optimizer):
                 grads.append(grad)
 
             for i, param in enumerate(p_grad):
+                
                 grad = grads[i]
-
                 # state = self.state[param]
 
                 if group["max"]:
@@ -86,7 +86,8 @@ class MaxFactor(torch.optim.Optimizer):
                     col_mean = torch.norm(grad, dim=-2, keepdim=True).square_().div_(grad.size(-2) + 1e-8)
                     col_var.lerp_(col_mean, beta_t)
 
-                    var_est = row_var @ col_var # var_est = row_var * col_var
+                    var_est = row_var @ col_var 
+                    # var_est = row_var * col_var
 
                     max_row_var = row_var.max(dim=-2, keepdim=True)[0]  
                     var_est.div_(max_row_var.clamp_(min=eps1))
@@ -103,12 +104,12 @@ class MaxFactor(torch.optim.Optimizer):
 
                 denom = max(1.0, update.norm(2).item() / ((update.numel() ** 0.5) * group["d"]))
 
-
                 if param.dim() < 3 or group["bias"] == 1:
                     scale = update.abs().max(dim=-1, keepdim=True)[0]
                     final_direction = update.sign() * scale
                 elif param.dim() > 2 or group["bias"] == 2:
-                    scale = torch.median(update.abs(), dim=-1, keepdim=True)[0]   # scale = torch.median(update.abs(), dim=-1, keepdim=True).values
+                    scale = torch.median(update.abs(), dim=-1, keepdim=True)[0]   
+                    # scale = torch.median(update.abs(), dim=-1, keepdim=True).values  
 
                     final_direction = update.sign() * scale
                 step_size = alpha / denom
@@ -124,36 +125,10 @@ class MaxFactor(torch.optim.Optimizer):
 
                 param.add_(final_direction, alpha=-step_size)
 
-                # if group["bias"] == 1: 
-                #     param.add_(-alpha / denom * update.sign() * update.abs().max(dim=-1, keepdim=True)[0])
-                # elif group["bias"] == 2: 
-                #     param.add_(-alpha / denom * update.sign() * torch.median(update.abs(), dim=-1, keepdim=True)[0])
-                # else: # bias == 0 max for > 1D params. Useful if running both spectrograms and pitch, in theory.
-                #     if param.dim() > 1:
-                #         max_vals = update.abs().max(dim=-1, keepdim=True)[0]
-                #         param.add_(-alpha / denom * update.sign() * max_vals)
-                #     else:
-                #         param.add_(-alpha / denom * update.sign())
-
-        #     param.add_(update, alpha=-group["lr"])
-             
-        # return loss               
-# For a 1D parameter (like a bias vector), update.abs().max(dim=-1, keepdim=True)[0] finds the single largest absolute 
-# value in the entire update vector and broadcasts it. This means **every element of the 1D parameter is updated by the same 
-# magnitude, determined by the most extreme value. Acts as a strong form of regularization, forcing all biases in a layer to move in unison.
-# for the 2D weight matrix, update.abs().max(dim=-1, keepdim=True)[0] finds the maximum absolute value per row.
-# The direction of the update for each individual bias term (+ or -) is still determined by its own gradient, via update.sign(). This creates a small bias for outliers.
-# The "outliers" that the max update amplifies are not statistical noise; they are the most information-rich, crucial parts of the pitch signal. (good for pitch bad for spectrograms)
-# The median update, by design, filters these critical signals out (good for spectrograms bad for pitch).
-# The max update latches onto the single largest gradient signal from these critical events and forces the entire group of related parameters 
-# (all biases in a layer) to react strongly. It treats these spikes as the most important thing to learn from in that step.
-# The median update looks at all the gradients for a parameter group and chooses the middle value. The critical "spike" from the pitch event is treated as an outlier and ignored. 
-# The update is instead based on the more numerous, less important gradients from stable or unvoiced parts of the audio. 
-
         return loss
 
 class MaxFactor99(torch.optim.Optimizer):
-    __version__ = "0.123blah"
+    __version__ = "0.99"
 
     def __init__(self, params, lr=0.025, b_decay=-0.8, eps=(1e-8, 1e-3), d=1.0, decay=0.01, gamma=0.99, max=False, clip=False, cap=0.0):
         
@@ -372,7 +347,7 @@ class MaxFactorA(torch.optim.Optimizer):
         return loss    
         
 class MaxFactor1(torch.optim.Optimizer):
-    __version__ = "? version old"
+    __version__ = "old"
 
     def __init__(self, params, lr=0.025, b_decay=-0.8, eps=(1e-8, 1e-3), d=1.0, decay=0.01, gamma=0.99, max=False, clip=False, cap=0.0):
         
@@ -461,7 +436,7 @@ class MaxFactor1(torch.optim.Optimizer):
         return loss
 
 class MaxFactor2(torch.optim.Optimizer):
-    __version__ = "1999"
+    __version__ = "party like its 1999"
     
     def __init__(self, params, lr=0.025, b_decay=-0.8, eps=(1e-8, 1e-3), d=1.0, decay=0.01, gamma=0.99, max=False, clip=False, cap=0.0):
         
