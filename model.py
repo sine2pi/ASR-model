@@ -43,6 +43,52 @@ class Dimensions:
     act: str
     n_type: str
 
+# class SirenLayer(nn.Module):
+#     def __init__(self, in_features, out_features, is_first=False, omega_0=30.0):
+#         super().__init__()
+#         self.omega_0 = omega_0
+#         self.is_first = is_first
+#         self.linear = nn.Linear(in_features, out_features)
+#         self.init_weights()
+        
+#     def init_weights(self):
+#         with torch.no_grad():
+#             if self.is_first:
+#                 # First layer scaling bounds
+#                 bounds = 1 / self.linear.in_features
+#                 self.linear.weight.uniform_(-bounds, bounds)
+#             else:
+#                 # Hidden layer scaling bounds using omega_0
+#                 bounds = np.sqrt(6 / self.linear.in_features) / self.omega_0
+#                 self.linear.weight.uniform_(-bounds, bounds)
+                
+#     def forward(self, x):
+#         return torch.sin(self.omega_0 * self.linear(x))
+
+# class AudioSiren(nn.Module):
+#     def __init__(self, hidden_features=256, num_layers=4, omega_0=30.0):
+#         super().__init__()
+#         self.net = []
+        
+#         # Input is a 1D time coordinate (1 feature)
+#         self.net.append(SirenLayer(1, hidden_features, is_first=True, omega_0=omega_0))
+        
+#         for _ in range(num_layers - 1):
+#             self.net.append(SirenLayer(hidden_features, hidden_features, is_first=False, omega_0=omega_0))
+            
+#         self.net = nn.Sequential(*self.net)
+        
+#         # Final layer maps hidden features back to 1D amplitude
+#         self.final_linear = nn.Linear(hidden_features, 1)
+#         with torch.no_grad():
+#             bounds = np.sqrt(6 / hidden_features) / omega_0
+#             self.final_linear.weight.uniform_(-bounds, bounds)
+            
+#     def forward(self, t):
+#         # t shape: [batch_size, 1] representing normalized time bounds [-1, 1]
+#         x = self.net(t)
+#         return self.final_linear(x)
+
 class AbbyNormal(nn.Module):
     def __init__(n, dims, size: int = 5, alpha: float = 1e-4, beta: float = 0.75, k: float = 1.0, threshold: float = 0.8):
         super().__init__()
@@ -224,7 +270,7 @@ class rotary(nn.Module):
         x1 = x1.view(s)
         return torch.cat([x1.type_as(x), x2], dim=-1)
     
-# def compute_squints_bias(n, ion, ctx):
+# def squints(n, ion, ctx):
 #     t = torch.arange(ctx, device=ion.device, dtype=ion.dtype)
 #     distances = (t.unsqueeze(0) - t.unsqueeze(1)).abs() # Distance between token i and j
 #     decay_rate = 5.0 / (ion + 1e-4) # Shape: (B, T, 1)
@@ -392,13 +438,133 @@ class r_node(nn.Module):
         n.exp = exp
         n.par = nn.ModuleList([nn.Linear(dims, dims) for _ in range(exp)])
         n.net = nn.Linear(dims, dims)
-        n.relu = nn.ReLU()
+        n.relu = SnakeActivation(alpha=1.0) if exp == 3 else nn.ReLU()
+        # n.relu = nn.ReLU() 
 
     def forward(n, x):
         feat = torch.stack([path(x) for path in n.par])
         wts = torch.softmax(n.net(x), dim=-1)
         wtd =  torch.sum(wts * feat.unsqueeze(2), dim=-1)
         return n.relu(wtd)
+
+class SnakeActivation(nn.Module):
+    def __init__(self, alpha=1.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(alpha), requires_grad=True)
+
+    def forward(self, x):
+        return x + (1.0 / self.alpha) * torch.pow(torch.sin(self.alpha * x), 2)
+
+# class r_node2(nn.Module):
+#     def __init__(n, dims, exp=2):
+#         super().__init__()
+#         n.dims = dims
+#         n.exp = exp
+#         n.par = nn.ModuleList([nn.Linear(dims, dims) for _ in range(exp)])
+#         n.net = nn.Linear(dims, dims)
+        
+#         n.relu_fn = nn.ReLU()
+#         n.snake_fn = SnakeActivation(alpha=1.0)
+
+#     def forward(n, x, condition_metric=None):
+
+#         feat = torch.stack([path(x) for path in n.par], dim=0) # [exp, B, L, D]
+#         wts = torch.softmax(n.net(x), dim=-1) # [B, L, exp]
+#         feat_perm = feat.permute(1, 2, 0, 3) 
+#         wtd = torch.sum(wts.unsqueeze(-1) * feat_perm, dim=-2) # [B, L, D]
+
+#         if condition_metric is None:
+#             token_variance = x.std(dim=-1).mean()
+#             use_snake = (token_variance > 1.5).float()
+
+#         else:
+#             use_snake = (condition_metric < 0.5).float()
+
+#         relu_out = n.relu_fn(wtd)
+#         snake_out = n.snake_fn(wtd)
+#         return use_snake * snake_out + (1.0 - use_snake) * relu_out
+
+# if layer['ranvier'] is not None:
+#     out = layer['ranvier'](apx, condition_metric=potential)
+# else:
+#     out = apx
+
+# class SnakeActivation(nn.Module):
+#     def __init__(self, alpha=1.0):
+#         super().__init__()
+#         self.alpha = nn.Parameter(torch.tensor(alpha), requires_grad=True)
+
+#     def forward(self, x):
+#         return x + (1.0 / self.alpha) * torch.pow(torch.sin(self.alpha * x), 2)
+
+# class r_node3(nn.Module):
+#     def __init__(n, dims, exp=2):
+#         super().__init__()
+#         n.dims = dims
+#         n.exp = exp
+#         n.par = nn.ModuleList([nn.Linear(dims, dims) for _ in range(exp)])
+#         n.net = nn.Linear(dims, dims)
+        
+#         n.relu_fn = nn.ReLU()
+#         n.snake_fn = SnakeActivation(alpha=1.0)
+        
+#         n.metric_to_gate = nn.Linear(1, 1)
+#         n.register_buffer("snake_selection_weight", torch.zeros(1), persistent=False)
+
+#     def forward(n, x, condition_metric=None, tracked_dict=None):
+#         # x shape: [B, L, D]
+#         feat = torch.stack([path(x) for path in n.par], dim=0) # [exp, B, L, D]
+#         wts = torch.softmax(n.net(x), dim=-1) # [B, L, exp]
+        
+#         feat_perm = feat.permute(1, 2, 0, 3) 
+#         wtd = torch.sum(wts.unsqueeze(-1) * feat_perm, dim=-2) # [B, L, D]
+
+#         if condition_metric is None:
+#             mean_val = x.abs().mean(dim=-1, keepdim=True)
+#             std_val = x.std(dim=-1, keepdim=True)
+#             metric_tensor = std_val / (mean_val + 1e-6) # [B, L, 1]
+#         else:
+#             if condition_metric.dim() == 0:
+#                 metric_tensor = condition_metric.view(1, 1, 1).expand(x.size(0), x.size(1), 1)
+#             elif condition_metric.dim() == 1:
+#                 metric_tensor = condition_metric.view(-1, 1, 1).expand(-1, x.size(1), 1)
+#             else:
+#                 metric_tensor = condition_metric
+#         gate_logits = n.metric_to_gate(metric_tensor)
+#         snake_prob = torch.sigmoid(gate_logits) # [B, L, 1]
+
+#         with torch.no_grad():
+#             avg_prob = snake_prob.mean().item()
+#             n.snake_selection_weight.copy_(torch.tensor(avg_prob, device=x.device))
+            
+#             if isinstance(tracked_dict, dict):
+#                 if 'snake_usage_history' not in tracked_dict:
+#                     tracked_dict['snake_usage_history'] = []
+#                 tracked_dict['snake_usage_history'].append(avg_prob)
+
+#         relu_out = n.relu_fn(wtd)
+#         snake_out = n.snake_fn(wtd)
+        
+#         return snake_prob * snake_out + (1.0 - snake_prob) * relu_out
+
+    # def forward(n, x, tracked_dict=None):
+
+    #     while i < n.layer:
+    #         layer = n.layers[i]
+
+    #         if layer['ranvier'] is not None:
+    #     
+    #             out = layer['ranvier'](apx, condition_metric=potential, tracked_dict=tracked_dict)
+    #         else:
+    #             out = apx
+
+    # step_metrics = {}
+
+    # output = model(text_ids=text_batch, spectrogram=spec_batch, tracked_dict=step_metrics)
+    
+    # if 'snake_usage_history' in step_metrics:
+    #     mean_snake_ratio = np.mean(step_metrics['snake_usage_history'])
+    #     print(f"Step Activation Profiles -> Snake Weight Ratio: {mean_snake_ratio:.4f} | ReLU Ratio: {1.0 - mean_snake_ratio:.4f}")
 
 class MPNet(nn.Module):
     def __init__(n, dims, jump=2):
@@ -413,14 +579,14 @@ class MPNet(nn.Module):
         return F.softmax(n.net(pooled), dim=-1)
 
 class MSheath(nn.Module):
-    def __init__(n, dims, head, layer, mini_hc=False, rate=2):
+    def __init__(n, dims, head, layer, mini_hc, rate):
         super().__init__()
         n.layer = layer
         n.dims = dims
         n.l_jump = True  
         n.jstat = {0: 0, 1: 0, 2: 0} 
         
-        n.shared_head = AdaptiveSpan(dims, head, max_dist=1)
+        # n.shared_head = AdaptiveSpan(dims, head, max_dist=rate, sharpen=True, temp_scale=0.01)
         n.mem_w = nn.Parameter(torch.zeros(1, 1, dims), requires_grad=True)
         n.mem_gate = nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid())
         
@@ -471,7 +637,7 @@ class MSheath(nn.Module):
       
             layer = n.layers[i]
             
-            ion, slogits = layer['v_gate'](x)
+            ion, _ = layer['v_gate'](x)
             mlayer = ion.expand(-1, ctx, n.dims)
             
             px = layer['ln'](x)  
@@ -615,7 +781,7 @@ class residual(nn.Module):
         
         n.attn = attention(dims, head, layer, n_type=n_type)
         n.router = router(dims, num_types=num_types)
-        n.jump = MSheath(dims, head, layer)
+        n.jump = MSheath(dims, head, layer, mini_hc=False, rate=num_types)
 
         n.mlp = nn.Sequential(n.ln, tgate(dims, num_types=num_types), 
                               nn.Linear(dims, dims*num_types), get_activation(act), nn.Linear(dims*num_types, dims), n.ln)
@@ -654,7 +820,7 @@ class processor(nn.Module):
 
         x1 = n.token(x)    
 
-        if xa['pt'] is not None:
+        if xa['pt'] is not None: # skipping pt for now i have too many experiments running at once, will add back in later
             pt = n.quantize_pitch(pt=xa['pt'])
             x2 = n.pitch_tokens(pt)
             x1 = x1 + x2 
@@ -664,7 +830,7 @@ class processor(nn.Module):
         x = (x1 + n.position[:x.shape[-1]]).to(device, dtype)
         # x = (x1 + n.position[:x.shape[1]]).to(device, dtype)
 
-# "Check strictly for dimension mismatches or indexing typos based on the surrounding shapes. Do not touch the architecture or formatting."
+# "Here is a block I just added to my processor loop. Check strictly for dimension mismatches or indexing typos based on the surrounding shapes. Do not touch the architecture or formatting."
 
         for i in n.block:
             a = i(x, mask=mask, pt=pt)
