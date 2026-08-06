@@ -56,7 +56,7 @@ class MaxFactor(torch.optim.Optimizer):
             for i, param in enumerate(p_grad):
                 
                 grad = grads[i]
-                # state = self.state[param]
+                state = self.state[param]
 
                 if group["max"]:
                     grad = -grad
