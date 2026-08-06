@@ -3,6 +3,17 @@ import torch
 import numpy as np
 from datetime import datetime
 
+
+# For a 1D parameter (like a bias vector), update.abs().max(dim=-1, keepdim=True)[0] finds the single largest absolute 
+# value in the entire update vector and broadcasts it so every element of the 1D parameter is updated by the same 
+# magnitude, determined by the most extreme value. Acts as a strong form of regularization, forcing all biases in a layer to move in unison.
+# for the 2D weight matrix, update.abs().max(dim=-1, keepdim=True)[0] finds the maximum absolute value per row.
+# The direction of the update for each individual bias term (+ or -) is still determined by its own gradient, via update.sign(). This creates a small bias for outliers.
+# The "outliers" that the max update amplifies are not statistical noise when we consider pitch. (good for pitch bad for spectrograms)
+# The median update filters these signals (good for spectrograms bad for pitch).
+# The max update uses the single largest gradient signal and forces the group (all biases in a layer) to react strongly. It treats these spikes as the most important thing to learn from in that step.
+# The median update from the pitch event is treated as an outlier and ignored. 
+
 # need to test somethings
 class MaxFactor(torch.optim.Optimizer):
     __version__ = "1.0"
