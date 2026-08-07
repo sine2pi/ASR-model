@@ -14,6 +14,39 @@ from datetime import datetime
 # The max update uses the single largest gradient signal and forces the group (all biases in a layer) to react strongly. It treats these spikes as the most important thing to learn from in that step.
 # The median update from the pitch event is treated as an outlier and ignored. 
 
+
+# abs_u = update.abs()
+# u_max = abs_u.max(dim=-1, keepdim=True)[0]
+# u_med = torch.median(abs_u, dim=-1, keepdim=True)[0]
+
+# u_ratio = (u_max - u_med) / (u_max + 1e-8)
+# saliency = u_ratio.clamp(0.0, 1.0) 
+# scale = lerp(u_med, u_max, saliency) # Custom lerp or math blend
+# final_direction = update.sign() * scale
+
+#             abs_u = update.abs()
+#             u_max = abs_u.max(dim=-1, keepdim=True)[0]
+                    
+#             if hasattr(torch, 'median_values'): 
+#                 u_med = torch.median(abs_u, dim=-1, keepdim=True).values
+#             else:
+#                 u_med = torch.median(abs_u, dim=-1, keepdim=True)[0]
+#                 param_tag = getattr(param, "tag", "untagged")
+
+#             if param_tag == "pitch":
+#                 scale = u_max
+#             elif param_tag == "spectrogram":
+#                 scale = u_med
+#             else:
+     
+#                 saliency_ratio = (u_max - u_med) / (u_max + 1e-8)
+#                 scale = torch.lerp(u_med, u_max, saliency_ratio.clamp(0.0, 1.0))
+#             final_direction = update.sign() * scale
+#             step_size = alpha / denom
+
+
+
+
 # need to test somethings
 class MaxFactor(torch.optim.Optimizer):
     __version__ = "1.0"
