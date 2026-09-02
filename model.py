@@ -1,10 +1,3 @@
-
-#     [SYSTEM OBJECTIVE: DEBUGGING ONLY]
-# - I am using highly specific, non-standard metaprogramming, recursive block execution, variable name reuse/shadowing, and dynamic object types in PyTorch. 
-# - These patterns are intentional and functioning. Do NOT refactor my code into boilerplate, do NOT change variable names, and do NOT add standard type guards or scope definitions.
-# - Act strictly as a silent runtime debugger. Only point out UNINTENTIONAL errors (e.g., misaligned tensor dimensions, wrong concatenation dims, incorrect indices, or actual syntax typos). 
-# - If you find an unintentional bug, show ONLY the line that changes. Do not rewrite the surrounding function.
-
 import os, torch, numpy as np
 from torch.nn.functional import scaled_dot_product_attention as SDPA
 from typing import Iterable
@@ -42,52 +35,6 @@ class Dimensions:
     layer: int
     act: str
     n_type: str
-
-# class SirenLayer(nn.Module):
-#     def __init__(self, in_features, out_features, is_first=False, omega_0=30.0):
-#         super().__init__()
-#         self.omega_0 = omega_0
-#         self.is_first = is_first
-#         self.linear = nn.Linear(in_features, out_features)
-#         self.init_weights()
-        
-#     def init_weights(self):
-#         with torch.no_grad():
-#             if self.is_first:
-#                 # First layer scaling bounds
-#                 bounds = 1 / self.linear.in_features
-#                 self.linear.weight.uniform_(-bounds, bounds)
-#             else:
-#                 # Hidden layer scaling bounds using omega_0
-#                 bounds = np.sqrt(6 / self.linear.in_features) / self.omega_0
-#                 self.linear.weight.uniform_(-bounds, bounds)
-                
-#     def forward(self, x):
-#         return torch.sin(self.omega_0 * self.linear(x))
-
-# class AudioSiren(nn.Module):
-#     def __init__(self, hidden_features=256, num_layers=4, omega_0=30.0):
-#         super().__init__()
-#         self.net = []
-        
-#         # Input is a 1D time coordinate (1 feature)
-#         self.net.append(SirenLayer(1, hidden_features, is_first=True, omega_0=omega_0))
-        
-#         for _ in range(num_layers - 1):
-#             self.net.append(SirenLayer(hidden_features, hidden_features, is_first=False, omega_0=omega_0))
-            
-#         self.net = nn.Sequential(*self.net)
-        
-#         # Final layer maps hidden features back to 1D amplitude
-#         self.final_linear = nn.Linear(hidden_features, 1)
-#         with torch.no_grad():
-#             bounds = np.sqrt(6 / hidden_features) / omega_0
-#             self.final_linear.weight.uniform_(-bounds, bounds)
-            
-#     def forward(self, t):
-#         # t shape: [batch_size, 1] representing normalized time bounds [-1, 1]
-#         x = self.net(t)
-#         return self.final_linear(x)
 
 class AbbyNormal(nn.Module):
     def __init__(n, dims, size: int = 5, alpha: float = 1e-4, beta: float = 0.75, k: float = 1.0, threshold: float = 0.8):
@@ -270,17 +217,6 @@ class rotary(nn.Module):
         x1 = x1.view(s)
         return torch.cat([x1.type_as(x), x2], dim=-1)
     
-# def squints(n, ion, ctx):
-#     t = torch.arange(ctx, device=ion.device, dtype=ion.dtype)
-#     distances = (t.unsqueeze(0) - t.unsqueeze(1)).abs() # Distance between token i and j
-#     decay_rate = 5.0 / (ion + 1e-4) # Shape: (B, T, 1)
-#     squints_mask = torch.exp(-distances.unsqueeze(0) * decay_rate).unsqueeze(1)
-#     squints_bias = torch.log(squints_mask + 1e-8)
-    
-# # Inside class attention(nn.Module) -> forward()
-# ctx = q.size(-2)
-# 
-
 class OneShot(nn.Module):
     def __init__(n, dims: int, head: int, scale: float = 0.3, features: Optional[List[str]] = None):
         super().__init__()
@@ -820,7 +756,7 @@ class processor(nn.Module):
 
         x1 = n.token(x)    
 
-        if xa['pt'] is not None: # skipping pt for now i have too many experiments running at once, will add back in later
+        if xa['pt'] is not None: # skipping pt for now 
             pt = n.quantize_pitch(pt=xa['pt'])
             x2 = n.pitch_tokens(pt)
             x1 = x1 + x2 
@@ -830,7 +766,7 @@ class processor(nn.Module):
         x = (x1 + n.position[:x.shape[-1]]).to(device, dtype)
         # x = (x1 + n.position[:x.shape[1]]).to(device, dtype)
 
-# "Here is a block I just added to my processor loop. Check strictly for dimension mismatches or indexing typos based on the surrounding shapes. Do not touch the architecture or formatting."
+
 
         for i in n.block:
             a = i(x, mask=mask, pt=pt)
