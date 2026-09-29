@@ -202,7 +202,6 @@ class rotary(nn.Module):
         # m = torch.sigmoid(n.lin(xa)) ** t
         # m = torch.sigmoid(n.lin(xa)) 
 
-        # this is important, this means something. mashed potatoes.....
         if mask is None:
             f = torch.polar(m, f)
         else: 
