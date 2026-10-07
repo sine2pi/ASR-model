@@ -198,9 +198,6 @@ class rotary(nn.Module):
         t = torch.arange(x.shape[2], device=device, dtype=dtype).float()
         f = torch.einsum('i,j->ij', t,  n.compute_f(mask=mask))
         m = torch.norm(xa, dim=-1, keepdim=True)
-        # m = n.lin(xa)
-        # m = torch.sigmoid(n.lin(xa)) ** t
-        # m = torch.sigmoid(n.lin(xa)) 
 
         if mask is None:
             f = torch.polar(m, f)
@@ -263,12 +260,6 @@ class attention(nn.Module):
         b, c, d = x.shape
         k, v = n.kv(aorb(xa, x))
         q = n.q(x)
-
-# potential = ion.mean() + 0.2 * w_metric.mean()
-
-# jump_g = 1.0
-# if potential < 0.1 and i < n.layer - 1:
-#     action = 1  
 
         if pitch_bias is not None:
             qk = n.rbf_scores(q * n.scale, k * n.scale, rbf_sigma=1.0, rbf_ratio=0.3)
@@ -374,7 +365,6 @@ class r_node(nn.Module):
         n.par = nn.ModuleList([nn.Linear(dims, dims) for _ in range(exp)])
         n.net = nn.Linear(dims, dims)
         n.relu = SnakeActivation(alpha=1.0) if exp == 3 else nn.ReLU()
-        # n.relu = nn.ReLU() 
 
     def forward(n, x):
         feat = torch.stack([path(x) for path in n.par])
@@ -389,117 +379,6 @@ class SnakeActivation(nn.Module):
 
     def forward(self, x):
         return x + (1.0 / self.alpha) * torch.pow(torch.sin(self.alpha * x), 2)
-
-# class r_node2(nn.Module):
-#     def __init__(n, dims, exp=2):
-#         super().__init__()
-#         n.dims = dims
-#         n.exp = exp
-#         n.par = nn.ModuleList([nn.Linear(dims, dims) for _ in range(exp)])
-#         n.net = nn.Linear(dims, dims)
-        
-#         n.relu_fn = nn.ReLU()
-#         n.snake_fn = SnakeActivation(alpha=1.0)
-
-#     def forward(n, x, condition_metric=None):
-
-#         feat = torch.stack([path(x) for path in n.par], dim=0) # [exp, B, L, D]
-#         wts = torch.softmax(n.net(x), dim=-1) # [B, L, exp]
-#         feat_perm = feat.permute(1, 2, 0, 3) 
-#         wtd = torch.sum(wts.unsqueeze(-1) * feat_perm, dim=-2) # [B, L, D]
-
-#         if condition_metric is None:
-#             token_variance = x.std(dim=-1).mean()
-#             use_snake = (token_variance > 1.5).float()
-
-#         else:
-#             use_snake = (condition_metric < 0.5).float()
-
-#         relu_out = n.relu_fn(wtd)
-#         snake_out = n.snake_fn(wtd)
-#         return use_snake * snake_out + (1.0 - use_snake) * relu_out
-
-# if layer['ranvier'] is not None:
-#     out = layer['ranvier'](apx, condition_metric=potential)
-# else:
-#     out = apx
-
-# class SnakeActivation(nn.Module):
-#     def __init__(self, alpha=1.0):
-#         super().__init__()
-#         self.alpha = nn.Parameter(torch.tensor(alpha), requires_grad=True)
-
-#     def forward(self, x):
-#         return x + (1.0 / self.alpha) * torch.pow(torch.sin(self.alpha * x), 2)
-
-# class r_node3(nn.Module):
-#     def __init__(n, dims, exp=2):
-#         super().__init__()
-#         n.dims = dims
-#         n.exp = exp
-#         n.par = nn.ModuleList([nn.Linear(dims, dims) for _ in range(exp)])
-#         n.net = nn.Linear(dims, dims)
-        
-#         n.relu_fn = nn.ReLU()
-#         n.snake_fn = SnakeActivation(alpha=1.0)
-        
-#         n.metric_to_gate = nn.Linear(1, 1)
-#         n.register_buffer("snake_selection_weight", torch.zeros(1), persistent=False)
-
-#     def forward(n, x, condition_metric=None, tracked_dict=None):
-#         # x shape: [B, L, D]
-#         feat = torch.stack([path(x) for path in n.par], dim=0) # [exp, B, L, D]
-#         wts = torch.softmax(n.net(x), dim=-1) # [B, L, exp]
-        
-#         feat_perm = feat.permute(1, 2, 0, 3) 
-#         wtd = torch.sum(wts.unsqueeze(-1) * feat_perm, dim=-2) # [B, L, D]
-
-#         if condition_metric is None:
-#             mean_val = x.abs().mean(dim=-1, keepdim=True)
-#             std_val = x.std(dim=-1, keepdim=True)
-#             metric_tensor = std_val / (mean_val + 1e-6) # [B, L, 1]
-#         else:
-#             if condition_metric.dim() == 0:
-#                 metric_tensor = condition_metric.view(1, 1, 1).expand(x.size(0), x.size(1), 1)
-#             elif condition_metric.dim() == 1:
-#                 metric_tensor = condition_metric.view(-1, 1, 1).expand(-1, x.size(1), 1)
-#             else:
-#                 metric_tensor = condition_metric
-#         gate_logits = n.metric_to_gate(metric_tensor)
-#         snake_prob = torch.sigmoid(gate_logits) # [B, L, 1]
-
-#         with torch.no_grad():
-#             avg_prob = snake_prob.mean().item()
-#             n.snake_selection_weight.copy_(torch.tensor(avg_prob, device=x.device))
-            
-#             if isinstance(tracked_dict, dict):
-#                 if 'snake_usage_history' not in tracked_dict:
-#                     tracked_dict['snake_usage_history'] = []
-#                 tracked_dict['snake_usage_history'].append(avg_prob)
-
-#         relu_out = n.relu_fn(wtd)
-#         snake_out = n.snake_fn(wtd)
-        
-#         return snake_prob * snake_out + (1.0 - snake_prob) * relu_out
-
-    # def forward(n, x, tracked_dict=None):
-
-    #     while i < n.layer:
-    #         layer = n.layers[i]
-
-    #         if layer['ranvier'] is not None:
-    #     
-    #             out = layer['ranvier'](apx, condition_metric=potential, tracked_dict=tracked_dict)
-    #         else:
-    #             out = apx
-
-    # step_metrics = {}
-
-    # output = model(text_ids=text_batch, spectrogram=spec_batch, tracked_dict=step_metrics)
-    
-    # if 'snake_usage_history' in step_metrics:
-    #     mean_snake_ratio = np.mean(step_metrics['snake_usage_history'])
-    #     print(f"Step Activation Profiles -> Snake Weight Ratio: {mean_snake_ratio:.4f} | ReLU Ratio: {1.0 - mean_snake_ratio:.4f}")
 
 class MPNet(nn.Module):
     def __init__(n, dims, jump=2):
@@ -521,7 +400,6 @@ class MSheath(nn.Module):
         n.l_jump = True  
         n.jstat = {0: 0, 1: 0, 2: 0} 
         
-        # n.shared_head = AdaptiveSpan(dims, head, max_dist=rate, sharpen=True, temp_scale=0.01)
         n.mem_w = nn.Parameter(torch.zeros(1, 1, dims), requires_grad=True)
         n.mem_gate = nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid())
         
@@ -544,7 +422,6 @@ class MSheath(nn.Module):
             n.layers.append(nn.ModuleDict(layer_dict))
 
         n.pnet = MPNet(dims, jump=2)
-        # n.oneshot = OneShot(dims, head)
 
         n.mlp_gate = nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid())
         n.mlp = nn.Sequential(
@@ -554,13 +431,11 @@ class MSheath(nn.Module):
         )
 
         n.mlp_ln = nn.LayerNorm(dims)
-        # n.dendrites = AdaptiveSpan(dims, head, max_dist=1, sharpen=True, temp_scale=0.01)
     
     def forward(n, x): 
-        
+
         batch, ctx = x.shape[:2]
         orig_x = x
-        
         mem_w = n.mem_w.expand(batch, -1, -1)
         pooled = x.mean(dim=1)
         policy = n.pnet(pooled)
@@ -630,24 +505,6 @@ class MSheath(nn.Module):
                 i += 1
                 history.append({'layer': i, 'status': 'processed'})
         
-        # wint = warp_stats.mean() 
-        # eff = ion.mean() + 0.5 * wint
-
-        # jump_g = 1.0
-        # if eff < 0.1 and i < n.layer - 1:
-        #     action = 1
-        # elif i < n.layer - 1:
-        #     if n.l_jump:
-        #         adjusted_policy = policy + warp_stats.view_as(policy)
-        #         jump = F.gumbel_softmax(adjusted_policy, tau=1.0, hard=True)
-        #         action = jump.argmax(dim=-1).item()
-        #         jump_g = jump[0, action]
-        #     else:
-        #         action = torch.multinomial(policy, 1).squeeze(-1).item()
-        # else:
-        #     action = 0
-
-        # x = n.dendrites(x)
         gate = n.mlp_gate(x)
         output = n.mlp(n.mlp_ln(x))
         x = x + gate * output
@@ -704,6 +561,13 @@ class router(nn.Module):
         weights = n.weights(n.top(input), input)
         return torch.sum(stack * weights.unsqueeze(2), dim=-1)
 
+DEBUG_FLOW = True
+_DBG = {'on': False, 'tag': ''}
+
+def _dbg(msg):
+    if _DBG['on']:
+        print(f"[flow {_DBG['tag']}] {msg}")
+
 class residual(nn.Module):
     def __init__(n, dims, head, layer, act, n_type, num_types=3):
         super().__init__()
@@ -722,14 +586,13 @@ class residual(nn.Module):
                               nn.Linear(dims, dims*num_types), get_activation(act), nn.Linear(dims*num_types, dims), n.ln)
 
     def forward(n, x, xa=None, mask=None, pt=None):
-        x, jmp  = n.jump(n.ln(x))
         x = n.router(*[x for _ in range(n.layer)]) + n.attn(n.ln(x), mask=mask, pt=pt)
         if xa is not None:
             xa = xa + n.audio(xa.shape[1], xa.shape[-1]).to(device, dtype)
             xa, jmp = n.jump(n.ln(xa))
+            # _dbg(f"  cross-attn  q=x{tuple(x.shape)} xa={tuple(xa.shape) if xa is not None else None} k,v=xa{tuple(xa.shape)} mask: {(mask.shape) if mask is not None else 'NONE'} (is_causal=False)")
             x = x + n.attn(n.ln(x), xa=n.router(*[xa for _ in range(n.layer)]), pt=pt)
 
-        print(jmp['jump_history']) # this will be noisy
         return x + n.mlp(x).to(device, dtype)
 
 class processor(nn.Module):
@@ -748,6 +611,7 @@ class processor(nn.Module):
             [residual(dims, head, layer, act, n_type) for _ in range(layer)]) 
         
         n.register_buffer("mask", torch.empty(ctx, ctx).fill_(-np.inf).triu_(1), persistent=False)
+        n._dbg_done = False
 
     def forward(n, x, xa=None, seq=False) -> Tensor:
         blend = torch.sigmoid(n.blend)
@@ -755,7 +619,7 @@ class processor(nn.Module):
 
         x1 = n.token(x)    
 
-        if xa['pt'] is not None: # skipping pt for now 
+        if xa['pt'] is not None:
             pt = n.quantize_pitch(pt=xa['pt'])
             x2 = n.pitch_tokens(pt)
             x1 = x1 + x2 
@@ -763,32 +627,18 @@ class processor(nn.Module):
             pt = None 
 
         x = (x1 + n.position[:x.shape[-1]]).to(device, dtype)
-        # x = (x1 + n.position[:x.shape[1]]).to(device, dtype)
 
+        for idx, i in enumerate(n.block):
 
+            a = i(x, xa=None, mask=mask, pt=pt)
+            ea = i(x=xa['a'], xa=xa['b'], mask=None, pt=pt)
+            b = i(x=a, xa=ea, mask=mask, pt=pt)
+            eb = i(x=xa['b'], xa=xa['c'], mask=None, pt=pt)
+            c = i(x=b, xa=eb, mask=mask, pt=pt)
+            ec = i(x=xa['c'], xa=xa['a'], mask=None, pt=pt)
+            d = i(x=c, xa=ec, mask=mask, pt=pt)
 
-        for i in n.block:
-            a = i(x, mask=mask, pt=pt)
-            b = i(a, xa=i(xa['a']), pt=pt)
-            c = i(b, xa=i(xa['b']), pt=pt)
-            d = i(c, xa=i(xa['c']), pt=pt)
-
-            # for j in [(xa['a']), (xa['b']), (xa['c'])]: e = i(x, xa=i(j, pt=pt))
-            # e = torch.mean(torch.stack([xa['a'], xa['b'], xa['c']]), dim=0)
-
-            e = a + b + c
-            f = torch.cat([d, e], dim=1)
-
-#         g = i(x=f[:, :x.shape[1]], xa=f[:, x.shape[1]:], pt=pt)
-        
-#         if seq:
-#             x = g
-#         else:
-#             x = blend * d + (1 - blend) * g if g is not None else a
-
-            g = i(x=f[:, :x.shape[1]], xa=f[:, x.shape[1]:])
-        
-        x = g if seq else blend * (d) + (1 - blend) * g if g is not None else a
+        x = d
         return (n.ln(x) @ torch.transpose(n.token.weight.to(dtype), 0, 1)).float()
 
 class Model(nn.Module):
@@ -838,13 +688,13 @@ def main():
 
     logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
     
-    metadata_file = "H:/DEV/datasets/lb1/metadata.csv"
-    data_dir = "H:/DEV/datasets/lb1"
+    metadata_file = "./lb1/metadata.csv"
+    data_dir = "./lb1"
 
     log_dir = os.path.join('./logs/', datetime.now().strftime('%m-%d_%H_%M_%S'))
     os.makedirs(log_dir, exist_ok=True)
 
-    tokenizer = setup_tokenizer("H:/DEV/sam3_motion/sine2pi/ASR-model/tokenizer.json") 
+    tokenizer = setup_tokenizer() 
     
     extract_args = {
 
@@ -859,8 +709,7 @@ def main():
         "mels": 128
     }
 
-    param = Dimensions(tokens=40000, mels=128, dims=512, head=4, layer=4, act="gelu", n_type="AbbyNormal")
-
+    param = Dimensions(tokens=40000, mels=128, dims=512, head=4, layer=4, act="relu", n_type="AbbyNormal")
     dataset = prepare_datasets(metadata_file, data_dir, tokenizer, extract_args=extract_args)
     train_size = int(0.8 * len(dataset))
     test_size = len(dataset) - train_size
@@ -901,8 +750,6 @@ def main():
         {'params': jump_params, 'bias': 2.0}  
     ], lr=2.5e-3, b_decay=-0.8, eps=(1e-8, 1e-8), d=1.0, decay=1e-2, gamma=0.99, max=False, bias=1, 
                  min_lr=1e-9, clip=False, cap=0.0)
-
-    # optimizer = MaxFactorA(model.named_parameters(), lr=2.5e-3, b_decay=-0.8, eps=(1e-8, 1e-8), d=1.0, decay=1e-2, gamma=0.99, max=False, clip=False, cap=0.0)
 
     scheduler = FAMScheduler2(optimizer, warmup_steps=10, total_steps=100, 
                  decay_start=None, warmup_start=1e-6, eta_min=1e-6, last_epoch=-1) 
