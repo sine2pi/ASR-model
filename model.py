@@ -656,13 +656,10 @@ class processor(nn.Module):
 
         for idx, i in enumerate(n.block):
 
-            a = i(x, xa=None, mask=mask, pt=pt)
-            ea = i(x=xa['a'], xa=xa['b'], mask=None, pt=pt)
-            b = i(x=a, xa=ea, mask=mask, pt=pt)
-            eb = i(x=xa['b'], xa=xa['c'], mask=None, pt=pt)
-            c = i(x=b, xa=eb, mask=mask, pt=pt)
-            ec = i(x=xa['c'], xa=xa['a'], mask=None, pt=pt)
-            d = i(x=c, xa=ec, mask=mask, pt=pt)
+            a = i(x, xa=None, mask=mask, pt=pt) # it's my code i can write it however i like  fuck yall
+            b = i(x=a, xa=i(x=xa['a'], xa=xa['b'], mask=None, pt=pt), mask=mask, pt=pt)
+            c = i(x=b, xa=i(x=xa['b'], xa=xa['c'], mask=None, pt=pt), mask=mask, pt=pt)
+            d = i(x=c, xa=i(x=xa['c'], xa=xa['a'], mask=None, pt=pt), mask=mask, pt=pt)
 
         x = d
         return (n.ln(x) @ torch.transpose(n.token.weight.to(dtype), 0, 1)).float()
