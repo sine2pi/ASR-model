@@ -26,6 +26,23 @@ _setup_tf32()
 THETA = 30000.0
 PATH = './cache'
 
+
+# For a 1D parameter (like a bias vector), update.abs().max(dim=-1, keepdim=True)[0] finds the single largest absolute 
+# value in the entire update vector and broadcasts it so every element of the 1D parameter is updated by the same 
+# magnitude, determined by the most extreme value. Acts as a strong form of regularization, forcing all biases in a layer to move in unison.
+# for the 2D weight matrix, update.abs().max(dim=-1, keepdim=True)[0] finds the maximum absolute value per row.
+# The direction of the update for each individual bias term (+ or -) is still determined by its own gradient, via update.sign(). This creates a small bias for outliers.
+# The "outliers" that the max update amplifies are not statistical noise when we consider pitch. (good for pitch bad for spectrograms)
+# The median update filters these signals (good for spectrograms bad for pitch).
+# The max update uses the single largest gradient signal and forces the group (all biases in a layer) to react strongly. It treats these spikes as the most important thing to learn from in that step.
+# The median update from the pitch event is treated as an outlier and ignored. 
+
+# compensate in the jump sheath layer and also .. Is it overfitting or just fast? Using the jump shortcut to offset an aggressive optimizer is a reasonable stopgap and then there is also Abbynormal.
+
+# notes /idea : 
+ # A sign-based update whose magnitude comes from the row maximum (amplify outliers, for pitch-like signals) or row median (suppress them, for spectrogram like signals). Observed: fast convergence, noisy gradients, consistent with signbased updates. noisier the faster convergence .makes sense
+
+
 @dataclass
 class Dimensions:
     tokens: int
