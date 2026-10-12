@@ -204,6 +204,9 @@ class rotary(nn.Module):
         else: 
             f = torch.polar(m, f)
 
+# Use f0 (or f0 converted to tokens relative to text.. pitch tokens?) as the magnitude in rotary embeddings (polar(‖xa‖, θ)), so dataset feature (frequency of voices during speech) scale attention instead of only rotating it. 
+        #Status: Explored several ways to bound/learn the magnitude (raw norm, linear, sigmoid). 
+        
         x1 = x[..., :f.shape[-1]*2]
         x2 = x[..., f.shape[-1]*2:]
         s = x1.shape
