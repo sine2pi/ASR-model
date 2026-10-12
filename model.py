@@ -206,6 +206,10 @@ class rotary(nn.Module):
 
 # Use f0 (or f0 converted to tokens relative to text.. pitch tokens?) as the magnitude in rotary embeddings (polar(‖xa‖, θ)), so dataset feature (frequency of voices during speech) scale attention instead of only rotating it. 
         #Status: Explored several ways to bound/learn the magnitude (raw norm, linear, sigmoid). 
+# ‖xa‖ is one number per audio frame, roughly its energy. Energy tracks arousal but it says little about valence, and emotion in speech is mostly carried by pitch contour, rhythm and voice quality. So this version could plausibly separate loud and intense
+# from quiet but probably not the full emotional range.
+# It means emotion related signal changes how strongly positions attend to each other, not just what gets added to the embedding.
+# my pitch work already points at something.. audiofunc.py and rotary.py have F0 and pitch-bias code. Feeding pitch or prosody features into m (or into the angle f) is closer to my sounds are not random intuition than the raw norm.
         
         x1 = x[..., :f.shape[-1]*2]
         x2 = x[..., f.shape[-1]*2:]
@@ -215,7 +219,9 @@ class rotary(nn.Module):
         x1 = torch.view_as_real(x1).flatten(-2)
         x1 = x1.view(s)
         return torch.cat([x1.type_as(x), x2], dim=-1)
-    
+
+
+
 class OneShot(nn.Module):
     def __init__(n, dims: int, head: int, scale: float = 0.3, features: Optional[List[str]] = None):
         super().__init__()
