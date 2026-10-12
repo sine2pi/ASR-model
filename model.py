@@ -204,7 +204,7 @@ class rotary(nn.Module):
         else: 
             f = torch.polar(m, f)
 
-# Use f0 (or f0 converted to tokens relative to text.. pitch tokens?) as the magnitude in rotary embeddings (polar(‖xa‖, θ)), so dataset feature (frequency of voices during speech) scale attention instead of only rotating it. 
+# Use f0 (or f0 converted to tokens.. pitch tokens) as the magnitude in rotary embeddings (polar(‖xa‖, θ)), so dataset feature (frequency of voices during speech) scale attention instead of only rotating it. 
         #Status: Explored several ways to bound/learn the magnitude (raw norm, linear, sigmoid). 
 # ‖xa‖ is one number per audio frame, roughly its energy. Energy tracks arousal but it says little about valence, and emotion in speech is mostly carried by pitch contour, rhythm and voice quality. So this version could plausibly separate loud and intense
 # from quiet but probably not the full emotional range.
